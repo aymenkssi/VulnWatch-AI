@@ -41,6 +41,8 @@ from database import (
     record_watch_alert,
     get_watch_alert_history,
     get_nvd_api_key,
+    get_app_config,
+    set_app_config,
     set_nvd_api_key,
     get_nvd_backfill_start,
     set_nvd_backfill_start,
@@ -196,6 +198,53 @@ def format_sync_timestamp(iso_value):
         return iso_value
 
 
+def launch_background_sync(script, min_interval, env=None):
+    """
+    Lance un script de synchro en sous-processus DÉTACHÉ (Popen) au
+    lieu de subprocess.run : l'interface s'affiche tout de suite au
+    lieu de rester figée (formulaire de connexion grisé) pendant que
+    CISA / NVD / Ollama / SMTP répondent — le flux NVD et les e-mails
+    générés par l'IA pouvaient prendre plusieurs minutes.
+
+    Streamlit relance tout le script à chaque interaction : on note
+    l'heure du lancement en base pour ne pas relancer le même script
+    tant qu'il tourne (ou, s'il a planté, avant min_interval).
+    Les tableaux se mettent à jour d'eux-mêmes (cache de 60 s).
+    """
+
+    key = f"autosync_launched_at:{script}"
+    now = datetime.now(timezone.utc)
+    launched_at = get_app_config(key)
+
+    if launched_at:
+
+        try:
+
+            last_launch = datetime.fromisoformat(launched_at)
+
+            if last_launch.tzinfo is None:
+                last_launch = last_launch.replace(tzinfo=timezone.utc)
+
+            if now - last_launch < min_interval:
+                return
+
+        except ValueError:
+
+            pass
+
+    set_app_config(key, now.isoformat())
+
+    subprocess.Popen(
+        [
+            sys.executable,
+            script
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        env=env
+    )
+
+
 def auto_sync_cisa_if_needed():
 
     state = get_sync_state("cisa_kev")
@@ -227,21 +276,10 @@ def auto_sync_cisa_if_needed():
 
     if needs_sync:
 
-        with st.spinner(
-            "Synchronisation automatique CISA KEV en cours "
-            "(plus de 12h depuis la dernière mise à jour)..."
-        ):
-
-            subprocess.run(
-                [
-                    sys.executable,
-                    "sync.py"
-                ],
-                capture_output=True,
-                text=True
-            )
-
-        st.cache_data.clear()
+        launch_background_sync(
+            "sync.py",
+            timedelta(hours=AUTO_SYNC_INTERVAL_HOURS)
+        )
 
 
 auto_sync_cisa_if_needed()
@@ -303,22 +341,11 @@ def auto_enrich_nvd_if_needed():
         if nvd_api_key_for_enrich:
             env["VULNWATCH_NVD_API_KEY"] = nvd_api_key_for_enrich
 
-        with st.spinner(
-            "Enrichissement NVD automatique en cours "
-            f"({AUTO_NVD_BATCH_SIZE} CVE)..."
-        ):
-
-            subprocess.run(
-                [
-                    sys.executable,
-                    "enrich.py"
-                ],
-                capture_output=True,
-                text=True,
-                env=env
-            )
-
-        st.cache_data.clear()
+        launch_background_sync(
+            "enrich.py",
+            timedelta(minutes=AUTO_NVD_INTERVAL_MINUTES),
+            env=env
+        )
 
 
 auto_enrich_nvd_if_needed()
@@ -370,21 +397,10 @@ def auto_notify_if_needed():
 
     if needs_run:
 
-        with st.spinner(
-            "Vérification des notifications e-mail "
-            "(nouvelles alertes / relances)..."
-        ):
-
-            subprocess.run(
-                [
-                    sys.executable,
-                    "notify.py"
-                ],
-                capture_output=True,
-                text=True
-            )
-
-        st.cache_data.clear()
+        launch_background_sync(
+            "notify.py",
+            timedelta(minutes=AUTO_NOTIFY_INTERVAL_MINUTES)
+        )
 
 
 auto_notify_if_needed()
@@ -443,22 +459,11 @@ def auto_sync_nvd_feed_if_needed():
         if api_key:
             env["VULNWATCH_NVD_API_KEY"] = api_key
 
-        with st.spinner(
-            "Synchronisation NVD quotidienne en cours "
-            "(nouvelles CVE + croisement XDR)..."
-        ):
-
-            subprocess.run(
-                [
-                    sys.executable,
-                    "sync_nvd_feed.py"
-                ],
-                capture_output=True,
-                text=True,
-                env=env
-            )
-
-        st.cache_data.clear()
+        launch_background_sync(
+            "sync_nvd_feed.py",
+            timedelta(minutes=AUTO_NVD_FEED_INTERVAL_MINUTES),
+            env=env
+        )
 
 
 auto_sync_nvd_feed_if_needed()
