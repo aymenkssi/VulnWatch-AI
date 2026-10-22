@@ -502,6 +502,29 @@ def initialize_database():
     """)
 
 
+    # =====================================================
+    # INDEX
+    # =====================================================
+    #
+    # defender_vulnerabilities dépasse facilement les 2 millions de
+    # lignes (une ligne par machine x logiciel x CVE) et la table
+    # vulnerabilities plusieurs centaines de milliers après le
+    # téléchargement historique NVD. Sans index sur cve_id, chaque
+    # jointure / recherche par CVE parcourt toute la table.
+    # La création est longue UNE fois (quelques dizaines de secondes
+    # sur une grosse base), ensuite IF NOT EXISTS ne coûte rien.
+
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_defender_vuln_cve
+        ON defender_vulnerabilities (cve_id, device_id)
+    """)
+
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_vulnerabilities_source
+        ON vulnerabilities (source)
+    """)
+
+
     conn.commit()
     conn.close()
 
@@ -3251,7 +3274,7 @@ def get_nvd_defender_exposure():
             ) AS affected_products
         FROM defender_vulnerabilities d
         INNER JOIN vulnerabilities v
-            ON UPPER(d.cve_id) = UPPER(v.cve_id)
+            ON v.cve_id = d.cve_id
         WHERE v.source = 'NVD'
           AND d.cve_id IS NOT NULL
         GROUP BY d.cve_id
