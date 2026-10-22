@@ -3918,6 +3918,32 @@ def count_cves_by_published_day(start_day, end_day):
     }
 
 
+def get_day_refreshed_at(day):
+    """
+    Date de la plus ancienne mise à jour NVD des CVE publiées ce jour-là
+    (cpe_checked_at), ou None si l'une d'elles n'a jamais été mise à jour
+    (ou s'il n'y en a aucune).
+    """
+
+    conn = get_connection()
+
+    row = conn.execute(
+        """
+        SELECT COUNT(*), SUM(cpe_checked_at IS NULL), MIN(cpe_checked_at)
+        FROM vulnerabilities
+        WHERE nvd_published >= ? AND nvd_published < ?
+        """,
+        (day.isoformat(), (day + timedelta(days=1)).isoformat())
+    ).fetchone()
+
+    conn.close()
+
+    if not row[0] or row[1]:
+        return None
+
+    return row[2]
+
+
 def count_cves_without_cpe_check():
     """CVE dont les produits vulnérables NVD n'ont jamais été récupérés."""
 

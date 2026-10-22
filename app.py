@@ -5491,7 +5491,8 @@ with tab_watch:
             st.info(
                 f"Rattrapage : {audit_report.get('recovered', 0)} CVE "
                 f"ajoutée(s), {audit_report.get('updated', 0)} mise(s) à jour "
-                f"(produits et scores NVD), dont {len(on_parc)} nouvelle(s) "
+                f"(produits et scores NVD), {audit_report.get('skipped', 0)} "
+                f"jour(s) inchangé(s) sautés, dont {len(on_parc)} nouvelle(s) "
                 f"présente(s) sur le parc"
                 + (f" : {', '.join(on_parc[:20])}" if on_parc else "")
                 + (" ..." if len(on_parc) > 20 else "")
