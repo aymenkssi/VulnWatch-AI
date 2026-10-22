@@ -4975,9 +4975,10 @@ with tab_watch:
         "Compare, jour par jour, le nombre de CVE publiées sur "
         "nvd.nist.gov avec celles présentes dans VulnWatch (une requête "
         "légère par jour, sans télécharger les CVE). « Rattraper » "
-        "retélécharge les jours incomplets, sans envoyer d'alerte "
-        "e-mail : les CVE rattrapées présentes sur le parc sont listées "
-        "ci-dessous."
+        "retélécharge tous les jours de la période : CVE manquantes, et "
+        "mise à jour des CVE dont NVD a déclaré ou corrigé les produits "
+        "vulnérables après coup. Sans alerte e-mail : les CVE devenues "
+        "présentes sur le parc sont listées ci-dessous."
     )
 
     if get_nvd_api_key():
@@ -5082,8 +5083,8 @@ with tab_watch:
 
             st.info(
                 f"Rattrapage : {audit_report.get('recovered', 0)} CVE "
-                f"ajoutée(s), {audit_report.get('completed', 0)} complétée(s) "
-                f"avec leurs produits NVD, dont {len(on_parc)} nouvelle(s) "
+                f"ajoutée(s), {audit_report.get('updated', 0)} mise(s) à jour "
+                f"(produits et scores NVD), dont {len(on_parc)} nouvelle(s) "
                 f"présente(s) sur le parc"
                 + (f" : {', '.join(on_parc[:20])}" if on_parc else "")
                 + (" ..." if len(on_parc) > 20 else "")
