@@ -4395,11 +4395,13 @@ def get_inventory_machines(search=None):
             MAX(os_platform) AS os_platform,
             MAX(os_version) AS os_version,
             MAX(os_architecture) AS os_architecture,
-            COUNT(DISTINCT cpe_vendor || ':' || cpe_product || ':'
+            COUNT(DISTINCT COALESCE(software_vendor, '') || ':'
+                  || COALESCE(software_name, '') || ':'
                   || software_version) AS software_count,
             COUNT(DISTINCT CASE
                 WHEN COALESCE(end_of_support_status, '') NOT IN ('', 'None')
-                THEN cpe_vendor || ':' || cpe_product || ':' || software_version
+                THEN COALESCE(software_vendor, '') || ':'
+                     || COALESCE(software_name, '') || ':' || software_version
             END) AS eos_count
         FROM software_inventory
         {where}
@@ -4535,7 +4537,10 @@ def get_machine_software(device_id):
             AND m.software_version = i.software_version
         LEFT JOIN vulnerabilities v ON v.cve_id = m.cve_id
         WHERE i.device_id = ?
-        GROUP BY i.cpe_vendor, i.cpe_product, i.software_version
+        -- Une ligne par logiciel / paquet réel : plusieurs paquets Linux
+        -- (php8.3-common, php8.3-cli...) peuvent être reliés au même
+        -- produit NVD, ils restent listés séparément.
+        GROUP BY i.software_vendor, i.software_name, i.software_version
         ORDER BY nvd_critical DESC, nvd_cves DESC, i.software_vendor, i.software_name
         """,
         (device_id,)

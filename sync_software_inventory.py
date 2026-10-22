@@ -31,6 +31,14 @@ from services.jobs import report_progress
 
 
 SYNC_KEY = "software_inventory"
+
+# Les exports de résultats Advanced Hunting (table
+# DeviceTvmSoftwareInventory, mêmes colonnes que ce CSV) sont plafonnés à
+# 100 000 lignes : un fichier de cette taille est très probablement
+# tronqué (machines avec une partie seulement de leurs logiciels).
+CSV_EXPORT_LIMIT = 100_000
+
+_read_rows = {"count": 0}
 EXPORT_DIR = Path("data/defender_exports")
 
 
@@ -38,7 +46,9 @@ def _read_csv(path):
 
     # Le portail Defender exporte en UTF-8 avec BOM.
     with open(path, encoding="utf-8-sig", newline="") as source:
-        yield from csv.DictReader(source)
+        for row in csv.DictReader(source):
+            _read_rows["count"] += 1
+            yield row
 
 
 def _read_defender_export():
@@ -137,8 +147,24 @@ def main():
         f"{matched_cves} CVE touchent le parc selon NVD"
     )
 
+    status = "OK"
+
+    if csv_path and _read_rows["count"] == CSV_EXPORT_LIMIT:
+
+        status = "WARNING"
+        limit = f"{CSV_EXPORT_LIMIT:,}".replace(",", " ")
+
+        detail = (
+            f"Fichier CSV de {limit} lignes exactement : très probablement "
+            "tronqué (limite des exports Advanced Hunting), certaines "
+            "machines n'ont qu'une partie de leurs logiciels. Préférez "
+            "« Importer l'inventaire depuis Defender » (API, sans limite) "
+            "ou découpez l'export. "
+            + detail
+        )
+
     print(detail)
-    set_sync_state(SYNC_KEY, "OK", detail)
+    set_sync_state(SYNC_KEY, status, detail)
 
 
 if __name__ == "__main__":
