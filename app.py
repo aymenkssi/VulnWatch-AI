@@ -548,7 +548,7 @@ def format_duration(seconds):
 
 
 @st.fragment(run_every=2)
-def _job_progress_fragment(key):
+def _job_progress_fragment(key, place=""):
 
     job = get_job(key)
 
@@ -595,16 +595,16 @@ def _job_progress_fragment(key):
 
         st.button(
             "Arrêt en cours...",
-            key=f"job_stop_{key}",
+            key=f"job_stop_{key}{place}",
             disabled=True
         )
 
-    elif st.button("Arrêter", key=f"job_stop_{key}", disabled=not IS_ADMIN):
+    elif st.button("Arrêter", key=f"job_stop_{key}{place}", disabled=not IS_ADMIN):
 
         request_stop(key)
 
 
-def render_job(key, warning_state_key=None):
+def render_job(key, warning_state_key=None, place=""):
     """
     Sous le bouton d'une synchro : barre de progression tant qu'elle
     tourne, puis résultat (succès / échec + journal) dans la session
@@ -621,7 +621,7 @@ def render_job(key, warning_state_key=None):
     if job["running"]:
 
         st.session_state[watched_key] = True
-        _job_progress_fragment(key)
+        _job_progress_fragment(key, place)
         return
 
     if not st.session_state.get(watched_key):
@@ -672,7 +672,10 @@ def render_job(key, warning_state_key=None):
     with st.expander("Journal de la synchronisation"):
         st.code(read_job_log(key) or "(vide)", language="text")
 
-    if st.button("Masquer", key=f"job_hide_{key}"):
+    # `place` : suffixe des clés quand la même tâche est affichée à deux
+    # endroits de la page (ex. import d'inventaire : onglet Veille et
+    # fiche machine), Streamlit refusant deux boutons de même clé.
+    if st.button("Masquer", key=f"job_hide_{key}{place}"):
         st.session_state[watched_key] = False
         st.rerun()
 
@@ -3867,7 +3870,11 @@ def render_machine_details(machine):
         env["VULNWATCH_INVENTORY_DEVICE"] = machine["device_id"]
         launch_job("sync_software_inventory.py", env=env)
 
-    render_job("sync_software_inventory", warning_state_key="software_inventory")
+    render_job(
+        "sync_software_inventory",
+        warning_state_key="software_inventory",
+        place="_machine"
+    )
 
     a1, a2, a3, a4, a5 = st.columns(5)
     a1.metric("Système", machine["os_platform"] or "N/A")
