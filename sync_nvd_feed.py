@@ -118,6 +118,13 @@ def _group_by_device(rows):
 
         if key not in devices:
             devices[key] = dict(row)
+
+            # Paquet Linux relié à NVD par son nom : correctif rétroporté
+            # possible, à vérifier (mention reprise dans l'e-mail).
+            if row.get("distro_note"):
+                devices[key]["software_name"] = (
+                    f"{row.get('software_name')} (paquet Linux, à vérifier)"
+                )
         elif row.get("software_version"):
             versions = devices[key]["software_version"].split(", ")
             if row["software_version"] not in versions:

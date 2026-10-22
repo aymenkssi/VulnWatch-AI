@@ -557,6 +557,23 @@ def initialize_database():
         )
     """)
 
+    # Paquets de distributions Linux (services/inventory_matcher.py) :
+    # distro_package = 1 quand un paquet (ex. php8.4-common de Debian) a
+    # été relié à son produit NVD ; match_version = version amont
+    # comparée aux plages NVD.
+    inventory_columns = {
+        row[1] for row in conn.execute("PRAGMA table_info(software_inventory)")
+    }
+
+    if "distro_package" not in inventory_columns:
+        conn.execute(
+            "ALTER TABLE software_inventory "
+            "ADD COLUMN distro_package INTEGER NOT NULL DEFAULT 0"
+        )
+
+    if "match_version" not in inventory_columns:
+        conn.execute("ALTER TABLE software_inventory ADD COLUMN match_version TEXT")
+
     conn.execute("""
         CREATE TABLE IF NOT EXISTS inventory_cve_matches (
             cve_id TEXT NOT NULL,
@@ -4302,7 +4319,8 @@ def get_inventory_devices_for_cve(cve_id):
             i.software_name,
             i.software_version,
             m.rule,
-            i.end_of_support_status
+            i.end_of_support_status,
+            CASE WHEN i.distro_package = 1 THEN 'Paquet Linux : vérifier le changelog (correctif rétroporté possible)' ELSE '' END AS distro_note
         FROM inventory_cve_matches m
         JOIN software_inventory i
             ON i.cpe_vendor = m.cpe_vendor
@@ -4544,6 +4562,7 @@ def get_machine_nvd_cves(device_id):
             i.software_name,
             i.software_version,
             m.rule,
+            CASE WHEN i.distro_package = 1 THEN 'Paquet Linux : vérifier le changelog (correctif rétroporté possible)' ELSE '' END AS distro_note,
             COALESCE(v.nvd_description, v.description) AS description
         FROM inventory_cve_matches m
         {_MATCH_JOIN}
@@ -4642,7 +4661,11 @@ def get_product_machines(cpe_vendor, cpe_product):
             os_platform,
             os_version,
             software_version,
-            end_of_support_status
+            end_of_support_status,
+            software_name,
+            CASE WHEN distro_package = 1
+                 THEN 'Paquet Linux : vérifier le changelog (correctif rétroporté possible)'
+                 ELSE '' END AS distro_note
         FROM software_inventory
         WHERE cpe_vendor = ? AND cpe_product = ?
         ORDER BY device_name
