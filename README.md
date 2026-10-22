@@ -114,7 +114,8 @@ administrateur :
 | API | Permission | Usage |
 |---|---|---|
 | WindowsDefenderATP | `Vulnerability.Read.All` | Export des vulnérabilités |
-| WindowsDefenderATP | `Software.Read.All` | Export de l'inventaire logiciel |
+| WindowsDefenderATP | `AdvancedQuery.Read.All` | Inventaire logiciel complet (Advanced Hunting, par lots de machines) |
+| WindowsDefenderATP | `Software.Read.All` | Export de l'inventaire logiciel (secours) |
 | WindowsDefenderATP | `User.Read.All` | Utilisateurs connectés aux machines |
 | Microsoft Graph | `User.Read.All` | Nom et e-mail des propriétaires |
 

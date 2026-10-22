@@ -3853,6 +3853,22 @@ def render_machine_details(machine):
     st.markdown(f"### 🖥️ {machine['device_name'] or machine['device_id']}")
     st.caption(f"Identifiant Defender : {machine['device_id']}")
 
+    # Inventaire de cette seule machine, relu dans Defender (Advanced
+    # Hunting) : utile si l'import global était incomplet ou ancien.
+    if st.button(
+        "🔄 Actualiser l'inventaire de cette machine depuis Defender",
+        key=f"refresh_device_{machine['device_id']}",
+        disabled=is_job_running("sync_software_inventory") or not IS_ADMIN,
+        help="Recharge tous les logiciels de cette machine (Advanced "
+             "Hunting, permission AdvancedQuery.Read.All) puis recalcule "
+             "les CVE selon NVD. Les autres machines ne changent pas."
+    ):
+        env = os.environ.copy()
+        env["VULNWATCH_INVENTORY_DEVICE"] = machine["device_id"]
+        launch_job("sync_software_inventory.py", env=env)
+
+    render_job("sync_software_inventory", warning_state_key="software_inventory")
+
     a1, a2, a3, a4, a5 = st.columns(5)
     a1.metric("Système", machine["os_platform"] or "N/A")
     a2.metric("Version", machine["os_version"] or "N/A")
@@ -5597,9 +5613,11 @@ with tab_watch:
             type="primary",
             disabled=(is_job_running("sync_software_inventory")) or not IS_ADMIN,
             key="inventory_defender_button",
-            help="Export SoftwareInventoryExport de l'API Defender, avec "
-                 "l'application Azure (barre latérale) ou à défaut Azure "
-                 "CLI ; permission Software.Read.All. Réimporté ensuite "
+            help="Inventaire complet par l'API Advanced Hunting de Defender "
+                 "(par lots de machines, sans la limite de 100 000 lignes ; "
+                 "permission AdvancedQuery.Read.All), à défaut export "
+                 "SoftwareInventoryExport (Software.Read.All). Application "
+                 "Azure (barre latérale) ou Azure CLI. Réimporté ensuite "
                  "automatiquement chaque jour."
         ):
             launch_job("sync_software_inventory.py")
