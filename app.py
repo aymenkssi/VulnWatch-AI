@@ -3517,7 +3517,8 @@ def render_nvd_cve_details(cve_id):
     # produits concernés, toutes les métriques (non conservés en base).
     if st.toggle(
         "Afficher le détail complet depuis NVD (références, produits "
-        "concernés, toutes les métriques)",
+        "concernés, toutes les métriques) et mettre à jour cette CVE "
+        "dans VulnWatch",
         key=f"nvd_full_{cve_id}"
     ):
 
