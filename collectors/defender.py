@@ -71,9 +71,23 @@ def get_access_token():
             "tsv"
         ],
         capture_output=True,
-        text=True,
-        check=True
+        text=True
     )
+
+    if result.returncode != 0:
+
+        # Sans ce message, l'erreur se résumait à "returned non-zero exit
+        # status 1" : on remonte ce qu'Azure CLI a réellement répondu
+        # (session expirée, mauvais compte, MFA requise...).
+        message = (result.stderr or result.stdout or "").strip()
+
+        raise RuntimeError(
+            "Azure CLI n'a pas pu fournir de jeton pour l'API Defender "
+            f"(compte Windows : {os.getenv('USERNAME') or os.getenv('USER') or 'inconnu'}). "
+            "Ouvrez une console avec ce compte et lancez "
+            "« az login » (ou « az login --tenant <id-du-tenant> »). "
+            f"Réponse d'Azure CLI : {message}"
+        )
 
     token = result.stdout.strip()
 

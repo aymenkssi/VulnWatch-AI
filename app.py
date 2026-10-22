@@ -15,7 +15,8 @@ from services.jobs import (
     get_job,
     is_job_running,
     read_job_log,
-    last_log_line
+    last_log_line,
+    request_stop
 )
 
 from database import (
@@ -430,6 +431,21 @@ def _job_progress_fragment(key):
     if detail:
         st.caption(detail)
 
+    # Le clic ne relance que ce fragment : l'arrêt est pris en compte par
+    # le lanceur en moins d'une seconde, la barre disparaît au passage
+    # suivant.
+    if job.get("stop_requested"):
+
+        st.button(
+            "Arrêt en cours...",
+            key=f"job_stop_{key}",
+            disabled=True
+        )
+
+    elif st.button("Arrêter", key=f"job_stop_{key}"):
+
+        request_stop(key)
+
 
 def render_job(key, warning_state_key=None):
     """
@@ -475,6 +491,13 @@ def render_job(key, warning_state_key=None):
             )
         else:
             st.success(f"{job['label']} terminée en {duration}.")
+
+    elif job["status"] == "STOPPED":
+
+        st.info(
+            f"{job['label']} arrêtée à votre demande après {duration}. "
+            "Les données déjà enregistrées sont conservées."
+        )
 
     elif job["status"] == "INTERRUPTED":
 
