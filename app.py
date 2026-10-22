@@ -1,0 +1,4473 @@
+﻿import subprocess
+import sys
+import os
+from pathlib import Path
+from datetime import date, datetime, timezone, timedelta
+
+import pandas as pd
+import plotly.express as px
+import streamlit as st
+
+from database import (
+    get_connection,
+    initialize_database,
+    import_manual_server_owners,
+    get_sync_state,
+    get_pending_nvd_count,
+    ensure_admin_seeded,
+    verify_admin_credentials,
+    set_admin_credentials,
+    get_notification_delays,
+    set_notification_delay,
+    get_notification_min_priority,
+    set_notification_min_priority,
+    get_smtp_config,
+    set_smtp_config,
+    is_smtp_configured,
+    get_notification_history,
+    get_hexiosec_config,
+    set_hexiosec_config,
+    is_hexiosec_configured,
+    get_hexiosec_findings,
+    get_hexiosec_severity_counts,
+    get_hexiosec_assets,
+    get_hexiosec_asset_type_counts,
+    get_recent_defender_detections,
+    get_devices_for_cve,
+    add_watch_recipient,
+    get_watch_recipients,
+    set_watch_recipient_active,
+    delete_watch_recipient,
+    record_watch_alert,
+    get_watch_alert_history,
+    get_nvd_api_key,
+    set_nvd_api_key,
+    get_nvd_backfill_start,
+    set_nvd_backfill_start,
+    is_nvd_backfill_done,
+    reset_nvd_backfill,
+    get_nvd_total_count,
+    bulk_save_nvd_discoveries,
+    get_nvd_defender_exposure
+)
+from services.mailer import send_test_email, send_email, SmtpNotConfigured
+from services.ai_engine import generate_watch_alert_email
+from collectors.hexiosec import test_connection as hexiosec_test_connection
+from collectors.nvd import parse_nvd_feed_bytes
+
+
+# =========================================================
+# CONFIGURATION
+# =========================================================
+
+st.set_page_config(
+    page_title="VulnWatch AI - Connexion",
+    page_icon="🛡️",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+
+# =========================================================
+# DATABASE INIT + COMPTE ADMIN
+# =========================================================
+#
+# Les identifiants admin sont stockés en base (hash PBKDF2 + sel,
+# jamais en clair, jamais codés en dur dans ce fichier). À la toute
+# première exécution, un compte est créé automatiquement : reprise
+# de VULNWATCH_ADMIN_USER / VULNWATCH_ADMIN_PASSWORD si définies,
+# sinon génération d'un mot de passe aléatoire révélé une seule fois
+# (console + fichier local). Il peut ensuite être changé depuis la
+# section "Compte" de la barre latérale.
+
+initialize_database()
+
+_seeded_admin = ensure_admin_seeded()
+
+if _seeded_admin:
+
+    print()
+    print("=" * 60)
+    print("VulnWatch AI - Compte admin initial généré")
+    print(f"Utilisateur : {_seeded_admin['username']}")
+    print(f"Mot de passe : {_seeded_admin['password']}")
+    print(
+        "Changez ce mot de passe depuis l'application "
+        "(section \"Compte\" dans la barre latérale) après connexion."
+    )
+    print("=" * 60)
+    print()
+
+    try:
+
+        Path("data").mkdir(parents=True, exist_ok=True)
+
+        with open(
+            "data/INITIAL_ADMIN_PASSWORD.txt",
+            "w",
+            encoding="utf-8"
+        ) as f:
+
+            f.write(
+                f"Utilisateur : {_seeded_admin['username']}\n"
+                f"Mot de passe : {_seeded_admin['password']}\n"
+                "Supprimez ce fichier une fois le mot de passe changé "
+                "(section \"Compte\" dans l'application).\n"
+            )
+
+    except OSError:
+
+        pass
+
+
+# =========================================================
+# AUTHENTIFICATION
+# =========================================================
+
+def authenticate():
+    if st.session_state.get("authenticated", False):
+        return True
+
+    st.title("🛡️ VulnWatch AI")
+    st.subheader("Connexion")
+    st.caption("Authentifiez-vous pour accéder à la plateforme de sécurité.")
+
+    # Formulaire (st.form) plutôt que des widgets + un bouton libres :
+    # avec un bouton libre, quand le navigateur (ou un gestionnaire de
+    # mots de passe) auto-remplit les champs, Streamlit ne voit
+    # parfois pas encore la valeur au moment du premier clic (elle
+    # n'a pas encore déclenché d'événement "change" côté navigateur),
+    # d'où le besoin de cliquer "Se connecter" deux fois. Un vrai
+    # <form> HTML force le navigateur à valider les champs auto-remplis
+    # avant la soumission, et Streamlit lit alors la valeur à jour dès
+    # le premier clic.
+    with st.form("login_form"):
+
+        username = st.text_input("Nom d'utilisateur", key="login_username")
+        password = st.text_input(
+            "Mot de passe", type="password", key="login_password"
+        )
+
+        submitted = st.form_submit_button(
+            "Se connecter", use_container_width=True, type="primary"
+        )
+
+    if submitted:
+
+        if verify_admin_credentials(username, password):
+            st.session_state["authenticated"] = True
+            st.session_state["authenticated_username"] = username
+            st.session_state.pop("login_username", None)
+            st.session_state.pop("login_password", None)
+            st.rerun()
+
+        st.error("Nom d'utilisateur ou mot de passe incorrect.")
+
+    return False
+
+
+if not authenticate():
+    st.stop()
+
+
+# =========================================================
+# AUTOMATIC CISA SYNC (every 12h)
+# =========================================================
+
+AUTO_SYNC_INTERVAL_HOURS = 12
+
+
+def format_sync_timestamp(iso_value):
+
+    if not iso_value:
+        return "jamais"
+
+    try:
+
+        dt = datetime.fromisoformat(iso_value)
+
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+
+        return dt.astimezone().strftime("%d/%m/%Y %H:%M")
+
+    except ValueError:
+
+        return iso_value
+
+
+def auto_sync_cisa_if_needed():
+
+    state = get_sync_state("cisa_kev")
+
+    now = datetime.now(timezone.utc)
+    needs_sync = True
+
+    if state and state.get("last_run_at"):
+
+        try:
+
+            last_run = datetime.fromisoformat(
+                state["last_run_at"]
+            )
+
+            if last_run.tzinfo is None:
+                last_run = last_run.replace(
+                    tzinfo=timezone.utc
+                )
+
+            needs_sync = (
+                (now - last_run)
+                >= timedelta(hours=AUTO_SYNC_INTERVAL_HOURS)
+            )
+
+        except ValueError:
+
+            needs_sync = True
+
+    if needs_sync:
+
+        with st.spinner(
+            "Synchronisation automatique CISA KEV en cours "
+            "(plus de 12h depuis la dernière mise à jour)..."
+        ):
+
+            subprocess.run(
+                [
+                    sys.executable,
+                    "sync.py"
+                ],
+                capture_output=True,
+                text=True
+            )
+
+        st.cache_data.clear()
+
+
+auto_sync_cisa_if_needed()
+
+
+# =========================================================
+# AUTOMATIC NVD ENRICHMENT (small batch on each load)
+# =========================================================
+#
+# L'API NVD publique est limitée en débit (délai de plusieurs
+# secondes entre chaque requête), donc on ne peut pas tout enrichir
+# d'un coup à chaque ouverture de l'appli. On grignote le retard par
+# petits lots, régulièrement, jusqu'à ce que "CVSS 3.1" / "Sévérité
+# NVD" soient renseignés pour toutes les CVE.
+
+AUTO_NVD_INTERVAL_MINUTES = 30
+AUTO_NVD_BATCH_SIZE = 5
+
+
+def auto_enrich_nvd_if_needed():
+
+    if get_pending_nvd_count() == 0:
+        return
+
+    state = get_sync_state("nvd_enrich")
+
+    now = datetime.now(timezone.utc)
+    needs_run = True
+
+    if state and state.get("last_run_at"):
+
+        try:
+
+            last_run = datetime.fromisoformat(
+                state["last_run_at"]
+            )
+
+            if last_run.tzinfo is None:
+                last_run = last_run.replace(
+                    tzinfo=timezone.utc
+                )
+
+            needs_run = (
+                (now - last_run)
+                >= timedelta(minutes=AUTO_NVD_INTERVAL_MINUTES)
+            )
+
+        except ValueError:
+
+            needs_run = True
+
+    if needs_run:
+
+        env = os.environ.copy()
+        env["VULNWATCH_MAX_CVES"] = str(AUTO_NVD_BATCH_SIZE)
+
+        nvd_api_key_for_enrich = get_nvd_api_key()
+
+        if nvd_api_key_for_enrich:
+            env["VULNWATCH_NVD_API_KEY"] = nvd_api_key_for_enrich
+
+        with st.spinner(
+            "Enrichissement NVD automatique en cours "
+            f"({AUTO_NVD_BATCH_SIZE} CVE)..."
+        ):
+
+            subprocess.run(
+                [
+                    sys.executable,
+                    "enrich.py"
+                ],
+                capture_output=True,
+                text=True,
+                env=env
+            )
+
+        st.cache_data.clear()
+
+
+auto_enrich_nvd_if_needed()
+
+
+# =========================================================
+# AUTOMATIC EMAIL NOTIFICATIONS (nouvelles + relances)
+# =========================================================
+#
+# Vérifie régulièrement s'il y a de nouvelles CVE à notifier aux
+# propriétaires de serveur (notification activée) ou des relances
+# arrivées à échéance (CVE toujours présente après le délai configuré
+# selon sa criticité). Ne fait rien si le SMTP n'est pas configuré.
+
+AUTO_NOTIFY_INTERVAL_MINUTES = 60
+
+
+def auto_notify_if_needed():
+
+    if not is_smtp_configured():
+        return
+
+    state = get_sync_state("email_notify")
+
+    now = datetime.now(timezone.utc)
+    needs_run = True
+
+    if state and state.get("last_run_at"):
+
+        try:
+
+            last_run = datetime.fromisoformat(
+                state["last_run_at"]
+            )
+
+            if last_run.tzinfo is None:
+                last_run = last_run.replace(
+                    tzinfo=timezone.utc
+                )
+
+            needs_run = (
+                (now - last_run)
+                >= timedelta(minutes=AUTO_NOTIFY_INTERVAL_MINUTES)
+            )
+
+        except ValueError:
+
+            needs_run = True
+
+    if needs_run:
+
+        with st.spinner(
+            "Vérification des notifications e-mail "
+            "(nouvelles alertes / relances)..."
+        ):
+
+            subprocess.run(
+                [
+                    sys.executable,
+                    "notify.py"
+                ],
+                capture_output=True,
+                text=True
+            )
+
+        st.cache_data.clear()
+
+
+auto_notify_if_needed()
+
+
+# =========================================================
+# AUTOMATIC NVD DAILY FEED (source principale + croisement XDR)
+# =========================================================
+#
+# Chaque jour, récupère les CVE nouvellement publiées par NVD (toutes
+# sources confondues, pas seulement CISA KEV) et les croise avec
+# l'inventaire XDR (defender_vulnerabilities). Toute correspondance
+# déclenche automatiquement une alerte vers la liste de diffusion de
+# l'onglet "Veille" (voir sync_nvd_feed.py). CISA KEV continue d'être
+# synchronisée séparément et sert toujours à notifier les propriétaires
+# de serveur (auto_notify_if_needed ci-dessus) : rien n'y change.
+
+AUTO_NVD_FEED_INTERVAL_MINUTES = 24 * 60
+
+
+def auto_sync_nvd_feed_if_needed():
+
+    state = get_sync_state("nvd_daily_feed")
+
+    now = datetime.now(timezone.utc)
+    needs_run = True
+
+    if state and state.get("last_run_at"):
+
+        try:
+
+            last_run = datetime.fromisoformat(
+                state["last_run_at"]
+            )
+
+            if last_run.tzinfo is None:
+                last_run = last_run.replace(
+                    tzinfo=timezone.utc
+                )
+
+            needs_run = (
+                (now - last_run)
+                >= timedelta(minutes=AUTO_NVD_FEED_INTERVAL_MINUTES)
+            )
+
+        except ValueError:
+
+            needs_run = True
+
+    if needs_run:
+
+        env = os.environ.copy()
+
+        api_key = get_nvd_api_key()
+
+        if api_key:
+            env["VULNWATCH_NVD_API_KEY"] = api_key
+
+        with st.spinner(
+            "Synchronisation NVD quotidienne en cours "
+            "(nouvelles CVE + croisement XDR)..."
+        ):
+
+            subprocess.run(
+                [
+                    sys.executable,
+                    "sync_nvd_feed.py"
+                ],
+                capture_output=True,
+                text=True,
+                env=env
+            )
+
+        st.cache_data.clear()
+
+
+auto_sync_nvd_feed_if_needed()
+
+
+# =========================================================
+# NVD HISTORICAL BACKFILL (téléchargement initial depuis 2020)
+# =========================================================
+#
+# Au tout premier lancement de l'appli, en plus de la synchro
+# quotidienne (nouvelles publications uniquement), on rapatrie en
+# arrière-plan tout l'historique NVD depuis get_nvd_backfill_start()
+# (par défaut le 1er janvier 2020). Potentiellement des dizaines de
+# milliers de CVE : on lance ça en sous-processus DÉTACHÉ (Popen, pas
+# subprocess.run) pour ne jamais bloquer l'interface, avec reprise sur
+# redémarrage (curseur persistant en base, voir sync_nvd_backfill.py).
+# Un "heartbeat" (sync_state mis à jour après chaque fenêtre) permet
+# de distinguer une synchro toujours active d'une synchro plantée, et
+# de ne relancer un sous-processus que dans ce dernier cas.
+
+NVD_BACKFILL_STALE_MINUTES = 15
+NVD_BACKFILL_ERROR_RETRY_MINUTES = 30
+
+
+def auto_launch_nvd_backfill_if_needed():
+
+    if is_nvd_backfill_done():
+        return
+
+    state = get_sync_state("nvd_historical_backfill")
+
+    now = datetime.now(timezone.utc)
+    should_launch = True
+
+    if state and state.get("last_run_at"):
+
+        try:
+
+            last_run = datetime.fromisoformat(state["last_run_at"])
+
+            if last_run.tzinfo is None:
+                last_run = last_run.replace(tzinfo=timezone.utc)
+
+            age = now - last_run
+
+            if state.get("status") == "RUNNING":
+
+                # Un process actif met à jour ce champ après CHAQUE
+                # fenêtre (quelques secondes à quelques minutes) : si
+                # ça n'a pas bougé depuis un moment, il est probable
+                # que le process ait été interrompu (redémarrage de
+                # l'appli, par exemple).
+                should_launch = age >= timedelta(
+                    minutes=NVD_BACKFILL_STALE_MINUTES
+                )
+
+            elif state.get("status") == "ERROR":
+
+                should_launch = age >= timedelta(
+                    minutes=NVD_BACKFILL_ERROR_RETRY_MINUTES
+                )
+
+            else:
+
+                should_launch = False
+
+        except ValueError:
+
+            should_launch = True
+
+    if should_launch:
+
+        env = os.environ.copy()
+
+        api_key = get_nvd_api_key()
+
+        if api_key:
+            env["VULNWATCH_NVD_API_KEY"] = api_key
+
+        subprocess.Popen(
+            [
+                sys.executable,
+                "sync_nvd_backfill.py"
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env=env
+        )
+
+
+auto_launch_nvd_backfill_if_needed()
+
+
+# =========================================================
+# DISPLAY HELPERS
+# =========================================================
+
+def fill_nvd_placeholders(frame):
+    """
+    Remplace les valeurs NULL de cvss_v3_score / cvss_v3_severity
+    par "N/A" pour l'affichage, au lieu du "None" par défaut de
+    pandas/Streamlit. Ces colonnes restent vides jusqu'à ce que
+    l'enrichissement NVD ait traité la CVE (ou si NVD ne la connaît
+    pas du tout).
+    """
+
+    frame = frame.copy()
+
+    if "cvss_v3_score" in frame.columns:
+
+        frame["cvss_v3_score"] = frame["cvss_v3_score"].apply(
+            lambda v: f"{v:.1f}" if pd.notna(v) else "N/A"
+        )
+
+    if "cvss_v3_severity" in frame.columns:
+
+        frame["cvss_v3_severity"] = (
+            frame["cvss_v3_severity"].fillna("N/A")
+        )
+
+    return frame
+
+
+PRIORITY_BADGES = {
+    "CRITICAL": "🔴 CRITICAL",
+    "HIGH": "🟠 HIGH",
+    "MEDIUM": "🟡 MEDIUM",
+    "LOW": "🔵 LOW",
+    "INFO": "⚪ INFO"
+}
+
+# Palette partagée par les graphiques (mêmes couleurs que les badges).
+SEVERITY_COLORS = {
+    "CRITICAL": "#ef4444",
+    "HIGH": "#f97316",
+    "MEDIUM": "#eab308",
+    "LOW": "#3b82f6",
+    "INFO": "#a1a1aa",
+    "N/A": "#9ca3af",
+    "UNKNOWN": "#9ca3af",
+    "NONE": "#9ca3af"
+}
+
+
+def plot_severity_bar(counts, x_title, y_title):
+    """
+    Construit un bar chart Plotly coloré par sévérité (mêmes
+    couleurs que les badges CRITICAL/HIGH/MEDIUM/LOW), avec les
+    valeurs affichées sur chaque barre.
+    """
+
+    chart_df = counts.reset_index()
+    chart_df.columns = ["severity", "count"]
+
+    fig = px.bar(
+        chart_df,
+        x="severity",
+        y="count",
+        color="severity",
+        color_discrete_map=SEVERITY_COLORS,
+        text="count"
+    )
+
+    fig.update_traces(
+        textposition="outside",
+        marker_line_width=0
+    )
+
+    fig.update_layout(
+        showlegend=False,
+        xaxis_title=x_title,
+        yaxis_title=y_title,
+        margin=dict(l=10, r=10, t=10, b=10),
+        height=320
+    )
+
+    return fig
+
+
+def badge_priority(value):
+    """
+    Préfixe la priorité CISA d'un indicateur coloré (émoji), lisible
+    d'un coup d'œil façon SOC/SIEM. st.dataframe n'interprète pas le
+    HTML dans les cellules, donc on reste sur de l'émoji + texte,
+    qui s'affiche correctement partout.
+    """
+
+    if pd.isna(value):
+        return "⚪ UNKNOWN"
+
+    text = str(value).strip().upper()
+
+    return PRIORITY_BADGES.get(text, f"⚪ {text}")
+
+
+def fill_priority_badges(frame, column="priority"):
+
+    frame = frame.copy()
+
+    if column in frame.columns:
+        frame[column] = frame[column].apply(badge_priority)
+
+    return frame
+
+
+# =========================================================
+# STYLE
+# =========================================================
+
+st.markdown("""
+<style>
+
+    .main {
+        padding-top: 1rem;
+    }
+
+    .block-container {
+        max-width: 1500px;
+        padding-top: 1.5rem;
+    }
+
+    .app-header {
+        padding: 0.5rem 0 1rem 0;
+    }
+
+    .app-title {
+        font-size: 2.3rem;
+        font-weight: 700;
+        margin-bottom: 0.1rem;
+    }
+
+    .app-subtitle {
+        color: #7f8c8d;
+        font-size: 1rem;
+        margin-bottom: 1rem;
+    }
+
+    .section-title {
+        font-size: 1.35rem;
+        font-weight: 600;
+        margin-top: 1rem;
+    }
+
+    .status-card {
+        padding: 1rem;
+        border-radius: 0.6rem;
+        border: 1px solid rgba(128,128,128,0.25);
+        background: rgba(128,128,128,0.05);
+    }
+
+    .server-card {
+        padding: 1.2rem;
+        border-radius: 0.6rem;
+        border: 1px solid rgba(128,128,128,0.25);
+        margin-bottom: 0.8rem;
+    }
+
+    div[data-testid="stMetric"] {
+        padding: 0.5rem;
+    }
+
+</style>
+""", unsafe_allow_html=True)
+
+
+# =========================================================
+# DATA LOADERS
+# =========================================================
+
+@st.cache_data(ttl=60)
+def load_vulnerabilities():
+
+    conn = get_connection()
+
+    df = pd.read_sql_query(
+        """
+        SELECT
+            cve_id,
+            vendor,
+            product,
+            vulnerability_name,
+            description,
+            date_added,
+            due_date,
+            known_ransomware,
+            source,
+            risk_score,
+            priority,
+            cvss_v3_score,
+            cvss_v3_severity,
+            cvss_v3_vector,
+            cvss_v4_score,
+            cvss_v4_severity,
+            cvss_v4_vector,
+            cwe,
+            nvd_description,
+            nvd_published,
+            nvd_last_modified,
+            nvd_enriched,
+            nvd_status,
+            ai_summary,
+            ai_impact,
+            ai_recommendation,
+            ai_confidence,
+            ai_model,
+            ai_generated_at,
+            ai_status
+        FROM vulnerabilities
+        """,
+        conn
+    )
+
+    conn.close()
+
+    return df
+
+
+@st.cache_data(ttl=60)
+def load_exposure():
+
+    conn = get_connection()
+
+    df = pd.read_sql_query(
+        """
+        SELECT
+            cve_id,
+            affected_devices,
+            affected_products,
+            defender_severity,
+            exploitability_level,
+            security_update_available,
+            recommended_security_updates,
+            recommended_security_update_ids,
+            ransomware,
+            generated_at
+        FROM cisa_defender_exposure
+        """,
+        conn
+    )
+
+    conn.close()
+
+    return df
+
+
+@st.cache_data(ttl=60)
+def get_top_vulnerable_devices(limit=15):
+
+    conn = get_connection()
+
+    df = pd.read_sql_query(
+        """
+        SELECT
+            d.device_id,
+            MAX(d.device_name) AS device_name,
+            COALESCE(MAX(ao.owner_name), 'Non attribué') AS owner_name,
+            COALESCE(MAX(ao.owner_email), 'N/A') AS owner_email,
+            COUNT(DISTINCT d.cve_id) AS cisa_cve_count
+        FROM defender_vulnerabilities d
+        INNER JOIN vulnerabilities v
+            ON d.cve_id = v.cve_id
+        LEFT JOIN asset_owners ao
+            ON ao.device_id = d.device_id
+        WHERE
+            v.source = 'CISA KEV'
+            AND d.device_name IS NOT NULL
+            AND TRIM(d.device_name) <> ''
+        GROUP BY
+            d.device_id
+        ORDER BY
+            cisa_cve_count DESC,
+            device_name ASC
+        LIMIT ?
+        """,
+        conn,
+        params=(limit,)
+    )
+
+    conn.close()
+    return df
+
+
+@st.cache_data(ttl=60)
+def get_server_metrics():
+
+    conn = get_connection()
+
+    total_servers = conn.execute(
+        """
+        SELECT COUNT(DISTINCT d.device_id)
+        FROM defender_vulnerabilities d
+        WHERE LOWER(COALESCE(d.os_platform, ''))
+                LIKE '%windowsserver%'
+            OR
+            LOWER(COALESCE(d.os_platform, ''))
+                LIKE '%windows server%'
+        """
+    ).fetchone()[0]
+
+    vulnerable_servers = conn.execute(
+        """
+        SELECT COUNT(DISTINCT d.device_id)
+
+        FROM defender_vulnerabilities d
+
+        INNER JOIN vulnerabilities v
+            ON d.cve_id = v.cve_id
+
+
+        WHERE
+            (
+                LOWER(COALESCE(d.os_platform, ''))
+                    LIKE '%windowsserver%'
+                OR
+                LOWER(COALESCE(d.os_platform, ''))
+                    LIKE '%windows server%'
+            )
+
+            AND v.source = 'CISA KEV'
+        """
+    ).fetchone()[0]
+
+    critical_servers = conn.execute(
+        """
+        SELECT COUNT(DISTINCT d.device_id)
+
+        FROM defender_vulnerabilities d
+
+        INNER JOIN vulnerabilities v
+            ON d.cve_id = v.cve_id
+
+
+        WHERE
+            (
+                LOWER(COALESCE(d.os_platform, ''))
+                    LIKE '%windowsserver%'
+                OR
+                LOWER(COALESCE(d.os_platform, ''))
+                    LIKE '%windows server%'
+            )
+
+            AND v.source = 'CISA KEV'
+            AND v.priority = 'CRITICAL'
+        """
+    ).fetchone()[0]
+
+    server_cves = conn.execute(
+        """
+        SELECT COUNT(DISTINCT d.cve_id)
+
+        FROM defender_vulnerabilities d
+
+        INNER JOIN vulnerabilities v
+            ON d.cve_id = v.cve_id
+
+
+        WHERE
+            (
+                LOWER(COALESCE(d.os_platform, ''))
+                    LIKE '%windowsserver%'
+                OR
+                LOWER(COALESCE(d.os_platform, ''))
+                    LIKE '%windows server%'
+            )
+
+            AND v.source = 'CISA KEV'
+        """
+    ).fetchone()[0]
+
+    conn.close()
+
+    return {
+        "total_servers": total_servers,
+        "vulnerable_servers": vulnerable_servers,
+        "critical_servers": critical_servers,
+        "server_cves": server_cves
+    }
+
+
+@st.cache_data(ttl=60)
+def get_server_cves():
+
+    conn = get_connection()
+
+    df = pd.read_sql_query(
+        """
+        SELECT
+            d.cve_id,
+            v.vendor,
+            v.product,
+            v.priority,
+            v.cvss_v3_score,
+            v.cvss_v3_severity,
+            v.known_ransomware,
+
+            COUNT(DISTINCT d.device_id)
+                AS affected_servers,
+
+            COUNT(DISTINCT
+                COALESCE(d.software_vendor, '')
+                || '|'
+                || COALESCE(d.software_name, '')
+                || '|'
+                || COALESCE(d.software_version, '')
+            ) AS affected_products,
+
+            MAX(d.defender_severity)
+                AS defender_severity,
+
+            MAX(d.exploitability_level)
+                AS exploitability_level,
+
+            MAX(d.security_update_available)
+                AS security_update_available,
+
+            GROUP_CONCAT(
+                DISTINCT d.recommended_security_update
+            ) AS recommended_updates
+
+        FROM defender_vulnerabilities d
+
+        INNER JOIN vulnerabilities v
+            ON d.cve_id = v.cve_id
+
+
+        WHERE
+            (
+                LOWER(COALESCE(d.os_platform, ''))
+                    LIKE '%windowsserver%'
+                OR
+                LOWER(COALESCE(d.os_platform, ''))
+                    LIKE '%windows server%'
+            )
+
+            AND v.source = 'CISA KEV'
+
+        GROUP BY
+            d.cve_id,
+            v.vendor,
+            v.product,
+            v.priority,
+            v.cvss_v3_score,
+            v.cvss_v3_severity,
+            v.known_ransomware
+
+        ORDER BY
+            CASE v.priority
+                WHEN 'CRITICAL' THEN 1
+                WHEN 'HIGH' THEN 2
+                WHEN 'MEDIUM' THEN 3
+                WHEN 'LOW' THEN 4
+                ELSE 5
+            END,
+            affected_servers DESC
+        """,
+        conn
+    )
+
+    conn.close()
+
+    return df
+
+
+@st.cache_data(ttl=60)
+def get_server_inventory():
+
+    conn = get_connection()
+
+    df = pd.read_sql_query(
+        """
+        SELECT
+            d.device_id,
+            d.device_name,
+            d.os_platform,
+            d.os_version,
+
+            m.owner AS owner,
+            COALESCE(m.notification, 0) AS notification,
+
+            COUNT(
+                DISTINCT
+                CASE
+                    WHEN v.source = 'CISA KEV'
+                    THEN d.cve_id
+                END
+            ) AS cve_count,
+
+            COUNT(
+                DISTINCT
+                CASE
+                    WHEN v.source = 'CISA KEV'
+                        AND v.priority = 'CRITICAL'
+                    THEN d.cve_id
+                END
+            ) AS critical_cve_count,
+
+            COUNT(
+                DISTINCT
+                CASE
+                    WHEN v.source = 'CISA KEV'
+                        AND v.priority = 'MEDIUM'
+                    THEN d.cve_id
+                END
+            ) AS medium_cve_count
+
+        FROM defender_vulnerabilities d
+
+
+        LEFT JOIN vulnerabilities v
+            ON d.cve_id = v.cve_id
+            AND v.source = 'CISA KEV'
+
+        LEFT JOIN manual_server_owners m
+            ON m.device_name = d.device_name
+
+        WHERE
+            (
+                LOWER(COALESCE(d.os_platform, ''))
+                    LIKE '%windowsserver%'
+                OR
+                LOWER(COALESCE(d.os_platform, ''))
+                    LIKE '%windows server%'
+            )
+
+        GROUP BY
+            d.device_id,
+            d.device_name,
+            d.os_platform,
+            d.os_version,
+            m.owner,
+            m.notification
+
+        ORDER BY
+            critical_cve_count DESC,
+            cve_count DESC,
+            d.device_name ASC
+        """,
+        conn
+    )
+
+    conn.close()
+
+    return df
+
+
+@st.cache_data(ttl=60)
+def get_server_cve_devices(cve_id):
+
+    conn = get_connection()
+
+    df = pd.read_sql_query(
+        """
+        SELECT DISTINCT
+            d.device_id,
+            d.device_name,
+            d.os_platform,
+            d.os_version,
+            d.software_vendor,
+            d.software_name,
+            d.software_version,
+            d.defender_severity,
+            d.exploitability_level,
+            d.security_update_available,
+            d.recommended_security_update,
+            d.recommended_security_update_id,
+            d.first_seen_timestamp,
+            d.last_seen_timestamp
+
+        FROM defender_vulnerabilities d
+
+
+        WHERE
+            d.cve_id = ?
+
+            AND (
+                LOWER(COALESCE(d.os_platform, ''))
+                    LIKE '%windowsserver%'
+                OR
+                LOWER(COALESCE(d.os_platform, ''))
+                    LIKE '%windows server%'
+            )
+
+        ORDER BY
+            d.device_name ASC
+        """,
+        conn,
+        params=(cve_id,)
+    )
+
+    conn.close()
+
+    return df
+
+
+# =========================================================
+# LOAD DATA
+# =========================================================
+
+df = load_vulnerabilities()
+exposure_df = load_exposure()
+
+if df.empty:
+
+    st.warning(
+        "Aucune vulnérabilité trouvée dans la base de données."
+    )
+
+    st.stop()
+
+
+# =========================================================
+# PREPARATION
+# =========================================================
+
+df["due_date_dt"] = pd.to_datetime(
+    df["due_date"],
+    errors="coerce"
+)
+
+today = pd.Timestamp(date.today())
+
+df["overdue"] = (
+    df["due_date_dt"].notna()
+    &
+    (df["due_date_dt"] < today)
+)
+
+df["ransomware_known"] = (
+    df["known_ransomware"]
+    .fillna("")
+    .str.lower()
+    .eq("known")
+)
+
+
+df = df.merge(
+    exposure_df,
+    on="cve_id",
+    how="left",
+    suffixes=("", "_exposure")
+)
+
+df["affected_devices"] = (
+    df["affected_devices"]
+    .fillna(0)
+    .astype(int)
+)
+
+df["affected_products"] = (
+    df["affected_products"]
+    .fillna(0)
+    .astype(int)
+)
+
+
+df["environment_status"] = (
+    df["affected_devices"]
+    .gt(0)
+    .map(
+        {
+            True: "PRESENT",
+            False: "NOT PRESENT"
+        }
+    )
+)
+
+
+# `df` ramène maintenant TOUTES les sources (CISA KEV + NVD, depuis
+# que sync_nvd_feed.py alimente aussi `vulnerabilities`). Le tableau
+# de bord, l'onglet "CISA KEV" et "Investigation CVE" sont, par leur
+# nom même, scopés CISA KEV : ils utilisent `df_cisa`. `df_nvd` sert
+# aux métriques NVD dédiées (voir tableau de bord ci-dessous) — pour
+# le détail et les alertes de correspondance XDR, voir l'onglet
+# "Veille", qui n'est volontairement pas limité à une seule source.
+df_cisa = df[df["source"] == "CISA KEV"].copy()
+df_nvd = df[df["source"] == "NVD"].copy()
+
+# `cisa_defender_exposure` (fusionné dans `df` plus haut) est
+# volontairement limité aux CVE CISA KEV avec un propriétaire résolu
+# -- il ne contient donc JAMAIS de ligne pour une CVE source='NVD',
+# et `affected_devices`/`affected_products` valaient 0 pour TOUTE CVE
+# NVD, quel que soit son nombre réel de correspondances dans
+# l'inventaire XDR. On recalcule ici la vraie présence NVD <-> XDR
+# (voir get_nvd_defender_exposure() pour la différence de portée).
+_nvd_exposure = get_nvd_defender_exposure()
+
+df_nvd["affected_devices"] = df_nvd["cve_id"].map(
+    lambda cve_id: _nvd_exposure.get(cve_id, {}).get("affected_devices", 0)
+)
+
+df_nvd["affected_products"] = df_nvd["cve_id"].map(
+    lambda cve_id: _nvd_exposure.get(cve_id, {}).get("affected_products", 0)
+)
+
+
+# =========================================================
+# HEADER
+# =========================================================
+
+st.markdown("""
+<div class="app-header">
+    <div class="app-title">VulnWatch AI</div>
+    <div class="app-subtitle">
+        CISA KEV &nbsp;•&nbsp;
+        NVD &nbsp;•&nbsp;
+        Microsoft Defender
+    </div>
+</div>
+""", unsafe_allow_html=True)
+
+
+# =========================================================
+# SIDEBAR
+# =========================================================
+
+with st.sidebar:
+
+    st.header("VulnWatch AI")
+
+    current_username = st.session_state.get(
+        "authenticated_username",
+        "admin"
+    )
+
+    st.success(f"Connecté en tant que {current_username}")
+
+    if st.button("Se déconnecter", use_container_width=True):
+        st.session_state["authenticated"] = False
+        st.rerun()
+
+    st.write("Plateforme de renseignement sécurité")
+
+    st.divider()
+
+    with st.expander("🔐 Compte"):
+
+        st.caption(
+            "Change le nom d'utilisateur et/ou le mot de passe "
+            "de connexion à l'application."
+        )
+
+        new_username = st.text_input(
+            "Nom d'utilisateur",
+            value=current_username,
+            key="account_new_username"
+        )
+
+        new_password = st.text_input(
+            "Nouveau mot de passe",
+            type="password",
+            key="account_new_password"
+        )
+
+        confirm_password = st.text_input(
+            "Confirmer le mot de passe",
+            type="password",
+            key="account_confirm_password"
+        )
+
+        if st.button(
+            "Mettre à jour les identifiants",
+            key="account_update_btn"
+        ):
+
+            if not new_username.strip():
+
+                st.error(
+                    "Le nom d'utilisateur ne peut pas être vide."
+                )
+
+            elif not new_password:
+
+                st.error(
+                    "Le mot de passe ne peut pas être vide."
+                )
+
+            elif new_password != confirm_password:
+
+                st.error(
+                    "Les deux mots de passe ne correspondent pas."
+                )
+
+            elif len(new_password) < 8:
+
+                st.error(
+                    "Le mot de passe doit contenir au moins "
+                    "8 caractères."
+                )
+
+            else:
+
+                set_admin_credentials(
+                    new_username.strip(),
+                    new_password
+                )
+
+                st.success(
+                    "Identifiants mis à jour. "
+                    "Merci de vous reconnecter."
+                )
+
+                st.session_state["authenticated"] = False
+
+                st.rerun()
+
+    st.divider()
+
+    st.subheader("Sources de données")
+
+    st.write("CISA KEV")
+    st.write("NVD")
+    st.write("Microsoft Defender")
+    st.write("IA locale (Ollama)")
+
+    st.divider()
+
+    st.subheader("Actions")
+
+    cisa_sync_state = get_sync_state("cisa_kev")
+
+    if cisa_sync_state:
+
+        cisa_status = cisa_sync_state.get("status")
+
+        sync_status_icon = (
+            "🟢"
+            if cisa_status == "OK"
+            else "🟠"
+            if cisa_status == "WARNING"
+            else "🔴"
+        )
+
+        st.caption(
+            f"{sync_status_icon} Dernière synchro CISA : "
+            f"{format_sync_timestamp(cisa_sync_state.get('last_run_at'))} "
+            f"(auto. toutes les {AUTO_SYNC_INTERVAL_HOURS}h)"
+        )
+
+        if cisa_status == "WARNING":
+
+            st.warning(
+                "Un sync CISA précédent a détecté une perte "
+                "d'enrichissement NVD/IA :\n\n"
+                f"{cisa_sync_state.get('detail')}"
+            )
+
+    else:
+
+        st.caption(
+            "⚪ Aucune synchronisation CISA effectuée pour le moment "
+            f"(auto. toutes les {AUTO_SYNC_INTERVAL_HOURS}h)"
+        )
+
+    if st.button(
+        "Synchroniser CISA",
+        use_container_width=True
+    ):
+
+        with st.spinner(
+            "Synchronisation CISA en cours..."
+        ):
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "sync.py"
+                ],
+                capture_output=True,
+                text=True
+            )
+
+        if result.returncode == 0:
+
+            refreshed_state = get_sync_state("cisa_kev")
+
+            if refreshed_state and refreshed_state.get("status") == "WARNING":
+
+                st.warning(
+                    "Synchronisation CISA terminée, mais une perte "
+                    "d'enrichissement NVD/IA a été détectée :\n\n"
+                    f"{refreshed_state.get('detail')}"
+                )
+
+            else:
+
+                st.success(
+                    "Synchronisation CISA terminée."
+                )
+
+            st.cache_data.clear()
+
+            st.rerun()
+
+        else:
+
+            st.error(
+                "Échec de la synchronisation CISA."
+            )
+
+            st.code(
+                result.stderr,
+                language="text"
+            )
+
+
+    nvd_pending = get_pending_nvd_count()
+
+    nvd_sync_state = get_sync_state("nvd_enrich")
+
+    if nvd_sync_state:
+
+        st.caption(
+            "🟢 Dernier enrichissement NVD : "
+            f"{format_sync_timestamp(nvd_sync_state.get('last_run_at'))} "
+            f"· {nvd_pending} CVE en attente "
+            f"(auto. {AUTO_NVD_BATCH_SIZE} CVE / "
+            f"{AUTO_NVD_INTERVAL_MINUTES} min)"
+        )
+
+    else:
+
+        st.caption(
+            f"⚪ Aucun enrichissement NVD effectué · "
+            f"{nvd_pending} CVE en attente"
+        )
+
+    nvd_batch_size = st.number_input(
+        "Nombre de CVE à enrichir (NVD)",
+        min_value=1,
+        value=20,
+        step=1,
+        key="nvd_batch_size"
+    )
+
+    if st.button(
+        "Enrichir NVD maintenant",
+        use_container_width=True
+    ):
+
+        env = os.environ.copy()
+        env["VULNWATCH_MAX_CVES"] = str(int(nvd_batch_size))
+
+        nvd_api_key_for_manual_enrich = get_nvd_api_key()
+
+        if nvd_api_key_for_manual_enrich:
+            env["VULNWATCH_NVD_API_KEY"] = nvd_api_key_for_manual_enrich
+
+        with st.spinner(
+            f"Enrichissement NVD en cours ({int(nvd_batch_size)} CVE, "
+            "peut prendre plusieurs minutes)..."
+        ):
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "enrich.py"
+                ],
+                capture_output=True,
+                text=True,
+                env=env
+            )
+
+        if result.returncode == 0:
+
+            st.success(
+                "Enrichissement NVD terminé."
+            )
+
+            st.code(
+                result.stdout,
+                language="text"
+            )
+
+            st.cache_data.clear()
+
+            st.rerun()
+
+        else:
+
+            st.error(
+                "Échec de l'enrichissement NVD."
+            )
+
+            st.code(
+                result.stdout + result.stderr,
+                language="text"
+            )
+
+
+    st.divider()
+
+    ai_batch_size = st.number_input(
+        "Nombre de CVE à analyser",
+        min_value=1,
+        max_value=100,
+        value=10,
+        step=1,
+        key="ai_batch_size"
+    )
+
+    if st.button(
+        "Analyser avec l'IA locale",
+        use_container_width=True
+    ):
+
+        with st.spinner(
+            "Analyse IA en cours (LLM local via Ollama)..."
+        ):
+
+            env = os.environ.copy()
+            env["VULNWATCH_AI_MAX_CVES"] = str(int(ai_batch_size))
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "ai_enrich.py"
+                ],
+                capture_output=True,
+                text=True,
+                env=env
+            )
+
+        if result.returncode == 0:
+
+            st.success(
+                "Analyse IA terminée."
+            )
+
+            st.code(
+                result.stdout,
+                language="text"
+            )
+
+            st.cache_data.clear()
+
+            st.rerun()
+
+        else:
+
+            st.error(
+                "Échec de l'analyse IA. "
+                "Vérifiez qu'Ollama est démarré en local."
+            )
+
+            st.code(
+                result.stdout + result.stderr,
+                language="text"
+            )
+
+
+    st.divider()
+
+    st.caption(
+        "Priority values are preserved from "
+        "the VulnWatch source classification."
+    )
+
+
+# =========================================================
+# GLOBAL METRICS
+# =========================================================
+#
+# Scopées CISA KEV (df_cisa), comme avant l'ajout de NVD comme source
+# d'entrée — sinon les CVE NVD viendraient gonfler silencieusement un
+# total étiqueté "CISA KEV". Les métriques NVD ont leur propre bloc
+# juste en dessous.
+
+total = len(df_cisa)
+
+critical = int(
+    (df_cisa["priority"] == "CRITICAL").sum()
+)
+
+high = int(
+    (df_cisa["priority"] == "HIGH").sum()
+)
+
+medium = int(
+    (df_cisa["priority"] == "MEDIUM").sum()
+)
+
+present = int(
+    (df_cisa["affected_devices"] > 0).sum()
+)
+
+affected_devices = int(
+    df_cisa.loc[
+        df_cisa["affected_devices"] > 0,
+        "affected_devices"
+    ].sum()
+)
+
+
+# NVD (source principale, voir sync_nvd_feed.py) : total des CVE
+# publiées récupérées, et combien d'entre elles ont une correspondance
+# dans l'inventaire XDR (c'est ce sous-ensemble qui déclenche les
+# alertes de l'onglet "Veille").
+
+nvd_total = len(df_nvd)
+
+nvd_present = int(
+    (df_nvd["affected_devices"] > 0).sum()
+)
+
+nvd_critical = int(
+    (df_nvd["priority"] == "CRITICAL").sum()
+)
+
+
+# =========================================================
+# TABS
+# =========================================================
+
+tab_dashboard, tab_servers, tab_kev, tab_investigation, tab_notifications, tab_attack_surface, tab_watch = st.tabs(
+    [
+        "Tableau de bord",
+        "Serveurs",
+        "CISA KEV",
+        "Investigation CVE",
+        "Notifications",
+        "Attack Surface",
+        "Veille"
+    ]
+)
+
+
+# =========================================================
+# DASHBOARD TAB
+# =========================================================
+
+with tab_dashboard:
+
+    st.subheader("Vue d’ensemble de la sécurité")
+
+    c1, c2, c3, c4, c5 = st.columns(5)
+
+    c1.metric(
+        "CISA KEV",
+        f"{total:,}"
+    )
+
+    c2.metric(
+        "CRITICAL",
+        f"{critical:,}"
+    )
+
+    c3.metric(
+        "HIGH",
+        f"{high:,}"
+    )
+
+    c4.metric(
+        "Présentes dans l’environnement",
+        f"{present:,}"
+    )
+
+    c5.metric(
+        "Équipements affectés",
+        f"{affected_devices:,}"
+    )
+
+    st.caption("CISA KEV (catalogue d'exploitation active confirmée)")
+
+    n1, n2, n3 = st.columns(3)
+
+    n1.metric(
+        "NVD",
+        f"{nvd_total:,}"
+    )
+
+    n2.metric(
+        "NVD — CRITICAL",
+        f"{nvd_critical:,}"
+    )
+
+    n3.metric(
+        "NVD présentes dans l’environnement",
+        f"{nvd_present:,}"
+    )
+
+    st.caption(
+        "NVD (source principale, synchronisation quotidienne — voir "
+        "l'onglet Veille) : total des CVE récemment publiées suivies, "
+        "et combien ont une correspondance confirmée dans l'inventaire "
+        "XDR."
+    )
+
+    st.divider()
+
+    st.markdown(
+        "### Top 15 Most Vulnerable Devices"
+    )
+    st.caption(
+        "Classement selon le nombre de CVE CISA KEV distinctes détectées par Microsoft Defender."
+    )
+
+    top_devices = get_top_vulnerable_devices(15)
+
+    if top_devices.empty:
+        st.info(
+            "Aucun équipement vulnérable trouvé dans les données CISA KEV actuelles."
+        )
+    else:
+        top_devices["chart_label"] = (
+            top_devices["device_name"].fillna("Unknown Device")
+            + " — "
+            + top_devices["owner_name"].fillna("Non attribué")
+        )
+
+        chart_data = top_devices.sort_values(
+            "cisa_cve_count",
+            ascending=True
+        )
+
+        devices_fig = px.bar(
+            chart_data,
+            x="cisa_cve_count",
+            y="chart_label",
+            orientation="h",
+            color="cisa_cve_count",
+            color_continuous_scale="Reds",
+            text="cisa_cve_count",
+            hover_data={
+                "owner_email": True,
+                "cisa_cve_count": True,
+                "chart_label": False
+            }
+        )
+
+        devices_fig.update_traces(
+            textposition="outside"
+        )
+
+        devices_fig.update_layout(
+            showlegend=False,
+            coloraxis_showscale=False,
+            xaxis_title="Nombre de CVE CISA KEV",
+            yaxis_title="",
+            margin=dict(l=10, r=10, t=10, b=10),
+            height=max(320, 28 * len(chart_data))
+        )
+
+        st.plotly_chart(
+            devices_fig,
+            use_container_width=True
+        )
+
+        top_devices_display = top_devices[[
+            "device_name",
+            "owner_name",
+            "owner_email",
+            "cisa_cve_count"
+        ]].rename(
+            columns={
+                "device_name": "Équipement",
+                "owner_name": "Propriétaire",
+                "owner_email": "E-mail propriétaire",
+                "cisa_cve_count": "Nombre de CVE CISA KEV"
+            }
+        )
+
+        st.dataframe(
+            top_devices_display,
+            use_container_width=True,
+            hide_index=True
+        )
+
+    st.divider()
+
+    left, right = st.columns(2)
+
+    with left:
+
+        st.markdown(
+            "### CISA Priority"
+        )
+
+        priority_counts = (
+            df_cisa["priority"]
+            .value_counts()
+            .reindex(
+                [
+                    "CRITICAL",
+                    "HIGH",
+                    "MEDIUM",
+                    "LOW"
+                ],
+                fill_value=0
+            )
+        )
+
+        st.plotly_chart(
+            plot_severity_bar(
+                priority_counts,
+                x_title="Priorité CISA",
+                y_title="Nombre de CVE"
+            ),
+            use_container_width=True
+        )
+
+
+    with right:
+
+        st.markdown(
+            "### NVD CVSS Severity"
+        )
+
+        nvd_counts = (
+            df_cisa["cvss_v3_severity"]
+            .fillna("N/A")
+            .str.upper()
+            .value_counts()
+        )
+
+        st.plotly_chart(
+            plot_severity_bar(
+                nvd_counts,
+                x_title="Sévérité NVD",
+                y_title="Nombre de CVE"
+            ),
+            use_container_width=True
+        )
+
+
+    st.divider()
+
+    st.markdown(
+        "### CISA KEV Present in Environment"
+    )
+
+    exposed = df_cisa[
+        df_cisa["affected_devices"] > 0
+    ].copy()
+
+    if exposed.empty:
+
+        st.info(
+            "No CISA KEV currently matched "
+            "in the Defender environment."
+        )
+
+    else:
+
+        display = exposed[
+            [
+                "cve_id",
+                "vendor",
+                "product",
+                "priority",
+                "cvss_v3_score",
+                "cvss_v3_severity",
+                "affected_devices",
+                "defender_severity",
+                "exploitability_level"
+            ]
+        ].copy()
+
+        display = fill_nvd_placeholders(display)
+        display = fill_priority_badges(display)
+
+        display = display.rename(
+            columns={
+                "cve_id": "CVE",
+                "vendor": "Éditeur",
+                "product": "Product",
+                "priority": "Priorité CISA",
+                "cvss_v3_score": "CVSS 3.1",
+                "cvss_v3_severity": "Sévérité NVD",
+                "affected_devices": "Devices",
+                "defender_severity": "Sévérité Defender",
+                "exploitability_level": "Exploitabilité"
+            }
+        )
+
+        st.dataframe(
+            display,
+            use_container_width=True,
+            hide_index=True
+        )
+
+
+# =========================================================
+# SERVERS TAB
+# =========================================================
+
+with tab_servers:
+
+    st.subheader(
+        "Sécurité des serveurs Windows"
+    )
+
+    st.caption(
+        "Servers are identified from Defender "
+        "devices running Windows Server."
+    )
+
+    metrics = get_server_metrics()
+
+    s1, s2, s3, s4 = st.columns(4)
+
+    s1.metric(
+        "Serveurs Windows",
+        f"{metrics['total_servers']:,}"
+    )
+
+    s2.metric(
+        "Serveurs avec CISA KEV",
+        f"{metrics['vulnerable_servers']:,}"
+    )
+
+    s3.metric(
+        "Serveurs avec KEV CRITIQUE",
+        f"{metrics['critical_servers']:,}"
+    )
+
+    s4.metric(
+        "CVE CISA sur les serveurs",
+        f"{metrics['server_cves']:,}"
+    )
+
+    st.divider()
+
+    server_cves = get_server_cves()
+
+    if server_cves.empty:
+
+        st.success(
+            "No CISA KEV vulnerability has "
+            "been detected on Windows Servers."
+        )
+
+    else:
+
+        st.markdown(
+            "### Top CISA KEV Vulnerabilities on Servers"
+        )
+
+        server_display = fill_priority_badges(
+            fill_nvd_placeholders(
+                server_cves[
+                    [
+                        "cve_id",
+                        "vendor",
+                        "product",
+                        "priority",
+                        "cvss_v3_score",
+                        "cvss_v3_severity",
+                        "affected_servers",
+                        "affected_products",
+                        "defender_severity",
+                        "exploitability_level",
+                        "security_update_available",
+                        "recommended_updates"
+                    ]
+                ]
+            )
+        ).rename(
+            columns={
+                "cve_id": "CVE",
+                "vendor": "Éditeur",
+                "product": "Product",
+                "priority": "Priorité CISA",
+                "cvss_v3_score": "CVSS 3.1",
+                "cvss_v3_severity": "Sévérité NVD",
+                "affected_servers": "Serveurs",
+                "affected_products": "Produits",
+                "defender_severity": "Sévérité Defender",
+                "exploitability_level": "Exploitabilité",
+                "security_update_available": "Mise à jour disponible",
+                "recommended_updates": "Mise à jour recommandée"
+            }
+        )
+
+        st.dataframe(
+            server_display,
+            use_container_width=True,
+            hide_index=True
+        )
+
+    st.divider()
+
+    st.markdown(
+        "### Windows Server Inventory"
+    )
+
+    with st.expander(
+        "Importer propriétaires / notification (CSV)"
+    ):
+
+        st.caption(
+            "Colonnes attendues : nom du serveur (device / device_name / "
+            "server / serveur), owner, notification (1/0, TRUE/FALSE, "
+            "oui/non ou x). Le nom du serveur doit correspondre à celui "
+            "affiché dans la colonne \"Server\" ci-dessous. Le champ "
+            "\"owner\" doit être une **adresse e-mail** : c'est elle qui "
+            "reçoit les alertes / relances (onglet Notifications) si la "
+            "notification est activée."
+        )
+
+        owners_csv = st.file_uploader(
+            "Fichier CSV",
+            type=["csv"],
+            key="owners_csv_uploader"
+        )
+
+        if owners_csv is not None:
+
+            try:
+
+                owners_df = pd.read_csv(owners_csv)
+
+            except Exception as error:
+
+                owners_df = None
+
+                st.error(
+                    f"Impossible de lire le CSV : {error}"
+                )
+
+            if owners_df is not None:
+
+                normalized = {
+                    col: str(col).strip().lower()
+                    for col in owners_df.columns
+                }
+
+                device_col = next(
+                    (
+                        col for col, norm in normalized.items()
+                        if norm in {
+                            "divise", "device", "device_name",
+                            "server", "serveur"
+                        }
+                    ),
+                    None
+                )
+
+                owner_col = next(
+                    (
+                        col for col, norm in normalized.items()
+                        if norm in {"owner", "proprietaire", "propriétaire"}
+                    ),
+                    None
+                )
+
+                notification_col = next(
+                    (
+                        col for col, norm in normalized.items()
+                        if norm in {"notification", "notif", "notify"}
+                    ),
+                    None
+                )
+
+                if not device_col or not owner_col or not notification_col:
+
+                    st.error(
+                        "Le CSV doit contenir 3 colonnes : nom du serveur, "
+                        "owner, notification. Colonnes détectées : "
+                        + ", ".join(str(c) for c in owners_df.columns)
+                    )
+
+                else:
+
+                    def _parse_notification(value):
+
+                        if pd.isna(value):
+                            return 0
+
+                        text = str(value).strip().lower()
+
+                        return (
+                            1
+                            if text in {
+                                "1", "1.0", "true", "vrai",
+                                "oui", "yes", "x"
+                            }
+                            else 0
+                        )
+
+                    owners_rows = [
+                        {
+                            "device_name": str(
+                                row[device_col]
+                            ).strip(),
+                            "owner": (
+                                str(row[owner_col]).strip()
+                                if pd.notna(row[owner_col])
+                                else None
+                            ),
+                            "notification": _parse_notification(
+                                row[notification_col]
+                            )
+                        }
+                        for _, row in owners_df.iterrows()
+                        if pd.notna(row[device_col])
+                        and str(row[device_col]).strip()
+                    ]
+
+                    st.write(
+                        f"{len(owners_rows)} ligne(s) détectée(s)."
+                    )
+
+                    if st.button(
+                        "Importer",
+                        key="import_owners_btn"
+                    ):
+
+                        imported = import_manual_server_owners(
+                            owners_rows
+                        )
+
+                        st.success(
+                            f"{imported} propriétaire(s)/notification(s) "
+                            "importé(s)."
+                        )
+
+                        st.cache_data.clear()
+
+                        st.rerun()
+
+    servers = get_server_inventory()
+
+    if servers.empty:
+
+        st.info(
+            "Aucun serveur Windows trouvé."
+        )
+
+    else:
+
+        server_count = len(servers)
+
+        st.write(
+            f"{server_count:,} Windows Server devices found"
+        )
+
+        st.caption(
+            "Vous pouvez modifier directement le propriétaire (adresse "
+            "e-mail) et la notification dans le tableau, puis cliquer sur "
+            "\"Enregistrer les modifications\"."
+        )
+
+        servers_editable = servers.copy()
+
+        servers_editable["owner"] = (
+            servers_editable["owner"].fillna("")
+        )
+
+        servers_editable["notification"] = (
+            servers_editable["notification"]
+            .fillna(0)
+            .astype(int)
+            .astype(bool)
+        )
+
+        servers_editable = servers_editable.rename(
+            columns={
+                "device_id": "ID équipement",
+                "device_name": "Server",
+                "os_platform": "OS",
+                "os_version": "Version OS",
+                "owner": "Propriétaire",
+                "notification": "Notification",
+                "cve_count": "Nombre de CVE CISA",
+                "critical_cve_count": "CVE critiques",
+                "medium_cve_count": "CVE moyennes"
+            }
+        )
+
+        edited_servers = st.data_editor(
+            servers_editable,
+            use_container_width=True,
+            hide_index=True,
+            disabled=[
+                "ID équipement",
+                "Server",
+                "OS",
+                "Version OS",
+                "Nombre de CVE CISA",
+                "CVE critiques",
+                "CVE moyennes"
+            ],
+            column_config={
+                "Propriétaire": st.column_config.TextColumn(
+                    "Propriétaire"
+                ),
+                "Notification": st.column_config.CheckboxColumn(
+                    "Notification"
+                )
+            },
+            key="server_inventory_editor"
+        )
+
+        if st.button(
+            "Enregistrer les modifications",
+            key="save_server_inventory_btn"
+        ):
+
+            rows_to_save = [
+                {
+                    "device_name": row["Server"],
+                    "owner": (
+                        row["Propriétaire"].strip()
+                        if isinstance(row["Propriétaire"], str)
+                        and row["Propriétaire"].strip()
+                        else None
+                    ),
+                    "notification": (
+                        1 if row["Notification"] else 0
+                    )
+                }
+                for _, row in edited_servers.iterrows()
+            ]
+
+            imported = import_manual_server_owners(
+                rows_to_save
+            )
+
+            invalid_email_devices = [
+                row["device_name"]
+                for row in rows_to_save
+                if row["notification"] == 1
+                and (not row["owner"] or "@" not in row["owner"])
+            ]
+
+            st.session_state.pop(
+                "server_inventory_editor",
+                None
+            )
+
+            st.success(
+                f"{imported} serveur(s) mis à jour."
+            )
+
+            if invalid_email_devices:
+
+                st.warning(
+                    "Notification activée mais propriétaire sans adresse "
+                    "e-mail valide pour : "
+                    + ", ".join(invalid_email_devices)
+                    + ". Ces serveurs ne recevront aucune alerte tant que "
+                    "le champ \"Propriétaire\" ne contient pas une adresse "
+                    "e-mail."
+                )
+
+            st.cache_data.clear()
+
+            st.rerun()
+
+    st.divider()
+
+    st.markdown(
+        "### Server Investigation"
+    )
+
+    if not servers.empty:
+
+        selected_server = st.selectbox(
+            "Sélectionner un serveur",
+            servers["device_name"].tolist()
+        )
+
+        server = servers[
+            servers["device_name"]
+            == selected_server
+        ].iloc[0]
+
+
+        a1, a2, a3 = st.columns(3)
+
+        a1.metric(
+            "CISA CVE",
+            int(server["cve_count"])
+        )
+
+        a2.metric(
+            "CRITICAL",
+            int(server["critical_cve_count"])
+        )
+
+        a3.metric(
+            "MEDIUM",
+            int(server["medium_cve_count"])
+        )
+
+        st.write(
+            f"**OS:** {server['os_platform']} "
+            f"{server['os_version']}"
+        )
+
+        conn = get_connection()
+
+        server_cve_df = pd.read_sql_query(
+            """
+            SELECT DISTINCT
+
+                d.cve_id,
+                v.priority,
+                v.cvss_v3_score,
+                v.cvss_v3_severity,
+                d.software_vendor,
+                d.software_name,
+                d.software_version,
+                d.defender_severity,
+                d.exploitability_level,
+                d.recommended_security_update
+
+            FROM defender_vulnerabilities d
+
+            INNER JOIN vulnerabilities v
+                ON d.cve_id = v.cve_id
+
+            WHERE
+                d.device_name = ?
+
+                AND v.source = 'CISA KEV'
+
+            ORDER BY
+                CASE v.priority
+                    WHEN 'CRITICAL' THEN 1
+                    WHEN 'HIGH' THEN 2
+                    WHEN 'MEDIUM' THEN 3
+                    WHEN 'LOW' THEN 4
+                    ELSE 5
+                END,
+                d.cve_id
+            """,
+            conn,
+            params=(selected_server,)
+        )
+
+        conn.close()
+
+        if not server_cve_df.empty:
+
+            server_cve_df = fill_priority_badges(
+                fill_nvd_placeholders(
+                    server_cve_df
+                )
+            ).rename(
+                columns={
+                    "cve_id": "CVE",
+                    "priority": "Priorité CISA",
+                    "cvss_v3_score": "CVSS 3.1",
+                    "cvss_v3_severity": "Sévérité NVD",
+                    "software_vendor": "Éditeur",
+                    "software_name": "Logiciel",
+                    "software_version": "Version",
+                    "defender_severity": "Sévérité Defender",
+                    "exploitability_level": "Exploitabilité",
+                    "recommended_security_update": "Mise à jour recommandée"
+                }
+            )
+
+            st.dataframe(
+                server_cve_df,
+                use_container_width=True,
+                hide_index=True
+            )
+
+        else:
+
+            st.success(
+                "Aucune CISA KEV détectée sur ce serveur."
+            )
+
+
+# =========================================================
+# CISA KEV TAB
+# =========================================================
+
+with tab_kev:
+
+    st.subheader(
+        "Vulnérabilités exploitées connues CISA"
+    )
+
+    st.caption(
+        "CISA priority is preserved as the "
+        "source classification."
+    )
+
+    exposed = df_cisa[
+        df_cisa["affected_devices"] > 0
+    ].copy()
+
+    if exposed.empty:
+
+        st.info(
+            "Aucune CISA KEV correspondante dans Defender."
+        )
+
+    else:
+
+        col1, col2, col3 = st.columns(3)
+
+        col1.metric(
+            "KEV dans l’environnement",
+            len(exposed)
+        )
+
+        col2.metric(
+            "Équipements affectés",
+            int(
+                exposed["affected_devices"].sum()
+            )
+        )
+
+        col3.metric(
+            "Ransomware connu",
+            int(
+                exposed["ransomware_known"].sum()
+            )
+        )
+
+        st.divider()
+
+        priority_filter = st.selectbox(
+            "Priorité CISA",
+            [
+                "ALL",
+                "CRITICAL",
+                "HIGH",
+                "MEDIUM",
+                "LOW"
+            ]
+        )
+
+        search = st.text_input(
+            "Rechercher CVE / éditeur / produit"
+        )
+
+        result = exposed.copy()
+
+        if priority_filter != "ALL":
+
+            result = result[
+                result["priority"]
+                == priority_filter
+            ]
+
+        if search:
+
+            term = search.lower()
+
+            mask = (
+                result["cve_id"]
+                .fillna("")
+                .str.lower()
+                .str.contains(
+                    term,
+                    na=False
+                )
+                |
+                result["vendor"]
+                .fillna("")
+                .str.lower()
+                .str.contains(
+                    term,
+                    na=False
+                )
+                |
+                result["product"]
+                .fillna("")
+                .str.lower()
+                .str.contains(
+                    term,
+                    na=False
+                )
+            )
+
+            result = result[mask]
+
+
+        table = fill_priority_badges(
+            fill_nvd_placeholders(
+                result[
+                    [
+                        "cve_id",
+                        "vendor",
+                        "product",
+                        "priority",
+                        "cvss_v3_score",
+                        "cvss_v3_severity",
+                        "affected_devices",
+                        "affected_products",
+                        "defender_severity",
+                        "exploitability_level",
+                        "security_update_available",
+                        "due_date"
+                    ]
+                ]
+            )
+        ).rename(
+            columns={
+                "cve_id": "CVE",
+                "vendor": "Éditeur",
+                "product": "Product",
+                "priority": "Priorité CISA",
+                "cvss_v3_score": "CVSS 3.1",
+                "cvss_v3_severity": "Sévérité NVD",
+                "affected_devices": "Devices",
+                "affected_products": "Produits",
+                "defender_severity": "Sévérité Defender",
+                "exploitability_level": "Exploitabilité",
+                "security_update_available": "Mise à jour",
+                "due_date": "Date d’échéance CISA"
+            }
+        )
+
+        st.write(
+            f"{len(table):,} CVE displayed"
+        )
+
+        st.dataframe(
+            table,
+            use_container_width=True,
+            hide_index=True
+        )
+
+
+# =========================================================
+# CVE INVESTIGATION TAB
+# =========================================================
+
+with tab_investigation:
+
+    st.subheader(
+        "Investigation CVE"
+    )
+
+    exposed = df_cisa[
+        df_cisa["affected_devices"] > 0
+    ].copy()
+
+    if exposed.empty:
+
+        st.info(
+            "No CISA KEV is currently "
+            "present in the environment."
+        )
+
+    else:
+
+        selected_cve = st.selectbox(
+            "Sélectionner une CVE",
+            exposed["cve_id"].tolist()
+        )
+
+        selected = exposed[
+            exposed["cve_id"]
+            == selected_cve
+        ].iloc[0]
+
+
+        c1, c2, c3, c4 = st.columns(4)
+
+        c1.metric(
+            "Priorité CISA",
+            badge_priority(selected["priority"])
+        )
+
+        c2.metric(
+            "CVSS 3.1",
+            str(
+                selected["cvss_v3_score"]
+            )
+            if pd.notna(
+                selected["cvss_v3_score"]
+            )
+            else "N/A"
+        )
+
+        c3.metric(
+            "Équipements affectés",
+            int(
+                selected["affected_devices"]
+            )
+        )
+
+        c4.metric(
+            "Produits affectés",
+            int(
+                selected["affected_products"]
+            )
+        )
+
+        st.divider()
+
+        left, right = st.columns(2)
+
+        with left:
+
+            st.markdown(
+                "### Classification"
+            )
+
+            st.write(
+                f"**CISA Priority:** "
+                f"{badge_priority(selected['priority'])}"
+            )
+
+            nvd_severity_display = (
+                selected["cvss_v3_severity"]
+                if pd.notna(selected["cvss_v3_severity"])
+                else "N/A"
+            )
+
+            st.write(
+                f"**NVD Severity:** {nvd_severity_display}"
+            )
+
+            st.write(
+                f"**Defender Severity:** "
+                f"{selected['defender_severity']}"
+            )
+
+            st.write(
+                f"**CWE:** "
+                f"{selected['cwe']}"
+            )
+
+            st.write(
+                f"**Ransomware:** "
+                f"{selected['known_ransomware']}"
+            )
+
+
+        with right:
+
+            st.markdown(
+                "### Defender"
+            )
+
+            st.write(
+                f"**Exploitability:** "
+                f"{selected['exploitability_level']}"
+            )
+
+            update = (
+                "YES"
+                if selected[
+                    "security_update_available"
+                ] == 1
+                else "NO"
+            )
+
+            st.write(
+                f"**Security Update:** {update}"
+            )
+
+            st.write(
+                f"**Recommended Update:** "
+                f"{selected['recommended_security_updates']}"
+            )
+
+            st.write(
+                f"**CISA Due Date:** "
+                f"{selected['due_date']}"
+            )
+
+
+        st.divider()
+
+        st.markdown(
+            "### Affected Devices"
+        )
+
+        devices = get_server_cve_devices(
+            selected_cve
+        )
+
+        if not devices.empty:
+
+            devices = devices.rename(
+                columns={
+                    "device_id": "ID équipement",
+                    "device_name": "Équipement",
+                    "os_platform": "OS",
+                    "os_version": "Version OS",
+                    "software_vendor": "Éditeur",
+                    "software_name": "Logiciel",
+                    "software_version": "Version",
+                    "defender_severity": "Sévérité Defender",
+                    "exploitability_level": "Exploitabilité",
+                    "security_update_available": "Mise à jour",
+                    "recommended_security_update": "Mise à jour recommandée",
+                    "recommended_security_update_id": "ID mise à jour",
+                    "first_seen_timestamp": "Première détection",
+                    "last_seen_timestamp": "Dernière détection"
+                }
+            )
+
+            st.write(
+                f"{len(devices):,} device/software records"
+            )
+
+            st.dataframe(
+                devices,
+                use_container_width=True,
+                hide_index=True
+            )
+
+        else:
+
+            st.info(
+                "Aucun détail d’équipement disponible."
+            )
+
+
+        st.divider()
+
+        st.markdown(
+            "### Analyse IA locale"
+        )
+
+        ai_status = selected.get("ai_status")
+
+        if ai_status == "OK" and pd.notna(selected.get("ai_summary")):
+
+            st.write(
+                f"**Résumé :** {selected['ai_summary']}"
+            )
+
+            st.write(
+                f"**Impact estimé (contexte interne) :** "
+                f"{selected['ai_impact']}"
+            )
+
+            st.write(
+                f"**Recommandation :** "
+                f"{selected['ai_recommendation']}"
+            )
+
+            st.caption(
+                f"Confiance : {selected['ai_confidence']} · "
+                f"Modèle : {selected['ai_model']} · "
+                f"Généré le {selected['ai_generated_at']}"
+            )
+
+        else:
+
+            st.info(
+                "Aucune analyse IA disponible pour cette CVE."
+            )
+
+        if st.button(
+            "Générer l'analyse IA pour cette CVE",
+            key="ai_single_cve"
+        ):
+
+            from services.ai_engine import (
+                generate_ai_enrichment,
+                is_ollama_available
+            )
+
+            from database import (
+                get_exposure_context,
+                update_ai_enrichment,
+                update_ai_status
+            )
+
+            if not is_ollama_available():
+
+                st.error(
+                    "Ollama n'est pas joignable en local "
+                    "(http://localhost:11434). "
+                    "Démarrez-le avec `ollama serve`."
+                )
+
+            else:
+
+                with st.spinner(
+                    "Analyse en cours (LLM local)..."
+                ):
+
+                    try:
+
+                        conn = get_connection()
+
+                        vuln_row = conn.execute(
+                            "SELECT * FROM vulnerabilities "
+                            "WHERE cve_id = ?",
+                            (selected_cve,)
+                        ).fetchone()
+
+                        conn.close()
+
+                        exposure = get_exposure_context(
+                            selected_cve
+                        )
+
+                        enrichment = generate_ai_enrichment(
+                            dict(vuln_row),
+                            exposure
+                        )
+
+                        update_ai_enrichment(
+                            selected_cve,
+                            enrichment
+                        )
+
+                        update_ai_status(
+                            selected_cve,
+                            "OK"
+                        )
+
+                        st.success(
+                            "Analyse IA générée."
+                        )
+
+                        st.cache_data.clear()
+
+                        st.rerun()
+
+                    except Exception as error:
+
+                        update_ai_status(
+                            selected_cve,
+                            "ERROR",
+                            error=str(error)
+                        )
+
+                        st.error(
+                            f"Échec de l'analyse IA : {error}"
+                        )
+
+
+# =========================================================
+# NOTIFICATIONS TAB
+# =========================================================
+
+with tab_notifications:
+
+    st.subheader("Notifications e-mail aux propriétaires de serveur")
+
+    st.caption(
+        "Un propriétaire dont la case \"Notification\" est activée "
+        "(onglet Serveurs, champ \"Propriétaire\" = adresse e-mail) "
+        "reçoit UN SEUL e-mail par serveur, généré par l'IA locale, "
+        "regroupant toutes les CVE CISA KEV actuellement présentes sur "
+        "ce serveur. L'envoi initial ne part que si au moins une de ces "
+        "CVE atteint le seuil de criticité configuré ci-dessous — les "
+        "CVE moins critiques ne déclenchent jamais un envoi à elles "
+        "seules mais sont regroupées dans le même e-mail dès qu'une CVE "
+        "plus grave le déclenche. Si des CVE du groupe sont toujours "
+        "présentes après le délai configuré (selon leur criticité), une "
+        "relance groupée est envoyée automatiquement ; le serveur est "
+        "marqué résolu quand il n'en reste plus aucune."
+    )
+
+    notify_state = get_sync_state("email_notify")
+
+    if notify_state:
+
+        notify_icon = (
+            "🟢"
+            if notify_state.get("status") == "OK"
+            else "🟠"
+            if notify_state.get("status") == "WARNING"
+            else "🔴"
+        )
+
+        st.caption(
+            f"{notify_icon} Dernière vérification : "
+            f"{format_sync_timestamp(notify_state.get('last_run_at'))} "
+            f"(auto. toutes les {AUTO_NOTIFY_INTERVAL_MINUTES} min) "
+            f"— {notify_state.get('detail') or ''}"
+        )
+
+    else:
+
+        st.caption(
+            "⚪ Aucune vérification effectuée pour le moment "
+            f"(auto. toutes les {AUTO_NOTIFY_INTERVAL_MINUTES} min)"
+        )
+
+    st.divider()
+
+    # -----------------------------------------------------
+    # Configuration SMTP
+    # -----------------------------------------------------
+
+    st.markdown("#### Configuration SMTP")
+
+    current_smtp = get_smtp_config()
+
+    with st.form("smtp_config_form"):
+
+        smtp_col1, smtp_col2 = st.columns(2)
+
+        with smtp_col1:
+
+            smtp_host = st.text_input(
+                "Serveur SMTP",
+                value=current_smtp["host"]
+            )
+
+            smtp_username = st.text_input(
+                "Utilisateur SMTP",
+                value=current_smtp["username"]
+            )
+
+            smtp_from = st.text_input(
+                "Adresse d'expédition",
+                value=current_smtp["from_addr"]
+            )
+
+        with smtp_col2:
+
+            smtp_port = st.number_input(
+                "Port",
+                min_value=1,
+                max_value=65535,
+                value=current_smtp["port"]
+            )
+
+            smtp_password = st.text_input(
+                "Mot de passe SMTP",
+                type="password",
+                value="",
+                key="smtp_password_field",
+                help=(
+                    "Laisser vide pour conserver le mot de passe déjà "
+                    "enregistré. Le champ se vide automatiquement "
+                    "après enregistrement."
+                )
+            )
+
+            smtp_use_tls = st.checkbox(
+                "Utiliser STARTTLS",
+                value=current_smtp["use_tls"]
+            )
+
+        smtp_submitted = st.form_submit_button(
+            "Enregistrer la configuration SMTP"
+        )
+
+        if smtp_submitted:
+
+            set_smtp_config(
+                host=smtp_host.strip(),
+                port=smtp_port,
+                username=smtp_username.strip(),
+                password=smtp_password,
+                from_addr=smtp_from.strip(),
+                use_tls=smtp_use_tls
+            )
+
+            st.session_state.pop("smtp_password_field", None)
+
+            st.success("Configuration SMTP enregistrée.")
+
+            st.rerun()
+
+    test_col1, test_col2 = st.columns([3, 1])
+
+    with test_col1:
+
+        test_email_addr = st.text_input(
+            "Adresse pour l'e-mail de test",
+            key="smtp_test_addr"
+        )
+
+    with test_col2:
+
+        st.write("")
+        st.write("")
+
+        if st.button("Envoyer un test", use_container_width=True):
+
+            if not test_email_addr.strip():
+
+                st.warning("Renseignez une adresse e-mail.")
+
+            else:
+
+                try:
+
+                    send_test_email(test_email_addr.strip())
+
+                    st.success(f"E-mail de test envoyé à {test_email_addr}.")
+
+                except SmtpNotConfigured:
+
+                    st.error("Configurez d'abord le SMTP ci-dessus.")
+
+                except Exception as error:
+
+                    st.error(f"Échec de l'envoi : {error}")
+
+    st.divider()
+
+    # -----------------------------------------------------
+    # Seuil de criticité déclenchant l'envoi
+    # -----------------------------------------------------
+
+    st.markdown("#### Seuil de déclenchement")
+
+    st.caption(
+        "Le premier e-mail pour un serveur ne part que si au moins une "
+        "de ses CVE atteint ce niveau de criticité ou plus (les autres "
+        "CVE, moins critiques, sont regroupées dans le même e-mail sans "
+        "jamais déclencher un envoi à elles seules)."
+    )
+
+    priority_options = ["CRITICAL", "HIGH", "MEDIUM", "LOW"]
+
+    current_min_priority = get_notification_min_priority()
+
+    selected_min_priority = st.selectbox(
+        "Criticité minimale pour déclencher un envoi",
+        priority_options,
+        index=priority_options.index(current_min_priority)
+        if current_min_priority in priority_options
+        else 1
+    )
+
+    if st.button("Enregistrer le seuil de déclenchement"):
+
+        set_notification_min_priority(selected_min_priority)
+
+        st.success("Seuil de déclenchement mis à jour.")
+
+        st.rerun()
+
+    st.divider()
+
+    # -----------------------------------------------------
+    # Délais de relance par criticité
+    # -----------------------------------------------------
+
+    st.markdown("#### Délai avant relance (par criticité)")
+
+    st.caption(
+        "Si la CVE est toujours présente sur le serveur après ce délai, "
+        "un e-mail de relance est envoyé automatiquement, et le compteur "
+        "redémarre pour la relance suivante."
+    )
+
+    current_delays = get_notification_delays()
+
+    delay_cols = st.columns(4)
+
+    delay_labels = {
+        "CRITICAL": "CRITICAL (heures)",
+        "HIGH": "HIGH (heures)",
+        "MEDIUM": "MEDIUM (heures)",
+        "LOW": "LOW (heures)"
+    }
+
+    new_delays = {}
+
+    for col, priority in zip(delay_cols, delay_labels):
+
+        with col:
+
+            new_delays[priority] = col.number_input(
+                delay_labels[priority],
+                min_value=1.0,
+                value=float(current_delays[priority]),
+                step=1.0,
+                key=f"delay_{priority}"
+            )
+
+    if st.button("Enregistrer les délais"):
+
+        for priority, hours in new_delays.items():
+            set_notification_delay(priority, hours)
+
+        st.success("Délais de relance mis à jour.")
+
+        st.rerun()
+
+    st.divider()
+
+    # -----------------------------------------------------
+    # Déclenchement manuel
+    # -----------------------------------------------------
+
+    if st.button(
+        "Vérifier et envoyer les notifications maintenant",
+        use_container_width=True
+    ):
+
+        if not is_smtp_configured():
+
+            st.error(
+                "Configurez d'abord le SMTP ci-dessus avant d'envoyer "
+                "des notifications."
+            )
+
+        else:
+
+            with st.spinner(
+                "Envoi des notifications / relances en cours..."
+            ):
+
+                result = subprocess.run(
+                    [
+                        sys.executable,
+                        "notify.py"
+                    ],
+                    capture_output=True,
+                    text=True
+                )
+
+            if result.returncode == 0:
+
+                st.success("Vérification des notifications terminée.")
+
+                st.cache_data.clear()
+
+                st.rerun()
+
+            else:
+
+                st.error("Échec du script de notification.")
+
+                st.code(result.stderr, language="text")
+
+    st.divider()
+
+    # -----------------------------------------------------
+    # Historique
+    # -----------------------------------------------------
+
+    st.markdown("#### Historique des notifications")
+
+    st.caption(
+        "Une ligne par serveur. \"CVE\" liste toutes les CVE regroupées "
+        "dans l'e-mail ; \"CVE en attente\" indique combien d'entre elles "
+        "sont encore présentes (les autres ont été résolues et retirées "
+        "du groupe au fil des relances)."
+    )
+
+    history = get_notification_history()
+
+    if not history:
+
+        st.info("Aucune notification envoyée pour le moment.")
+
+    else:
+
+        history_df = pd.DataFrame(history)
+
+        status_labels = {
+            "SENT": "🟦 Envoyée",
+            "REMINDER_SENT": "🟠 Relancée",
+            "RESOLVED": "🟢 Résolue",
+            "ERROR": "🔴 Erreur"
+        }
+
+        history_df["status"] = history_df["status"].map(
+            lambda value: status_labels.get(value, value)
+        )
+
+        history_df = history_df.rename(
+            columns={
+                "device_name": "Serveur",
+                "owner_email": "Propriétaire",
+                "cve_ids": "CVE",
+                "cve_count": "Nb. CVE",
+                "cve_open_count": "CVE en attente",
+                "status": "Statut",
+                "sent_at": "Envoyée le",
+                "reminder_count": "Relances",
+                "last_reminder_at": "Dernière relance",
+                "next_check_at": "Prochaine vérification",
+                "resolved_at": "Résolue le",
+                "last_error": "Dernière erreur"
+            }
+        )
+
+        st.dataframe(
+            history_df,
+            use_container_width=True,
+            hide_index=True
+        )
+
+
+# =========================================================
+# ATTACK SURFACE TAB (Hexiosec ASM)
+# =========================================================
+
+with tab_attack_surface:
+
+    st.subheader("Attack Surface Management (Hexiosec ASM)")
+
+    st.caption(
+        "Importe les risques détectés par Hexiosec ASM (découverte "
+        "d'actifs exposés sur Internet — domaines, IP, certificats, "
+        "services). Table séparée de CISA KEV : un risque ASM n'a pas "
+        "toujours de CVE associée."
+    )
+
+    hexiosec_state = get_sync_state("hexiosec")
+
+    if hexiosec_state:
+
+        hexiosec_icon = (
+            "🟢"
+            if hexiosec_state.get("status") == "OK"
+            else "🔴"
+        )
+
+        st.caption(
+            f"{hexiosec_icon} Dernière synchro : "
+            f"{format_sync_timestamp(hexiosec_state.get('last_run_at'))} "
+            f"— {hexiosec_state.get('detail') or ''}"
+        )
+
+    else:
+
+        st.caption("⚪ Aucune synchronisation Hexiosec effectuée pour le moment.")
+
+    st.divider()
+
+    # -----------------------------------------------------
+    # Configuration de la connexion API
+    # -----------------------------------------------------
+
+    st.markdown("#### Configuration de la connexion")
+
+    st.caption(
+        "L'API publique Hexiosec ASM n'est pas disponible sur tous les "
+        "paliers et son chemin exact dépend de votre organisation/scan "
+        "(visible dans l'app Hexiosec sous \"Using the Public API\" / "
+        "Swagger UI, en haut à droite de l'écran). Utilisez "
+        "\"Tester la connexion\" ci-dessous pour valider/ajuster ces "
+        "paramètres."
+    )
+
+    current_hexiosec = get_hexiosec_config()
+
+    with st.form("hexiosec_config_form"):
+
+        hx_col1, hx_col2 = st.columns(2)
+
+        with hx_col1:
+
+            hx_base_url = st.text_input(
+                "URL de base de l'API",
+                value=current_hexiosec["base_url"]
+            )
+
+            hx_endpoint_path = st.text_input(
+                "Chemin de l'endpoint \"risques\"",
+                value=current_hexiosec["endpoint_path"],
+                help=(
+                    "Endpoint officiel : /v1/scan_data/{scan_id}/risks "
+                    "(d'après la spec OpenAPI Hexiosec). Le "
+                    "\"{scan_id}\" est automatiquement remplacé par "
+                    "l'ID de scan renseigné ci-dessous."
+                )
+            )
+
+            hx_scan_id = st.text_input(
+                "ID du scan (\"SCC France\")",
+                value=current_hexiosec["scan_id"],
+                help=(
+                    "Visible dans l'URL de la page du scan dans l'app "
+                    "Hexiosec ASM, ou récupérable via "
+                    "GET /v1/scans/by-org."
+                )
+            )
+
+            hx_label = st.text_input(
+                "Nom du scope (affichage uniquement)",
+                value=current_hexiosec["label"]
+            )
+
+        with hx_col2:
+
+            hx_auth_header = st.text_input(
+                "Nom du header d'authentification",
+                value=current_hexiosec["auth_header"],
+                help="Header officiel Hexiosec : X-Hexiosec-API-Key"
+            )
+
+            hx_auth_prefix = st.text_input(
+                "Préfixe du header (laisser vide pour Hexiosec)",
+                value=current_hexiosec["auth_prefix"]
+            )
+
+            hx_api_key = st.text_input(
+                "Clé API",
+                type="password",
+                value="",
+                key="hexiosec_api_key_field",
+                help=(
+                    "Laisser vide pour conserver la clé déjà "
+                    "enregistrée. Le champ se vide automatiquement "
+                    "après enregistrement, la clé n'est jamais "
+                    "réaffichée."
+                )
+            )
+
+        hx_submitted = st.form_submit_button(
+            "Enregistrer la configuration"
+        )
+
+        if hx_submitted:
+
+            set_hexiosec_config(
+                base_url=hx_base_url.strip(),
+                api_key=hx_api_key,
+                auth_header=hx_auth_header.strip(),
+                auth_prefix=hx_auth_prefix,
+                endpoint_path=hx_endpoint_path.strip(),
+                scan_id=hx_scan_id.strip(),
+                label=hx_label.strip()
+            )
+
+            # Vide explicitement le champ (masqué par type="password",
+            # mais Streamlit garde sinon la saisie affichée en points
+            # entre deux exécutions du script) : après enregistrement,
+            # la clé n'est plus jamais présente à l'écran, même masquée.
+            st.session_state.pop("hexiosec_api_key_field", None)
+
+            st.success("Configuration Hexiosec enregistrée.")
+
+            st.rerun()
+
+    if st.button("Tester la connexion"):
+
+        if not is_hexiosec_configured():
+
+            st.warning(
+                "Renseignez au moins l'URL de base, l'endpoint et la "
+                "clé API avant de tester."
+            )
+
+        else:
+
+            ok, status_code, payload = hexiosec_test_connection(
+                get_hexiosec_config()
+            )
+
+            if ok:
+
+                st.success(f"Connexion réussie (HTTP {status_code}).")
+
+            else:
+
+                st.error(
+                    f"Échec de connexion "
+                    f"(HTTP {status_code if status_code else 'N/A'})."
+                )
+
+            st.caption(
+                "Réponse brute (utile pour ajuster l'endpoint / le "
+                "mapping des champs) :"
+            )
+
+            st.json(payload) if isinstance(payload, (dict, list)) else st.code(str(payload))
+
+    st.divider()
+
+    # -----------------------------------------------------
+    # Déclenchement manuel
+    # -----------------------------------------------------
+
+    if st.button(
+        "Synchroniser les risques Hexiosec",
+        use_container_width=True
+    ):
+
+        if not is_hexiosec_configured():
+
+            st.error(
+                "Configurez d'abord la connexion Hexiosec ci-dessus."
+            )
+
+        else:
+
+            with st.spinner("Synchronisation Hexiosec ASM en cours..."):
+
+                result = subprocess.run(
+                    [
+                        sys.executable,
+                        "sync_hexiosec.py"
+                    ],
+                    capture_output=True,
+                    text=True
+                )
+
+            if result.returncode == 0:
+
+                st.success("Synchronisation Hexiosec terminée.")
+
+                st.cache_data.clear()
+
+                st.rerun()
+
+            else:
+
+                st.error("Échec de la synchronisation Hexiosec.")
+
+                st.code(result.stdout + "\n" + result.stderr, language="text")
+
+    st.divider()
+
+    # -----------------------------------------------------
+    # Risques importés
+    # -----------------------------------------------------
+
+    st.markdown(
+        f"#### Risques — {current_hexiosec['label'] or 'Attack Surface'}"
+    )
+
+    hexiosec_counts = get_hexiosec_severity_counts()
+
+    if hexiosec_counts:
+
+        hx_c1, hx_c2, hx_c3, hx_c4, hx_c5 = st.columns(5)
+
+        hx_c1.metric("CRITICAL", hexiosec_counts.get("CRITICAL", 0))
+        hx_c2.metric("HIGH", hexiosec_counts.get("HIGH", 0))
+        hx_c3.metric("MEDIUM", hexiosec_counts.get("MEDIUM", 0))
+        hx_c4.metric("LOW", hexiosec_counts.get("LOW", 0))
+        hx_c5.metric("INFO", hexiosec_counts.get("INFO", 0))
+
+        hx_counts_series = pd.Series(hexiosec_counts).reindex(
+            ["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"]
+        ).fillna(0).astype(int)
+
+        st.plotly_chart(
+            plot_severity_bar(
+                hx_counts_series,
+                "Sévérité",
+                "Nombre de risques"
+            ),
+            use_container_width=True
+        )
+
+    hexiosec_findings = get_hexiosec_findings()
+
+    if not hexiosec_findings:
+
+        st.info(
+            "Aucun risque importé pour le moment. Configurez la "
+            "connexion ci-dessus puis cliquez sur \"Synchroniser\"."
+        )
+
+    else:
+
+        findings_df = pd.DataFrame(hexiosec_findings)
+
+        hx_risk_filter_col1, hx_risk_filter_col2 = st.columns([2, 3])
+
+        with hx_risk_filter_col1:
+
+            hx_severity_filter = st.multiselect(
+                "Filtrer par sévérité",
+                options=["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"],
+                default=[],
+                key="hx_risk_severity_filter"
+            )
+
+        with hx_risk_filter_col2:
+
+            hx_risk_search = st.text_input(
+                "Rechercher (actif, titre, CVE)",
+                key="hx_risk_search"
+            )
+
+        filtered_findings_df = findings_df.copy()
+
+        if hx_severity_filter:
+
+            filtered_findings_df = filtered_findings_df[
+                filtered_findings_df["severity"]
+                .fillna("")
+                .str.upper()
+                .isin(hx_severity_filter)
+            ]
+
+        if hx_risk_search.strip():
+
+            needle = hx_risk_search.strip().lower()
+
+            haystack = (
+                filtered_findings_df["asset"].fillna("")
+                + " "
+                + filtered_findings_df["title"].fillna("")
+                + " "
+                + filtered_findings_df["cve_id"].fillna("")
+            ).str.lower()
+
+            filtered_findings_df = filtered_findings_df[
+                haystack.str.contains(needle, regex=False)
+            ]
+
+        st.caption(
+            f"{len(filtered_findings_df)} / {len(findings_df)} risque(s) affiché(s)"
+        )
+
+        filtered_findings_df = fill_priority_badges(
+            filtered_findings_df, column="severity"
+        )
+
+        filtered_findings_df = filtered_findings_df.rename(
+            columns={
+                "asset": "Actif",
+                "category": "Catégorie",
+                "title": "Titre",
+                "severity": "Sévérité",
+                "cve_id": "CVE",
+                "status": "Statut",
+                "first_seen": "Détecté le",
+                "last_seen": "Vu le",
+                "imported_at": "Importé le"
+            }
+        )
+
+        st.dataframe(
+            filtered_findings_df[
+                [
+                    "Actif", "Catégorie", "Titre", "Sévérité", "CVE",
+                    "Statut", "Détecté le", "Vu le", "Importé le"
+                ]
+            ],
+            use_container_width=True,
+            hide_index=True
+        )
+
+    st.divider()
+
+    # -----------------------------------------------------
+    # Inventaire des actifs (domaines, IP, services, composants)
+    # -----------------------------------------------------
+
+    st.markdown("#### Actifs découverts")
+
+    st.caption(
+        "Inventaire complet remonté par Hexiosec ASM (les tuiles "
+        "\"Discovery\" de l'app : domaines, IP, services, composants), "
+        "avec le nombre de risques par sévérité associés à chaque "
+        "actif."
+    )
+
+    hx_asset_counts = get_hexiosec_asset_type_counts()
+
+    if hx_asset_counts:
+
+        hx_ac1, hx_ac2, hx_ac3, hx_ac4 = st.columns(4)
+
+        hx_ac1.metric("Domaines", hx_asset_counts.get("DOMAIN", 0))
+        hx_ac2.metric("IP", hx_asset_counts.get("IP", 0))
+        hx_ac3.metric("Services", hx_asset_counts.get("SERVICE", 0))
+        hx_ac4.metric("Composants", hx_asset_counts.get("COMPONENT", 0))
+
+    hx_asset_filter_col1, hx_asset_filter_col2, hx_asset_filter_col3 = st.columns(
+        [2, 2, 3]
+    )
+
+    with hx_asset_filter_col1:
+
+        hx_asset_type_filter = st.multiselect(
+            "Type d'actif",
+            options=["DOMAIN", "IP", "SERVICE", "COMPONENT"],
+            default=[],
+            format_func=lambda value: {
+                "DOMAIN": "Domaine",
+                "IP": "IP",
+                "SERVICE": "Service",
+                "COMPONENT": "Composant"
+            }.get(value, value),
+            key="hx_asset_type_filter"
+        )
+
+    with hx_asset_filter_col2:
+
+        hx_asset_min_severity = st.selectbox(
+            "Risque minimum associé",
+            options=["Tous", "LOW", "MEDIUM", "HIGH", "CRITICAL"],
+            key="hx_asset_min_severity"
+        )
+
+    with hx_asset_filter_col3:
+
+        hx_asset_search = st.text_input(
+            "Rechercher (nom, détail)",
+            key="hx_asset_search"
+        )
+
+    hexiosec_assets_rows = get_hexiosec_assets(
+        asset_types=hx_asset_type_filter or None,
+        search=hx_asset_search.strip() or None,
+        min_severity=(
+            hx_asset_min_severity if hx_asset_min_severity != "Tous" else None
+        )
+    )
+
+    if not hexiosec_assets_rows:
+
+        st.info(
+            "Aucun actif importé pour le moment (ou aucun ne "
+            "correspond aux filtres). Cliquez sur \"Synchroniser\" "
+            "ci-dessus pour importer l'inventaire complet."
+        )
+
+    else:
+
+        assets_df = pd.DataFrame(hexiosec_assets_rows)
+
+        assets_df["asset_type"] = assets_df["asset_type"].map(
+            {
+                "DOMAIN": "Domaine",
+                "IP": "IP",
+                "SERVICE": "Service",
+                "COMPONENT": "Composant"
+            }
+        ).fillna(assets_df["asset_type"])
+
+        assets_df = assets_df.rename(
+            columns={
+                "asset_type": "Type",
+                "name": "Nom",
+                "detail": "Détail",
+                "risk_critical": "Critiques",
+                "risk_high": "Hautes",
+                "risk_medium": "Moyennes",
+                "risk_low": "Basses",
+                "risk_info": "Info",
+                "created": "Découvert le",
+                "last_seen": "Vu le",
+                "imported_at": "Importé le"
+            }
+        )
+
+        st.dataframe(
+            assets_df[
+                [
+                    "Type", "Nom", "Détail", "Critiques", "Hautes",
+                    "Moyennes", "Basses", "Info", "Découvert le",
+                    "Vu le", "Importé le"
+                ]
+            ],
+            use_container_width=True,
+            hide_index=True
+        )
+
+
+# =========================================================
+# VEILLE TAB (détections récentes Defender XDR + liste de diffusion)
+# =========================================================
+#
+# Contrairement aux onglets "CISA KEV" / "Serveurs" / "Investigation
+# CVE", ici defender_vulnerabilities N'EST PAS filtrée sur
+# v.source = 'CISA KEV' : on voit TOUTE CVE que Defender XDR a
+# détectée dans l'environnement, y compris une CVE toute fraîche pas
+# encore référencée CISA KEV. L'alerte par e-mail part vers une liste
+# de diffusion dédiée (pas les propriétaires de serveur).
+
+with tab_watch:
+
+    st.subheader("Veille — détections récentes (Microsoft Defender XDR)")
+
+    st.caption(
+        "Contrairement aux autres onglets, cette vue n'est PAS limitée "
+        "aux CVE du catalogue CISA KEV : elle exploite directement "
+        "toutes les détections déjà remontées par Microsoft Defender "
+        "XDR (synchro existante), ce qui permet de réagir à une "
+        "vulnérabilité fraîchement annoncée (ex: un 0-day fournisseur) "
+        "avant même qu'elle soit éventuellement ajoutée au catalogue "
+        "CISA KEV."
+    )
+
+    # -----------------------------------------------------
+    # Synchro NVD quotidienne (source principale)
+    # -----------------------------------------------------
+    #
+    # NVD est la source d'ENTRÉE : chaque jour, les nouvelles CVE
+    # publiées par NVD sont récupérées et croisées avec l'inventaire
+    # XDR ci-dessus. CISA KEV reste synchronisée séparément (onglet
+    # CISA KEV) et continue à servir d'étiquette "exploitation active
+    # connue" sur les CVE communes aux deux sources.
+
+    st.markdown("#### Synchronisation NVD (source principale)")
+
+    st.caption(
+        "Chaque jour, VulnWatch récupère les CVE nouvellement publiées "
+        "sur nvd.nist.gov et les croise automatiquement avec "
+        "l'inventaire XDR : toute correspondance déclenche une alerte "
+        "automatique vers la liste de diffusion ci-dessous (sans "
+        "attendre un ajout éventuel au catalogue CISA KEV)."
+    )
+
+    nvd_feed_state = get_sync_state("nvd_daily_feed")
+
+    if nvd_feed_state:
+
+        nvd_feed_icon = (
+            "🟢"
+            if nvd_feed_state.get("status") == "OK"
+            else "🟠"
+            if nvd_feed_state.get("status") == "WARNING"
+            else "🔴"
+        )
+
+        st.caption(
+            f"{nvd_feed_icon} Dernière synchro : "
+            f"{format_sync_timestamp(nvd_feed_state.get('last_run_at'))} "
+            f"(auto. toutes les 24h) — {nvd_feed_state.get('detail') or ''}"
+        )
+
+    else:
+
+        st.caption(
+            "⚪ Aucune synchronisation NVD effectuée pour le moment "
+            "(auto. toutes les 24h)"
+        )
+
+    if st.button(
+        "Synchroniser NVD maintenant",
+        use_container_width=True,
+        key="watch_nvd_sync_button"
+    ):
+
+        env = os.environ.copy()
+
+        nvd_key_for_run = get_nvd_api_key()
+
+        if nvd_key_for_run:
+            env["VULNWATCH_NVD_API_KEY"] = nvd_key_for_run
+
+        with st.spinner(
+            "Récupération des nouvelles CVE NVD et croisement XDR..."
+        ):
+
+            nvd_sync_result = subprocess.run(
+                [sys.executable, "sync_nvd_feed.py"],
+                capture_output=True,
+                text=True,
+                env=env
+            )
+
+        if nvd_sync_result.returncode == 0:
+
+            st.success("Synchronisation NVD terminée.")
+
+            st.cache_data.clear()
+
+            st.rerun()
+
+        else:
+
+            st.error("Échec de la synchronisation NVD.")
+
+            st.code(nvd_sync_result.stderr, language="text")
+
+    with st.expander("Clé API NVD (optionnel)"):
+
+        st.caption(
+            "Sans clé : limite publique de 5 requêtes / 30s (suffisant "
+            "pour un volume quotidien normal). Avec une clé gratuite "
+            "(nvd.nist.gov/developers/request-an-api-key), la limite "
+            "passe à 50 requêtes / 30s — utile si la fenêtre de "
+            "synchro contient beaucoup de CVE (ex: après un premier "
+            "lancement, ou une longue interruption)."
+        )
+
+        current_nvd_key = get_nvd_api_key()
+
+        new_nvd_key = st.text_input(
+            "Clé API NVD",
+            type="password",
+            value="",
+            key="nvd_api_key_field",
+            help=(
+                "Laisser vide pour conserver la clé déjà enregistrée "
+                "(ou continuer sans clé). Le champ se vide "
+                "automatiquement après enregistrement."
+            )
+        )
+
+        nvd_key_status = "configurée" if current_nvd_key else "non configurée"
+
+        st.caption(f"Clé actuelle : {nvd_key_status}")
+
+        if st.button("Enregistrer la clé API NVD"):
+
+            if new_nvd_key:
+
+                set_nvd_api_key(new_nvd_key.strip())
+
+                st.session_state.pop("nvd_api_key_field", None)
+
+                st.success("Clé API NVD enregistrée.")
+
+                st.rerun()
+
+            else:
+
+                st.info("Champ vide : rien n'a été changé.")
+
+    # -----------------------------------------------------
+    # Téléchargement historique NVD (premier lancement)
+    # -----------------------------------------------------
+
+    st.markdown("#### Historique NVD (téléchargement initial)")
+
+    st.caption(
+        "En plus de la synchro quotidienne ci-dessus (nouvelles "
+        "publications), VulnWatch télécharge en arrière-plan tout "
+        "l'historique NVD, en partant des CVE les PLUS RÉCENTES et en "
+        "remontant progressivement jusqu'à la date de départ choisie "
+        "— les vulnérabilités les plus susceptibles de concerner "
+        "l'environnement actuel sont donc disponibles dès les "
+        "premières minutes, sans attendre la fin du téléchargement. "
+        "Le tout sans bloquer l'interface, par petits lots, avec "
+        "reprise automatique en cas d'interruption."
+    )
+
+    backfill_state = get_sync_state("nvd_historical_backfill")
+    backfill_done = is_nvd_backfill_done()
+
+    if backfill_done:
+
+        st.success(
+            f"🟢 Historique NVD complet — {get_nvd_total_count()} CVE "
+            f"NVD en base."
+        )
+
+    elif backfill_state:
+
+        backfill_icon = (
+            "🟠" if backfill_state.get("status") == "RUNNING"
+            else "🔴" if backfill_state.get("status") == "ERROR"
+            else "⚪"
+        )
+
+        st.info(
+            f"{backfill_icon} Téléchargement en cours (arrière-plan) — "
+            f"{format_sync_timestamp(backfill_state.get('last_run_at'))} : "
+            f"{backfill_state.get('detail') or ''}"
+        )
+
+        st.caption(
+            "Cette page peut être fermée et rouverte sans perdre la "
+            "progression : la reprise se fait automatiquement depuis "
+            "le dernier point atteint."
+        )
+
+    else:
+
+        st.caption(
+            "⚪ Pas encore démarré — sera lancé automatiquement au "
+            "prochain chargement de l'appli."
+        )
+
+    with st.expander("Options de l'historique NVD"):
+
+        current_backfill_start = get_nvd_backfill_start()
+
+        st.caption(
+            f"Le téléchargement remonte jusqu'au : "
+            f"{current_backfill_start[:10]} (le plus ancien)"
+        )
+
+        if not backfill_state:
+
+            new_backfill_start = st.date_input(
+                "Remonter l'historique jusqu'au",
+                value=date(2020, 1, 1),
+                key="nvd_backfill_start_field",
+                help=(
+                    "Modifiable uniquement avant le premier lancement "
+                    "du téléchargement."
+                )
+            )
+
+            if st.button(
+                "Enregistrer la date de départ",
+                key="nvd_backfill_start_save_button"
+            ):
+
+                set_nvd_backfill_start(
+                    datetime(
+                        new_backfill_start.year,
+                        new_backfill_start.month,
+                        new_backfill_start.day,
+                        tzinfo=timezone.utc
+                    ).isoformat()
+                )
+
+                st.success("Date de départ enregistrée.")
+
+                st.rerun()
+
+        else:
+
+            st.caption(
+                "Le téléchargement a déjà commencé : la date de "
+                "départ ne peut plus être changée (utiliser "
+                "\"Relancer depuis zéro\" ci-dessous pour en choisir "
+                "une nouvelle)."
+            )
+
+        if st.button(
+            "Relancer le téléchargement maintenant",
+            use_container_width=True,
+            key="watch_nvd_backfill_relaunch_button",
+            help=(
+                "Reprend depuis le dernier point atteint. Utile si le "
+                "téléchargement semble bloqué sans attendre le délai "
+                "de reprise automatique."
+            )
+        ):
+
+            env = os.environ.copy()
+
+            backfill_key_for_run = get_nvd_api_key()
+
+            if backfill_key_for_run:
+                env["VULNWATCH_NVD_API_KEY"] = backfill_key_for_run
+
+            subprocess.Popen(
+                [sys.executable, "sync_nvd_backfill.py"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                env=env
+            )
+
+            st.success(
+                "Téléchargement relancé en arrière-plan. Rafraîchir "
+                "cette page dans quelques instants pour voir la "
+                "progression."
+            )
+
+        if backfill_done or backfill_state:
+
+            if st.button(
+                "Tout retélécharger depuis zéro",
+                key="watch_nvd_backfill_reset_button"
+            ):
+
+                reset_nvd_backfill()
+
+                st.success(
+                    "Historique réinitialisé — sera retéléchargé "
+                    "(aucune CVE déjà en base n'est supprimée)."
+                )
+
+                st.rerun()
+
+    # -----------------------------------------------------
+    # Import manuel d'un fichier NVD (si pas d'accès sortant depuis
+    # le serveur vers services.nvd.nist.gov)
+    # -----------------------------------------------------
+
+    with st.expander("Import manuel d'un fichier NVD"):
+
+        st.caption(
+            "Si ce serveur n'a pas d'accès sortant vers "
+            "services.nvd.nist.gov (proxy, pare-feu...), le "
+            "téléchargement automatique ne peut pas fonctionner. "
+            "Solution : télécharger le fichier depuis un poste qui a "
+            "accès à Internet, puis l'envoyer ici."
+        )
+
+        st.markdown(
+            "Où trouver le fichier : "
+            "[nvd.nist.gov/vuln/data-feeds](https://nvd.nist.gov/vuln/data-feeds) "
+            "(un fichier `nvdcve-2.0-AAAA.json.gz` par année, ex. "
+            "2020 à aujourd'hui) — ou l'export JSON d'une requête "
+            "sur l'API NVD 2.0 (`cves/2.0`). Formats acceptés : "
+            "`.json`, `.json.gz`, `.json.zip`."
+        )
+
+        uploaded_nvd_files = st.file_uploader(
+            "Fichier(s) NVD",
+            type=["json", "gz", "zip"],
+            accept_multiple_files=True,
+            key="nvd_manual_upload_field"
+        )
+
+        if uploaded_nvd_files and st.button(
+            "Importer",
+            use_container_width=True,
+            key="nvd_manual_upload_button"
+        ):
+
+            total_imported = 0
+            import_errors = []
+
+            with st.spinner(
+                f"Import de {len(uploaded_nvd_files)} fichier(s) en "
+                "cours (peut prendre plusieurs minutes pour un flux "
+                "annuel complet)..."
+            ):
+
+                for uploaded_file in uploaded_nvd_files:
+
+                    try:
+
+                        discoveries = parse_nvd_feed_bytes(
+                            uploaded_file.getvalue(),
+                            uploaded_file.name
+                        )
+
+                        imported = bulk_save_nvd_discoveries(discoveries)
+
+                        total_imported += imported
+
+                    except Exception as error:
+
+                        import_errors.append(
+                            f"{uploaded_file.name} : {error}"
+                        )
+
+            if total_imported:
+
+                st.success(
+                    f"{total_imported} CVE importée(s)/mise(s) à jour "
+                    f"({get_nvd_total_count()} CVE NVD en base au total)."
+                )
+
+                st.cache_data.clear()
+
+            for err in import_errors:
+                st.error(err)
+
+            if total_imported and not import_errors:
+                st.rerun()
+
+    st.divider()
+
+    # -----------------------------------------------------
+    # Recherche / détections récentes
+    # -----------------------------------------------------
+
+    watch_search = st.text_input(
+        "Rechercher une CVE, un éditeur ou un produit",
+        key="watch_search",
+        placeholder="ex: CVE-2026-109618, Apache, PHP..."
+    )
+
+    detections = get_recent_defender_detections(
+        limit=200,
+        search=watch_search.strip() if watch_search else None
+    )
+
+    if not detections:
+
+        st.info(
+            "Aucune détection Defender trouvée"
+            + (f" pour \"{watch_search}\"." if watch_search else ".")
+        )
+
+    else:
+
+        detections_df = pd.DataFrame(detections)
+
+        detections_df["criticité"] = detections_df.apply(
+            lambda row: badge_priority(
+                row["cisa_priority"] or row["defender_severity"]
+            ),
+            axis=1
+        )
+
+        detections_df["Au catalogue CISA KEV"] = detections_df[
+            "cisa_source"
+        ].apply(lambda value: "🟢 Oui" if value == "CISA KEV" else "⚪ Non")
+
+        detections_df["nvd_published_display"] = detections_df[
+            "nvd_published"
+        ].apply(
+            lambda value: str(value)[:10] if value else "N/A"
+        )
+
+        display_df = detections_df.rename(
+            columns={
+                "cve_id": "CVE",
+                "vulnerability_name": "Nom",
+                "software_vendor": "Éditeur",
+                "software_name": "Produit",
+                "defender_cvss_score": "CVSS (Defender)",
+                "nvd_published_display": "Date de publication (NVD)",
+                "affected_devices": "Équipements touchés",
+                "devices_with_update_available": "Équip. avec MàJ dispo",
+                "recommended_security_update": "Mise à jour recommandée",
+                "first_seen": "Première détection",
+                "last_seen": "Dernière détection"
+            }
+        )
+
+        st.dataframe(
+            display_df[
+                [
+                    "CVE", "Nom", "Éditeur", "Produit", "criticité",
+                    "Au catalogue CISA KEV", "Date de publication (NVD)",
+                    "CVSS (Defender)", "Équipements touchés",
+                    "Équip. avec MàJ dispo", "Mise à jour recommandée",
+                    "Première détection", "Dernière détection"
+                ]
+            ].rename(columns={"criticité": "Criticité"}),
+            use_container_width=True,
+            hide_index=True
+        )
+
+        st.divider()
+
+        # -------------------------------------------------
+        # Détail d'une CVE + actifs touchés + envoi d'alerte
+        # -------------------------------------------------
+
+        st.markdown("#### Détail et envoi d'alerte")
+
+        watch_cve_options = detections_df["cve_id"].tolist()
+
+        selected_watch_cve = st.selectbox(
+            "Sélectionner une CVE",
+            watch_cve_options,
+            key="watch_selected_cve"
+        )
+
+        selected_detection = detections_df[
+            detections_df["cve_id"] == selected_watch_cve
+        ].iloc[0].to_dict()
+
+        affected_devices = get_devices_for_cve(selected_watch_cve)
+
+        wc1, wc2, wc3, wc4, wc5 = st.columns(5)
+
+        wc1.metric(
+            "Criticité",
+            badge_priority(
+                selected_detection["cisa_priority"]
+                or selected_detection["defender_severity"]
+            )
+        )
+
+        wc2.metric(
+            "CVSS",
+            str(
+                selected_detection["nvd_cvss_v3_score"]
+                or selected_detection["defender_cvss_score"]
+                or "N/A"
+            )
+        )
+
+        wc3.metric(
+            "Actifs touchés",
+            len(affected_devices)
+        )
+
+        wc4.metric(
+            "Au catalogue CISA KEV",
+            "Oui" if selected_detection["cisa_source"] == "CISA KEV" else "Non"
+        )
+
+        wc5.metric(
+            "Date de publication (NVD)",
+            str(selected_detection.get("nvd_published") or "N/A")[:10]
+        )
+
+        if affected_devices:
+
+            devices_df = pd.DataFrame(affected_devices).rename(
+                columns={
+                    "device_name": "Équipement",
+                    "os_platform": "OS",
+                    "os_version": "Version OS",
+                    "software_vendor": "Éditeur",
+                    "software_name": "Logiciel",
+                    "software_version": "Version",
+                    "defender_severity": "Sévérité Defender",
+                    "exploitability_level": "Exploitabilité",
+                    "security_update_available": "Mise à jour",
+                    "recommended_security_update": "Mise à jour recommandée",
+                    "first_seen_timestamp": "Première détection",
+                    "last_seen_timestamp": "Dernière détection"
+                }
+            )
+
+            st.dataframe(
+                devices_df[
+                    [
+                        "Équipement", "OS", "Version OS", "Éditeur",
+                        "Logiciel", "Version", "Sévérité Defender",
+                        "Exploitabilité", "Mise à jour",
+                        "Mise à jour recommandée", "Première détection",
+                        "Dernière détection"
+                    ]
+                ],
+                use_container_width=True,
+                hide_index=True
+            )
+
+        else:
+
+            st.info("Aucun équipement listé pour cette CVE.")
+
+        active_recipients = get_watch_recipients(active_only=True)
+
+        if st.button(
+            f"📧 Envoyer une alerte à la liste de diffusion "
+            f"({len(active_recipients)} destinataire(s))",
+            use_container_width=True,
+            disabled=not active_recipients
+        ):
+
+            if not is_smtp_configured():
+
+                st.error(
+                    "Configurez d'abord le SMTP (onglet Notifications) "
+                    "avant d'envoyer une alerte."
+                )
+
+            else:
+
+                with st.spinner("Génération et envoi de l'alerte..."):
+
+                    alert_email = generate_watch_alert_email(
+                        selected_detection,
+                        affected_devices
+                    )
+
+                    recipient_emails = [
+                        recipient["email"]
+                        for recipient in active_recipients
+                    ]
+
+                    send_errors = []
+
+                    for recipient_email in recipient_emails:
+
+                        try:
+
+                            send_email(
+                                recipient_email,
+                                alert_email["sujet"],
+                                alert_email["corps"]
+                            )
+
+                        except Exception as error:
+
+                            send_errors.append(f"{recipient_email} : {error}")
+
+                    sent_count = len(recipient_emails) - len(send_errors)
+
+                    if sent_count > 0:
+
+                        record_watch_alert(
+                            cve_id=selected_watch_cve,
+                            recipients=recipient_emails,
+                            subject=alert_email["sujet"],
+                            body=alert_email["corps"],
+                            affected_device_count=len(affected_devices)
+                        )
+
+                if sent_count > 0:
+
+                    st.success(
+                        f"Alerte envoyée à {sent_count} destinataire(s) "
+                        f"pour {selected_watch_cve}."
+                    )
+
+                if send_errors:
+
+                    st.error(
+                        "Échec pour : " + " ; ".join(send_errors)
+                    )
+
+        elif not active_recipients:
+
+            st.caption(
+                "Ajoutez au moins un destinataire actif ci-dessous pour "
+                "pouvoir envoyer une alerte."
+            )
+
+    st.divider()
+
+    # -----------------------------------------------------
+    # Liste de diffusion
+    # -----------------------------------------------------
+
+    st.markdown("#### Liste de diffusion")
+
+    st.caption(
+        "Indépendante des propriétaires de serveur (onglet Serveurs) : "
+        "ces destinataires reçoivent les alertes de veille envoyées "
+        "manuellement ci-dessus, quel que soit le serveur concerné."
+    )
+
+    with st.form("watch_recipient_form", clear_on_submit=True):
+
+        wr_col1, wr_col2, wr_col3 = st.columns([2, 2, 1])
+
+        with wr_col1:
+            new_recipient_email = st.text_input("Adresse e-mail")
+
+        with wr_col2:
+            new_recipient_label = st.text_input(
+                "Nom / équipe (optionnel)"
+            )
+
+        with wr_col3:
+            st.write("")
+            st.write("")
+            add_recipient_submitted = st.form_submit_button(
+                "Ajouter",
+                use_container_width=True
+            )
+
+        if add_recipient_submitted:
+
+            if not new_recipient_email.strip() or "@" not in new_recipient_email:
+
+                st.warning("Adresse e-mail invalide.")
+
+            else:
+
+                add_watch_recipient(
+                    new_recipient_email.strip(),
+                    new_recipient_label.strip()
+                )
+
+                st.success(f"{new_recipient_email} ajouté à la liste.")
+
+                st.rerun()
+
+    all_recipients = get_watch_recipients()
+
+    if not all_recipients:
+
+        st.info("Aucun destinataire dans la liste de diffusion.")
+
+    else:
+
+        for recipient in all_recipients:
+
+            rc1, rc2, rc3, rc4 = st.columns([3, 2, 1, 1])
+
+            rc1.write(recipient["email"])
+            rc2.write(recipient["label"] or "—")
+
+            with rc3:
+
+                new_active = st.checkbox(
+                    "Actif",
+                    value=bool(recipient["active"]),
+                    key=f"watch_recipient_active_{recipient['id']}"
+                )
+
+                if new_active != bool(recipient["active"]):
+
+                    set_watch_recipient_active(recipient["id"], new_active)
+
+                    st.rerun()
+
+            with rc4:
+
+                if st.button(
+                    "🗑️",
+                    key=f"watch_recipient_delete_{recipient['id']}"
+                ):
+
+                    delete_watch_recipient(recipient["id"])
+
+                    st.rerun()
+
+    st.divider()
+
+    # -----------------------------------------------------
+    # Historique des alertes envoyées
+    # -----------------------------------------------------
+
+    st.markdown("#### Historique des alertes de veille")
+
+    watch_history = get_watch_alert_history()
+
+    if not watch_history:
+
+        st.info("Aucune alerte de veille envoyée pour le moment.")
+
+    else:
+
+        history_df = pd.DataFrame(watch_history).rename(
+            columns={
+                "cve_id": "CVE",
+                "recipients": "Destinataires",
+                "subject": "Objet",
+                "affected_device_count": "Actifs touchés",
+                "sent_at": "Envoyée le"
+            }
+        )
+
+        st.dataframe(
+            history_df[
+                [
+                    "CVE", "Objet", "Destinataires", "Actifs touchés",
+                    "Envoyée le"
+                ]
+            ],
+            use_container_width=True,
+            hide_index=True
+        )
+
+
+# =========================================================
+# FOOTER
+# =========================================================
+
+st.divider()
+
+st.caption(
+    "VulnWatch AI | CISA KEV + NVD + Microsoft Defender + IA locale (Ollama)"
+)

@@ -1,0 +1,19 @@
+# Données locales (base SQLite, exports Defender)
+data/
+*.db
+*.db-wal
+*.db-shm
+
+# Exports d'inventaire : données réelles du parc (noms de postes, versions
+# logicielles) — ne jamais les publier dans le dépôt
+imports/*
+!imports/.gitkeep
+
+# Secrets
+.env
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
