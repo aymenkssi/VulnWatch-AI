@@ -11,13 +11,13 @@ Pour chaque jour, le rapport indique aussi combien de CVE ont leurs
 produits vulnérables NVD (CPE) et combien sont "à compléter" (importées
 avant l'enregistrement des produits).
 
-Avec VULNWATCH_AUDIT_FIX=1, TOUS les jours de la période sont
-retéléchargés (CVE publiées ce jour-là) et enregistrés avec leurs
-produits, puis recomptés : en plus des CVE manquantes ou à compléter,
-cela met à jour les CVE dont NVD a déclaré ou corrigé les produits
-vulnérables après leur enregistrement (ex. CVE publiée sans produits,
-analysée par NVD une heure plus tard). Une page d'API par jour en
-général : moins d'une minute pour 30 jours avec une clé API.
+Avec VULNWATCH_AUDIT_FIX=1, chaque jour de la période est retéléchargé
+(CVE publiées ce jour-là) et enregistré avec ses produits, puis recompté,
+s'il a changé : CVE manquantes ou à compléter, ou CVE modifiées par NVD
+depuis la dernière mise à jour du jour (ex. CVE publiée sans produits,
+analysée par NVD une heure plus tard). Un jour inchangé coûte une seule
+requête légère (count_nvd_cves_modified_since) et n'est pas
+retéléchargé.
 Le rattrapage n'envoie pas d'alerte e-mail (il peut ramener beaucoup de
 CVE d'un coup) : les CVE rattrapées présentes sur le parc sont listées
 dans le rapport et visibles dans l'onglet Veille.
@@ -47,6 +47,8 @@ from collectors.nvd import (
 )
 from services.jobs import report_progress
 from services.inventory_matcher import refresh_matches_for_cves
+from database import get_day_refreshed_at
+from collectors.nvd import count_nvd_cves_modified_since
 from database import get_inventory_matched_cve_ids
 
 
@@ -76,7 +78,12 @@ def _count_nvd_by_day(days, step, total_steps):
         )
 
         start, end = _day_bounds(day)
+        started = time.monotonic()
         counts[day.isoformat()] = count_nvd_cves(start, end)
+        print(
+            f"  {day} : {counts[day.isoformat()]} CVE selon NVD "
+            f"({time.monotonic() - started:.1f} s)"
+        )
 
         step += 1
         time.sleep(PAGE_DELAY_SECONDS)
@@ -147,31 +154,76 @@ def main():
     recovered = 0
     completed = 0
     updated = 0
+    skipped = 0
     recovered_on_parc = []
 
     if FIX:
 
         for row in rows:
 
+            day = datetime.fromisoformat(row["day"]).date()
+            start, end = _day_bounds(day)
+            started = time.monotonic()
+
+            # Jour complet en base : on demande d'abord à NVD (une
+            # requête légère) si des CVE de ce jour ont été modifiées
+            # depuis notre dernière mise à jour. Sinon, rien à faire.
+            refreshed_at = (
+                get_day_refreshed_at(day)
+                if not row["missing"] and not row["unchecked"] else None
+            )
+
+            if refreshed_at:
+
+                report_progress(
+                    step, total_steps,
+                    f"{row['day']} : vérification des modifications NVD",
+                    force=True
+                )
+
+                # Marge de 10 min : décalage d'horloge entre NVD et ce serveur.
+                since = datetime.fromisoformat(refreshed_at) - timedelta(minutes=10)
+                changed = None
+
+                if datetime.now(timezone.utc) - since < timedelta(days=119):
+                    try:
+                        changed = count_nvd_cves_modified_since(start, end, since)
+                    except Exception as error:
+                        print(f"  {row['day']} : vérification impossible ({error})")
+
+                if changed == 0:
+
+                    skipped += 1
+                    step += 1
+
+                    print(
+                        f"  {row['day']} : inchangé depuis la dernière mise "
+                        f"à jour ({time.monotonic() - started:.1f} s)"
+                    )
+
+                    time.sleep(PAGE_DELAY_SECONDS)
+                    continue
+
             report_progress(
                 step,
                 total_steps,
-                f"Rattrapage du {row['day']} ({row['missing']} manquante(s), "
+                f"Mise à jour du {row['day']} ({row['missing']} manquante(s), "
                 f"{row['unchecked']} à compléter)",
                 force=True
             )
 
-            day = datetime.fromisoformat(row["day"]).date()
-            start, end = _day_bounds(day)
-
+            fetch_started = time.monotonic()
             discoveries = fetch_recent_nvd_cves(start, end, "published")
+            fetch_seconds = time.monotonic() - fetch_started
             ids = [cve_id for cve_id, _ in discoveries]
 
             known = get_known_cve_ids(ids)
             new_ids = [cve_id for cve_id in ids if cve_id not in known]
             matched_before = get_inventory_matched_cve_ids(ids)
 
+            save_started = time.monotonic()
             bulk_save_nvd_discoveries(discoveries)
+            save_seconds = time.monotonic() - save_started
 
             recovered += len(new_ids)
             completed += row["unchecked"]
@@ -179,7 +231,9 @@ def main():
 
             # Produits à jour pour toutes les CVE du jour : équipements
             # touchés selon NVD recalculés pour elles.
+            match_started = time.monotonic()
             matched_after = refresh_matches_for_cves(ids)
+            match_seconds = time.monotonic() - match_started
 
             # Nouvelles sur le parc : CVE rattrapées présentes chez
             # Defender, et toute CVE du jour qui touche maintenant une
@@ -191,7 +245,9 @@ def main():
             print(
                 f"  {row['day']} : {len(new_ids)} CVE rattrapée(s), "
                 f"{len(ids) - len(new_ids)} mise(s) à jour, "
-                f"{len(on_parc)} nouvelle(s) sur le parc"
+                f"{len(on_parc)} nouvelle(s) sur le parc — "
+                f"NVD {fetch_seconds:.1f} s, enregistrement "
+                f"{save_seconds:.1f} s, calcul {match_seconds:.1f} s"
             )
 
             step += 1
@@ -210,6 +266,7 @@ def main():
         "recovered": recovered,
         "completed": completed,
         "updated": updated,
+        "skipped": skipped,
         "recovered_on_parc": sorted(recovered_on_parc),
         "rows": rows
     }
@@ -227,6 +284,7 @@ def main():
     if FIX:
         print(f"  CVE rattrapées          : {recovered}")
         print(f"  CVE complétées (produits): {completed}")
+        print(f"  Jours inchangés (sautés): {skipped}")
         print(f"  dont présentes sur le parc : {len(recovered_on_parc)}")
 
     print()

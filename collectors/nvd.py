@@ -6,7 +6,7 @@ import re
 import zipfile
 import requests
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 from services.jobs import report_progress
 
@@ -469,6 +469,29 @@ def count_nvd_cves(start_dt, end_dt, date_field="published"):
 
     params = dict(
         _window_params(start_dt, end_dt, date_field),
+        resultsPerPage=1,
+        startIndex=0
+    )
+
+    data = _get_cve_page(params, _headers())
+
+    return data.get("totalResults", 0)
+
+
+def count_nvd_cves_modified_since(start_dt, end_dt, modified_since):
+    """
+    Nombre de CVE publiées entre start_dt et end_dt ET modifiées par NVD
+    depuis `modified_since` (fenêtre de modification de 120 jours au plus).
+    Sert à ne retélécharger un jour que s'il a changé (nvd_audit.py).
+    """
+
+    # Les dates envoyées à NVD sont tronquées à la seconde : une seconde
+    # de marge pour ne pas exclure une modification toute récente.
+    now = datetime.now(timezone.utc) + timedelta(seconds=1)
+
+    params = dict(
+        _window_params(start_dt, end_dt, "published"),
+        **_window_params(modified_since, now, "modified"),
         resultsPerPage=1,
         startIndex=0
     )

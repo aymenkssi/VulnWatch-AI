@@ -588,6 +588,25 @@ def initialize_database():
 
 
     # =====================================================
+    # UTILISATEURS (admin / lecteur)
+    # =====================================================
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            username TEXT PRIMARY KEY,
+            password_salt TEXT NOT NULL,
+            password_hash TEXT NOT NULL,
+            role TEXT NOT NULL DEFAULT 'viewer',
+            must_change_password INTEGER NOT NULL DEFAULT 0,
+            active INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT,
+            created_by TEXT,
+            last_login_at TEXT
+        )
+    """)
+
+
+    # =====================================================
     # AUTH SESSIONS (connexion conservée après rafraîchissement)
     # =====================================================
 
@@ -1740,11 +1759,12 @@ def create_auth_session(username):
 
 def get_auth_session_user(token):
     """
-    Nom d'utilisateur de la session si le jeton est valide (connu, non
-    expiré, et toujours celui du compte admin actuel), sinon None.
+    Utilisateur (dict, voir get_user) de la session si le jeton est
+    valide (connu, non expiré, utilisateur existant et actif), sinon None.
     """
 
-    if not token:
+    # Cookie absent ou mal formé : simplement pas de session.
+    if not isinstance(token, str) or not token:
         return None
 
     conn = get_connection()
@@ -1763,12 +1783,12 @@ def get_auth_session_user(token):
         delete_auth_session(token)
         return None
 
-    creds = get_admin_credentials()
+    user = get_user(row["username"])
 
-    if creds is None or not hmac.compare_digest(row["username"], creds["username"]):
+    if not user or not user["active"]:
         return None
 
-    return row["username"]
+    return user
 
 
 def delete_auth_session(token):
@@ -1828,44 +1848,332 @@ def verify_admin_credentials(
 
 def ensure_admin_seeded():
     """
-    Crée le compte admin s'il n'existe pas encore en base (première
-    installation). Reprend VULNWATCH_ADMIN_USER / VULNWATCH_ADMIN_PASSWORD
-    si définies (compatibilité), sinon génère un utilisateur "admin"
-    avec un mot de passe aléatoire.
+    Garantit qu'un compte administrateur existe (table users).
 
-    Ne s'exécute qu'une seule fois par installation : les appels
-    suivants ne font rien (retournent None) tant que les identifiants
-    ne sont pas explicitement changés via set_admin_credentials().
+    - Installation existante : l'ancien compte admin unique (app_config)
+      est repris tel quel, même mot de passe.
+    - Première installation : VULNWATCH_ADMIN_USER / _PASSWORD si
+      définies, sinon "admin" avec un mot de passe aléatoire à changer à
+      la première connexion.
 
-    Retourne {"username", "password"} UNIQUEMENT quand un mot de
-    passe a été généré aléatoirement ici (pour affichage unique à
-    l'admin), sinon None.
+    Retourne {"username", "password"} UNIQUEMENT quand un mot de passe a
+    été généré ici (affichage unique), sinon None.
     """
 
-    if get_admin_credentials() is not None:
+    conn = get_connection()
+    has_users = conn.execute("SELECT 1 FROM users LIMIT 1").fetchone()
+    conn.close()
+
+    if has_users:
         return None
 
-    env_username = os.getenv("VULNWATCH_ADMIN_USER")
+    legacy = get_admin_credentials()
+    now = datetime.now(timezone.utc).isoformat()
+
+    if legacy is not None:
+
+        conn = get_connection()
+        conn.execute(
+            """
+            INSERT INTO users (
+                username, password_salt, password_hash, role,
+                must_change_password, active, created_at, created_by
+            )
+            VALUES (?, ?, ?, 'admin', 0, 1, ?, 'migration')
+            """,
+            (legacy["username"], legacy["salt"], legacy["hash"], now)
+        )
+        conn.commit()
+        conn.close()
+
+        return None
+
+    username = os.getenv("VULNWATCH_ADMIN_USER") or "admin"
     env_password = os.getenv("VULNWATCH_ADMIN_PASSWORD")
-
-    username = env_username or "admin"
-
     generated = env_password is None
+    password = env_password or secrets.token_urlsafe(18)
 
-    password = env_password or secrets.token_urlsafe(12)
-
-    set_admin_credentials(
+    create_user(
         username,
-        password
+        password,
+        role="admin",
+        must_change_password=generated,
+        created_by="installation",
+        enforce_policy=False
     )
 
     if generated:
-        return {
-            "username": username,
-            "password": password
-        }
+        return {"username": username, "password": password}
 
     return None
+
+
+# =========================================================
+# UTILISATEURS ET POLITIQUE DE MOT DE PASSE
+# =========================================================
+#
+# Deux rôles :
+#   - admin  : tout (configuration, imports, synchros, utilisateurs) ;
+#   - viewer : consultation et rafraîchissement de l'affichage seulement.
+
+ROLES = {
+    "admin": "Administrateur",
+    "viewer": "Lecteur (consultation)"
+}
+
+PASSWORD_MIN_LENGTH = 15
+
+
+def password_policy_checks(password):
+    """
+    [(exigence, respectée)] : la liste est affichée à l'utilisateur pour
+    qu'il voie ce qui est déjà respecté et ce qui ne l'est pas encore.
+    """
+
+    password = password or ""
+
+    return [
+        (f"Au moins {PASSWORD_MIN_LENGTH} caractères "
+         f"(actuellement {len(password)})",
+         len(password) >= PASSWORD_MIN_LENGTH),
+        ("Au moins un chiffre (0-9)",
+         any(c.isdigit() for c in password)),
+        ("Au moins une lettre (a-z, A-Z)",
+         any(c.isalpha() for c in password)),
+        ("Au moins un caractère spécial (ex. ! @ # $ % & * ? - _)",
+         any(not c.isalnum() and not c.isspace() for c in password))
+    ]
+
+
+def password_is_valid(password):
+
+    return all(ok for _, ok in password_policy_checks(password))
+
+
+def get_user(username):
+
+    conn = get_connection()
+
+    row = conn.execute(
+        "SELECT * FROM users WHERE username = ?",
+        (username,)
+    ).fetchone()
+
+    conn.close()
+
+    if not row:
+        return None
+
+    user = dict(row)
+    user["active"] = bool(user["active"])
+    user["must_change_password"] = bool(user["must_change_password"])
+
+    return user
+
+
+def list_users():
+
+    conn = get_connection()
+
+    rows = conn.execute(
+        """
+        SELECT username, role, must_change_password, active,
+               created_at, created_by, last_login_at
+        FROM users
+        ORDER BY role, username
+        """
+    ).fetchall()
+
+    conn.close()
+
+    return [dict(row) for row in rows]
+
+
+def create_user(
+    username,
+    password,
+    role="viewer",
+    must_change_password=True,
+    created_by=None,
+    enforce_policy=True
+):
+    """Crée un utilisateur. Lève ValueError si invalide ou déjà existant."""
+
+    username = (username or "").strip()
+
+    if not username:
+        raise ValueError("Nom d'utilisateur obligatoire.")
+
+    if role not in ROLES:
+        raise ValueError(f"Rôle inconnu : {role}")
+
+    if enforce_policy and not password_is_valid(password):
+        raise ValueError("Le mot de passe ne respecte pas la politique.")
+
+    if get_user(username):
+        raise ValueError(f"L'utilisateur « {username} » existe déjà.")
+
+    salt = secrets.token_bytes(16)
+
+    conn = get_connection()
+    conn.execute(
+        """
+        INSERT INTO users (
+            username, password_salt, password_hash, role,
+            must_change_password, active, created_at, created_by
+        )
+        VALUES (?, ?, ?, ?, ?, 1, ?, ?)
+        """,
+        (
+            username,
+            salt.hex(),
+            _hash_password(password, salt),
+            role,
+            1 if must_change_password else 0,
+            datetime.now(timezone.utc).isoformat(),
+            created_by
+        )
+    )
+    conn.commit()
+    conn.close()
+
+
+def verify_user_credentials(username, password):
+    """
+    Utilisateur (dict) si nom + mot de passe corrects et compte actif,
+    sinon None. Comparaison en temps constant ; un calcul de hash est
+    fait même pour un utilisateur inconnu (pas d'indice sur son
+    existence par le temps de réponse).
+    """
+
+    user = get_user((username or "").strip())
+
+    if user is None:
+        _hash_password(password or "", secrets.token_bytes(16))
+        return None
+
+    computed = _hash_password(password or "", bytes.fromhex(user["password_salt"]))
+
+    if not hmac.compare_digest(computed, user["password_hash"]):
+        return None
+
+    if not user["active"]:
+        return None
+
+    conn = get_connection()
+    conn.execute(
+        "UPDATE users SET last_login_at = ? WHERE username = ?",
+        (datetime.now(timezone.utc).isoformat(), user["username"])
+    )
+    conn.commit()
+    conn.close()
+
+    return user
+
+
+def set_user_password(username, password, must_change_password=False):
+    """
+    Change le mot de passe (politique appliquée) et ferme toutes les
+    sessions de l'utilisateur (autres navigateurs, postes).
+    """
+
+    if not password_is_valid(password):
+        raise ValueError("Le mot de passe ne respecte pas la politique.")
+
+    salt = secrets.token_bytes(16)
+
+    conn = get_connection()
+    conn.execute(
+        """
+        UPDATE users
+        SET password_salt = ?, password_hash = ?, must_change_password = ?
+        WHERE username = ?
+        """,
+        (salt.hex(), _hash_password(password, salt),
+         1 if must_change_password else 0, username)
+    )
+    conn.commit()
+    conn.close()
+
+    delete_user_sessions(username)
+
+
+def count_active_admins(exclude=None):
+
+    conn = get_connection()
+
+    count = conn.execute(
+        "SELECT COUNT(*) FROM users WHERE role = 'admin' AND active = 1 "
+        "AND username <> ?",
+        (exclude or "",)
+    ).fetchone()[0]
+
+    conn.close()
+
+    return count
+
+
+def update_user(username, role=None, active=None):
+    """
+    Change le rôle et/ou l'état d'un utilisateur. Refuse de retirer le
+    dernier administrateur actif.
+    """
+
+    user = get_user(username)
+
+    if user is None:
+        raise ValueError("Utilisateur introuvable.")
+
+    removes_admin = user["role"] == "admin" and user["active"] and (
+        (role is not None and role != "admin")
+        or (active is not None and not active)
+    )
+
+    if removes_admin and count_active_admins(exclude=username) == 0:
+        raise ValueError("Impossible : c'est le dernier administrateur actif.")
+
+    conn = get_connection()
+
+    if role is not None:
+        conn.execute("UPDATE users SET role = ? WHERE username = ?", (role, username))
+
+    if active is not None:
+        conn.execute(
+            "UPDATE users SET active = ? WHERE username = ?",
+            (1 if active else 0, username)
+        )
+
+    conn.commit()
+    conn.close()
+
+    if active is False or role is not None:
+        delete_user_sessions(username)
+
+
+def delete_user(username):
+
+    user = get_user(username)
+
+    if user is None:
+        return
+
+    if user["role"] == "admin" and user["active"] and count_active_admins(exclude=username) == 0:
+        raise ValueError("Impossible : c'est le dernier administrateur actif.")
+
+    delete_user_sessions(username)
+
+    conn = get_connection()
+    conn.execute("DELETE FROM users WHERE username = ?", (username,))
+    conn.commit()
+    conn.close()
+
+
+def delete_user_sessions(username):
+
+    conn = get_connection()
+    conn.execute("DELETE FROM auth_sessions WHERE username = ?", (username,))
+    conn.commit()
+    conn.close()
 
 
 # =========================================================
@@ -3608,6 +3916,32 @@ def count_cves_by_published_day(start_day, end_day):
         }
         for row in rows
     }
+
+
+def get_day_refreshed_at(day):
+    """
+    Date de la plus ancienne mise à jour NVD des CVE publiées ce jour-là
+    (cpe_checked_at), ou None si l'une d'elles n'a jamais été mise à jour
+    (ou s'il n'y en a aucune).
+    """
+
+    conn = get_connection()
+
+    row = conn.execute(
+        """
+        SELECT COUNT(*), SUM(cpe_checked_at IS NULL), MIN(cpe_checked_at)
+        FROM vulnerabilities
+        WHERE nvd_published >= ? AND nvd_published < ?
+        """,
+        (day.isoformat(), (day + timedelta(days=1)).isoformat())
+    ).fetchone()
+
+    conn.close()
+
+    if not row[0] or row[1]:
+        return None
+
+    return row[2]
 
 
 def count_cves_without_cpe_check():
