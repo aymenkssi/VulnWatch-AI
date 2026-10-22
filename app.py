@@ -9,6 +9,15 @@ import plotly.express as px
 import streamlit as st
 import streamlit.components.v1 as components
 
+from services.azure_auth import (
+    get_azure_app_config,
+    set_azure_app_config,
+    clear_azure_app_config,
+    is_azure_app_configured,
+    test_azure_app,
+    REQUIRED_ROLES,
+    API_LABELS
+)
 from services.inventory_matcher import (
     get_inventory_matched_at,
     refresh_matches_for_cves
@@ -1745,6 +1754,150 @@ with st.sidebar:
                 logout()
 
                 st.rerun()
+
+    with st.expander("☁️ Application Azure (Defender / Graph)"):
+
+        azure_config = get_azure_app_config()
+
+        if is_azure_app_configured(azure_config):
+            st.success("Synchros Defender via l'application Azure.")
+        else:
+            st.caption(
+                "Non configurée : les synchros Defender utilisent le "
+                "compte connecté à Azure CLI (az login)."
+            )
+
+        with st.popover("Comment créer l'application ?", use_container_width=True):
+
+            st.markdown(
+                "1. **Portail Entra ID** > Inscriptions d'applications > "
+                "**Nouvelle inscription** (ex. *VulnWatch*), comptes de "
+                "cet annuaire uniquement, sans URI de redirection.\n"
+                "2. Noter l'**ID d'application (client)** et l'**ID de "
+                "l'annuaire (tenant)**.\n"
+                "3. **Certificats et secrets** > Nouveau secret client : "
+                "copier la **valeur** (affichée une seule fois). Notez la "
+                "date d'expiration.\n"
+                "4. **Autorisations d'API** > Ajouter une autorisation, "
+                "type **Autorisations d'application** :"
+            )
+
+            for resource, roles in REQUIRED_ROLES.items():
+                st.markdown(
+                    f"**{API_LABELS[resource]}**"
+                    + (" — onglet *API utilisées par mon organisation*, "
+                       "rechercher *WindowsDefenderATP*"
+                       if "Defender" in API_LABELS[resource] else "")
+                )
+                for role, usage in roles.items():
+                    st.markdown(f"- `{role}` : {usage}")
+
+            st.markdown(
+                "5. **Accorder un consentement d'administrateur** pour "
+                "l'organisation (bouton dans *Autorisations d'API*).\n"
+                "6. Renseigner les trois valeurs ci-dessous, enregistrer, "
+                "puis **Tester**."
+            )
+
+        azure_tenant = st.text_input(
+            "ID de l'annuaire (tenant)",
+            value=azure_config["tenant_id"],
+            key="azure_tenant_id"
+        )
+
+        azure_client = st.text_input(
+            "ID d'application (client)",
+            value=azure_config["client_id"],
+            key="azure_client_id"
+        )
+
+        azure_secret = st.text_input(
+            "Secret client",
+            type="password",
+            value="",
+            placeholder=(
+                "Défini (variable d'environnement)" if azure_config["secret_from_env"]
+                else "Enregistré — laisser vide pour le conserver"
+                if azure_config["client_secret"] else "Valeur du secret"
+            ),
+            key="azure_client_secret",
+            help="Stocké dans la base VulnWatch (comme le mot de passe "
+                 "SMTP). Pour ne pas le stocker : variable d'environnement "
+                 "VULNWATCH_AZURE_CLIENT_SECRET."
+        )
+
+        azure_enabled = st.checkbox(
+            "Utiliser cette application pour les synchros Defender",
+            value=azure_config["enabled"] or not azure_config["client_id"],
+            key="azure_enabled"
+        )
+
+        az1, az2, az3 = st.columns(3)
+
+        with az1:
+            azure_save = st.button("Enregistrer", use_container_width=True, key="azure_save")
+
+        with az2:
+            azure_test = st.button("Tester", use_container_width=True, key="azure_test")
+
+        with az3:
+            azure_clear = st.button("Supprimer", use_container_width=True, key="azure_clear")
+
+        if azure_save:
+
+            if not azure_tenant.strip() or not azure_client.strip():
+                st.error("ID de l'annuaire et ID d'application obligatoires.")
+            elif not azure_secret and not azure_config["client_secret"]:
+                st.error("Secret client obligatoire.")
+            else:
+                set_azure_app_config(
+                    azure_tenant, azure_client, azure_secret, azure_enabled
+                )
+                st.success("Application Azure enregistrée.")
+                st.rerun()
+
+        if azure_clear:
+            clear_azure_app_config()
+            st.success("Application Azure supprimée : retour à Azure CLI.")
+            st.rerun()
+
+        if azure_test:
+
+            # Test avec les valeurs saisies (même non enregistrées).
+            test_config = dict(
+                azure_config,
+                tenant_id=azure_tenant.strip(),
+                client_id=azure_client.strip(),
+                client_secret=azure_secret.strip() or azure_config["client_secret"]
+            )
+
+            if not (
+                test_config["tenant_id"] and test_config["client_id"]
+                and test_config["client_secret"]
+            ):
+                st.error("Renseignez le tenant, l'ID d'application et le secret.")
+            else:
+                with st.spinner("Test de connexion à Entra ID et aux API..."):
+                    azure_results = test_azure_app(test_config)
+
+                failures = [r for r in azure_results if not r["ok"]]
+
+                if failures:
+                    st.error(
+                        f"{len(failures)} vérification(s) en échec sur "
+                        f"{len(azure_results)}."
+                    )
+                else:
+                    st.success("Connexion et permissions OK.")
+
+                for result in azure_results:
+                    st.markdown(
+                        f"{'✅' if result['ok'] else '❌'} **{result['check']}** "
+                        f"— {result['api']}"
+                    )
+                    # Texte brut : le détail peut contenir la réponse
+                    # d'Entra ID ou de l'API.
+                    st.text(result["detail"])
 
     st.divider()
 
@@ -5184,9 +5337,10 @@ with tab_watch:
             type="primary",
             disabled=is_job_running("sync_software_inventory"),
             key="inventory_defender_button",
-            help="Export SoftwareInventoryExport de l'API Defender (Azure "
-                 "CLI connecté, permission Software.Read.All). Réimporté "
-                 "ensuite automatiquement chaque jour."
+            help="Export SoftwareInventoryExport de l'API Defender, avec "
+                 "l'application Azure (barre latérale) ou à défaut Azure "
+                 "CLI ; permission Software.Read.All. Réimporté ensuite "
+                 "automatiquement chaque jour."
         ):
             launch_job("sync_software_inventory.py")
 
