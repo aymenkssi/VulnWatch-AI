@@ -335,6 +335,42 @@ def replace_software_inventory(records, progress=None):
     return count, devices
 
 
+def replace_device_inventory(device_id, records):
+    """
+    Remplace l'inventaire d'UNE machine (actualisation depuis la fiche
+    machine), puis recalcule les correspondances. Retourne le nombre de
+    lignes importées.
+    """
+
+    imported_at = datetime.now(timezone.utc).isoformat()
+
+    rows = [
+        row for row in (
+            normalize_inventory_record(record, imported_at)
+            for record in records
+        )
+        if row is not None and row[0] == device_id
+    ]
+
+    if not rows:
+        raise RuntimeError(
+            "Defender ne renvoie aucun logiciel pour cette machine."
+        )
+
+    conn = get_connection()
+    conn.execute("BEGIN")
+    conn.execute("DELETE FROM software_inventory WHERE device_id = ?", (device_id,))
+    conn.executemany(
+        "INSERT INTO software_inventory VALUES "
+        "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        rows
+    )
+    conn.commit()
+    conn.close()
+
+    return len(rows)
+
+
 # =========================================================
 # CORRESPONDANCES
 # =========================================================

@@ -31,7 +31,8 @@ GRAPH_RESOURCE = "https://graph.microsoft.com"
 REQUIRED_ROLES = {
     DEFENDER_RESOURCE: {
         "Vulnerability.Read.All": "Export des vulnérabilités Defender (sync_defender.py)",
-        "Software.Read.All": "Export de l'inventaire logiciel (sync_software_inventory.py)",
+        "AdvancedQuery.Read.All": "Inventaire logiciel complet par Advanced Hunting (sync_software_inventory.py)",
+        "Software.Read.All": "Export de l'inventaire logiciel, en secours (sync_software_inventory.py)",
         "User.Read.All": "Utilisateurs connectés aux machines (sync_asset_owners.py)"
     },
     GRAPH_RESOURCE: {
@@ -208,6 +209,14 @@ _TEST_CALLS = {
         "https://graph.microsoft.com/v1.0/users?$top=1&$select=id"
 }
 
+# Appels de test en POST : (url, corps JSON).
+_TEST_POSTS = {
+    (DEFENDER_RESOURCE, "AdvancedQuery.Read.All"): (
+        "https://api.security.microsoft.com/api/advancedqueries/run",
+        {"Query": "DeviceTvmSoftwareInventory | take 1"}
+    )
+}
+
 
 def test_azure_app(config=None):
     """
@@ -250,8 +259,9 @@ def test_azure_app(config=None):
                 continue
 
             url = _TEST_CALLS.get((resource, role))
+            post = _TEST_POSTS.get((resource, role))
 
-            if not url:
+            if not url and not post:
                 results.append({
                     "api": api, "check": role, "ok": True,
                     "detail": f"Accordée. Sert à : {usage}"
@@ -259,11 +269,19 @@ def test_azure_app(config=None):
                 continue
 
             try:
-                response = requests.get(
-                    url,
-                    headers={"Authorization": f"Bearer {token}"},
-                    timeout=30
-                )
+                if post:
+                    response = requests.post(
+                        post[0],
+                        headers={"Authorization": f"Bearer {token}"},
+                        json=post[1],
+                        timeout=60
+                    )
+                else:
+                    response = requests.get(
+                        url,
+                        headers={"Authorization": f"Bearer {token}"},
+                        timeout=30
+                    )
                 ok = response.status_code == 200
                 detail = (
                     f"Accordée, appel de test réussi. Sert à : {usage}" if ok
