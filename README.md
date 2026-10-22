@@ -86,6 +86,23 @@ Variables d'environnement (fichier `.env` possible, non versionné) :
 Les paramètres SMTP, Hexiosec et les délais de notification se règlent dans
 l'interface et sont stockés dans la base SQLite.
 
+### Comptes utilisateurs
+
+Barre latérale > « Utilisateurs » (administrateurs) :
+
+- **Administrateur** : tout (configuration, imports, synchronisations, comptes) ;
+- **Lecteur** : consultation de tous les onglets, recherche et bouton
+  « Rafraîchir les données » ; les boutons de configuration, d'import, de
+  synchronisation et d'envoi d'e-mails sont désactivés.
+
+À la création, l'option « Changer le mot de passe à la première connexion »
+(cochée par défaut) impose un mot de passe personnel avant d'accéder à
+l'application. Politique de mot de passe : au moins 15 caractères, un chiffre,
+une lettre et un caractère spécial (exigences affichées, respectées ou non,
+pendant la saisie). Le compte administrateur existant est repris
+automatiquement. Le dernier administrateur actif ne peut être ni désactivé, ni
+rétrogradé, ni supprimé.
+
 ### Accès à Microsoft Defender et Graph
 
 Les synchros Defender (vulnérabilités, inventaire logiciel, propriétaires)

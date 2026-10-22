@@ -38,12 +38,20 @@ from database import (
     get_sync_state,
     get_pending_nvd_count,
     ensure_admin_seeded,
-    verify_admin_credentials,
+    verify_user_credentials,
+    get_user,
+    list_users,
+    create_user,
+    update_user,
+    delete_user,
+    set_user_password,
+    password_policy_checks,
+    password_is_valid,
+    ROLES,
     create_auth_session,
     get_auth_session_user,
     delete_auth_session,
     AUTH_SESSION_DAYS,
-    set_admin_credentials,
     get_notification_delays,
     set_notification_delay,
     get_notification_min_priority,
@@ -195,7 +203,7 @@ def logout():
 
     delete_auth_session(st.session_state.get("session_token"))
 
-    for key in ("authenticated", "authenticated_username", "session_token"):
+    for key in ("authenticated", "authenticated_username", "session_token", "user"):
         st.session_state.pop(key, None)
 
     # Le cookie est effacé à l'affichage de la page de connexion.
@@ -205,6 +213,17 @@ def logout():
 def authenticate():
 
     if st.session_state.get("authenticated", False):
+
+        # Compte relu à chaque chargement : un utilisateur désactivé ou
+        # supprimé par un administrateur est déconnecté aussitôt, un
+        # changement de rôle s'applique tout de suite.
+        user = get_user(st.session_state.get("authenticated_username"))
+
+        if not user or not user["active"]:
+            logout()
+            st.rerun()
+
+        st.session_state["user"] = user
 
         # Cookie à poser juste après la connexion (le st.rerun() qui suit
         # le formulaire ne laisse pas le temps au navigateur de le faire).
@@ -224,11 +243,12 @@ def authenticate():
         # Page rafraîchie / nouvel onglet : on reprend la session du
         # cookie si elle est toujours valide.
         token = st.context.cookies.get(SESSION_COOKIE)
-        username = get_auth_session_user(token)
+        user = get_auth_session_user(token)
 
-        if username:
+        if user:
             st.session_state["authenticated"] = True
-            st.session_state["authenticated_username"] = username
+            st.session_state["authenticated_username"] = user["username"]
+            st.session_state["user"] = user
             st.session_state["session_token"] = token
             return True
 
@@ -258,10 +278,13 @@ def authenticate():
 
     if submitted:
 
-        if verify_admin_credentials(username, password):
-            token = create_auth_session(username)
+        user = verify_user_credentials(username, password)
+
+        if user:
+            token = create_auth_session(user["username"])
             st.session_state["authenticated"] = True
-            st.session_state["authenticated_username"] = username
+            st.session_state["authenticated_username"] = user["username"]
+            st.session_state["user"] = user
             st.session_state["session_token"] = token
             st.session_state["pending_session_cookie"] = token
             st.session_state.pop("login_username", None)
@@ -273,7 +296,120 @@ def authenticate():
     return False
 
 
+def render_password_policy(password):
+    """
+    Exigences de la politique de mot de passe, avec ce qui est déjà
+    respecté (✅) et ce qui ne l'est pas encore (❌). Mis à jour quand
+    on quitte le champ ou qu'on appuie sur Entrée.
+    """
+
+    lines = [
+        f"{'✅' if ok else '❌'} {label}"
+        for label, ok in password_policy_checks(password)
+    ]
+
+    st.caption("**Politique de mot de passe**  \n" + "  \n".join(lines))
+
+
+def password_change_form(username, key_prefix, require_current=True):
+    """
+    Formulaire de changement de mot de passe (première connexion ou
+    « Mon compte »). Retourne True une fois le mot de passe changé.
+    """
+
+    current = None
+
+    if require_current:
+        current = st.text_input(
+            "Mot de passe actuel", type="password",
+            key=f"{key_prefix}_current"
+        )
+
+    new = st.text_input(
+        "Nouveau mot de passe", type="password", key=f"{key_prefix}_new"
+    )
+
+    render_password_policy(new)
+
+    confirm = st.text_input(
+        "Confirmer le nouveau mot de passe", type="password",
+        key=f"{key_prefix}_confirm"
+    )
+
+    if confirm:
+        st.caption(
+            "✅ Les deux saisies correspondent" if confirm == new
+            else "❌ Les deux saisies ne correspondent pas"
+        )
+
+    if not st.button(
+        "Changer le mot de passe",
+        type="primary",
+        use_container_width=True,
+        key=f"{key_prefix}_submit"
+    ):
+        return False
+
+    if require_current and not verify_user_credentials(username, current):
+        st.error("Mot de passe actuel incorrect.")
+    elif not password_is_valid(new):
+        st.error("Le nouveau mot de passe ne respecte pas toutes les exigences.")
+    elif new != confirm:
+        st.error("Les deux saisies ne correspondent pas.")
+    elif verify_user_credentials(username, new):
+        st.error("Le nouveau mot de passe doit être différent de l'actuel.")
+    else:
+        # set_user_password ferme toutes les sessions de l'utilisateur :
+        # on en rouvre une pour ce navigateur.
+        set_user_password(username, new, must_change_password=False)
+
+        token = create_auth_session(username)
+        st.session_state["session_token"] = token
+        st.session_state["pending_session_cookie"] = token
+
+        for suffix in ("current", "new", "confirm"):
+            st.session_state.pop(f"{key_prefix}_{suffix}", None)
+
+        return True
+
+    return False
+
+
 if not authenticate():
+    st.stop()
+
+
+CURRENT_USER = st.session_state["user"]
+
+# Lecteur : consultation et rafraîchissement seulement. Tous les boutons
+# qui configurent, importent, lancent une synchro ou envoient un e-mail
+# sont désactivés (disabled=... or not IS_ADMIN).
+IS_ADMIN = CURRENT_USER["role"] == "admin"
+
+
+# =========================================================
+# CHANGEMENT DE MOT DE PASSE OBLIGATOIRE (première connexion)
+# =========================================================
+
+if CURRENT_USER["must_change_password"]:
+
+    st.title("🛡️ VulnWatch AI")
+    st.subheader("Changement de mot de passe obligatoire")
+    st.info(
+        f"Bonjour {CURRENT_USER['username']}, choisissez votre mot de passe "
+        "personnel avant d'accéder à l'application."
+    )
+
+    if password_change_form(
+        CURRENT_USER["username"], "first_login", require_current=False
+    ):
+        st.success("Mot de passe changé.")
+        st.rerun()
+
+    if st.button("Se déconnecter", key="first_login_logout"):
+        logout()
+        st.rerun()
+
     st.stop()
 
 
@@ -463,7 +599,7 @@ def _job_progress_fragment(key):
             disabled=True
         )
 
-    elif st.button("Arrêter", key=f"job_stop_{key}"):
+    elif st.button("Arrêter", key=f"job_stop_{key}", disabled=not IS_ADMIN):
 
         request_stop(key)
 
@@ -1673,7 +1809,20 @@ with st.sidebar:
         "admin"
     )
 
-    st.success(f"Connecté en tant que {current_username}")
+    st.success(
+        f"Connecté en tant que {current_username} "
+        f"({ROLES.get(CURRENT_USER['role'], CURRENT_USER['role'])})"
+    )
+
+    if not IS_ADMIN:
+        st.caption(
+            "🔒 Accès en consultation : configuration, imports et "
+            "synchronisations réservés aux administrateurs."
+        )
+
+    if st.button("🔄 Rafraîchir les données", use_container_width=True):
+        st.cache_data.clear()
+        st.rerun()
 
     if st.button("Se déconnecter", use_container_width=True):
         logout()
@@ -1683,221 +1832,320 @@ with st.sidebar:
 
     st.divider()
 
-    with st.expander("🔐 Compte"):
+    with st.expander("🔐 Mon compte"):
 
-        st.caption(
-            "Change le nom d'utilisateur et/ou le mot de passe "
-            "de connexion à l'application."
-        )
+        st.caption("Changer mon mot de passe.")
 
-        new_username = st.text_input(
-            "Nom d'utilisateur",
-            value=current_username,
-            key="account_new_username"
-        )
+        if password_change_form(current_username, "account_password"):
+            st.success("Mot de passe changé.")
 
-        new_password = st.text_input(
-            "Nouveau mot de passe",
-            type="password",
-            key="account_new_password"
-        )
+    if IS_ADMIN:
 
-        confirm_password = st.text_input(
-            "Confirmer le mot de passe",
-            type="password",
-            key="account_confirm_password"
-        )
+        with st.expander("👥 Utilisateurs"):
 
-        if st.button(
-            "Mettre à jour les identifiants",
-            key="account_update_btn"
-        ):
+            users = list_users()
 
-            if not new_username.strip():
-
-                st.error(
-                    "Le nom d'utilisateur ne peut pas être vide."
-                )
-
-            elif not new_password:
-
-                st.error(
-                    "Le mot de passe ne peut pas être vide."
-                )
-
-            elif new_password != confirm_password:
-
-                st.error(
-                    "Les deux mots de passe ne correspondent pas."
-                )
-
-            elif len(new_password) < 8:
-
-                st.error(
-                    "Le mot de passe doit contenir au moins "
-                    "8 caractères."
-                )
-
-            else:
-
-                set_admin_credentials(
-                    new_username.strip(),
-                    new_password
-                )
-
-                st.success(
-                    "Identifiants mis à jour. "
-                    "Merci de vous reconnecter."
-                )
-
-                # set_admin_credentials() a supprimé toutes les sessions.
-                logout()
-
-                st.rerun()
-
-    with st.expander("☁️ Application Azure (Defender / Graph)"):
-
-        azure_config = get_azure_app_config()
-
-        if is_azure_app_configured(azure_config):
-            st.success("Synchros Defender via l'application Azure.")
-        else:
-            st.caption(
-                "Non configurée : les synchros Defender utilisent le "
-                "compte connecté à Azure CLI (az login)."
+            st.dataframe(
+                pd.DataFrame([
+                    {
+                        "Utilisateur": u["username"],
+                        "Rôle": ROLES.get(u["role"], u["role"]),
+                        "Actif": "Oui" if u["active"] else "Non",
+                        "Mot de passe à changer": (
+                            "Oui" if u["must_change_password"] else ""
+                        ),
+                        "Dernière connexion": format_sync_timestamp(
+                            u["last_login_at"]
+                        ) if u["last_login_at"] else ""
+                    }
+                    for u in users
+                ]),
+                use_container_width=True,
+                hide_index=True
             )
 
-        with st.popover("Comment créer l'application ?", use_container_width=True):
+            st.markdown("**Créer un compte**")
 
-            st.markdown(
-                "1. **Portail Entra ID** > Inscriptions d'applications > "
-                "**Nouvelle inscription** (ex. *VulnWatch*), comptes de "
-                "cet annuaire uniquement, sans URI de redirection.\n"
-                "2. Noter l'**ID d'application (client)** et l'**ID de "
-                "l'annuaire (tenant)**.\n"
-                "3. **Certificats et secrets** > Nouveau secret client : "
-                "copier la **valeur** (affichée une seule fois). Notez la "
-                "date d'expiration.\n"
-                "4. **Autorisations d'API** > Ajouter une autorisation, "
-                "type **Autorisations d'application** :"
+            new_user_name = st.text_input(
+                "Nom d'utilisateur", key="new_user_name"
             )
 
-            for resource, roles in REQUIRED_ROLES.items():
-                st.markdown(
-                    f"**{API_LABELS[resource]}**"
-                    + (" — onglet *API utilisées par mon organisation*, "
-                       "rechercher *WindowsDefenderATP*"
-                       if "Defender" in API_LABELS[resource] else "")
-                )
-                for role, usage in roles.items():
-                    st.markdown(f"- `{role}` : {usage}")
-
-            st.markdown(
-                "5. **Accorder un consentement d'administrateur** pour "
-                "l'organisation (bouton dans *Autorisations d'API*).\n"
-                "6. Renseigner les trois valeurs ci-dessous, enregistrer, "
-                "puis **Tester**."
+            new_user_role = st.selectbox(
+                "Rôle",
+                list(ROLES),
+                index=list(ROLES).index("viewer"),
+                format_func=ROLES.get,
+                key="new_user_role",
+                help="Lecteur : consultation et rafraîchissement seulement "
+                     "(aucune configuration, aucun import, aucune "
+                     "synchronisation)."
             )
 
-        azure_tenant = st.text_input(
-            "ID de l'annuaire (tenant)",
-            value=azure_config["tenant_id"],
-            key="azure_tenant_id"
-        )
-
-        azure_client = st.text_input(
-            "ID d'application (client)",
-            value=azure_config["client_id"],
-            key="azure_client_id"
-        )
-
-        azure_secret = st.text_input(
-            "Secret client",
-            type="password",
-            value="",
-            placeholder=(
-                "Défini (variable d'environnement)" if azure_config["secret_from_env"]
-                else "Enregistré — laisser vide pour le conserver"
-                if azure_config["client_secret"] else "Valeur du secret"
-            ),
-            key="azure_client_secret",
-            help="Stocké dans la base VulnWatch (comme le mot de passe "
-                 "SMTP). Pour ne pas le stocker : variable d'environnement "
-                 "VULNWATCH_AZURE_CLIENT_SECRET."
-        )
-
-        azure_enabled = st.checkbox(
-            "Utiliser cette application pour les synchros Defender",
-            value=azure_config["enabled"] or not azure_config["client_id"],
-            key="azure_enabled"
-        )
-
-        az1, az2, az3 = st.columns(3)
-
-        with az1:
-            azure_save = st.button("Enregistrer", use_container_width=True, key="azure_save")
-
-        with az2:
-            azure_test = st.button("Tester", use_container_width=True, key="azure_test")
-
-        with az3:
-            azure_clear = st.button("Supprimer", use_container_width=True, key="azure_clear")
-
-        if azure_save:
-
-            if not azure_tenant.strip() or not azure_client.strip():
-                st.error("ID de l'annuaire et ID d'application obligatoires.")
-            elif not azure_secret and not azure_config["client_secret"]:
-                st.error("Secret client obligatoire.")
-            else:
-                set_azure_app_config(
-                    azure_tenant, azure_client, azure_secret, azure_enabled
-                )
-                st.success("Application Azure enregistrée.")
-                st.rerun()
-
-        if azure_clear:
-            clear_azure_app_config()
-            st.success("Application Azure supprimée : retour à Azure CLI.")
-            st.rerun()
-
-        if azure_test:
-
-            # Test avec les valeurs saisies (même non enregistrées).
-            test_config = dict(
-                azure_config,
-                tenant_id=azure_tenant.strip(),
-                client_id=azure_client.strip(),
-                client_secret=azure_secret.strip() or azure_config["client_secret"]
+            new_user_password = st.text_input(
+                "Mot de passe provisoire",
+                type="password",
+                key="new_user_password"
             )
 
-            if not (
-                test_config["tenant_id"] and test_config["client_id"]
-                and test_config["client_secret"]
+            render_password_policy(new_user_password)
+
+            new_user_must_change = st.checkbox(
+                "Changer le mot de passe à la première connexion",
+                value=True,
+                key="new_user_must_change"
+            )
+
+            if st.button(
+                "Créer le compte", use_container_width=True,
+                type="primary", key="new_user_create"
             ):
-                st.error("Renseignez le tenant, l'ID d'application et le secret.")
-            else:
-                with st.spinner("Test de connexion à Entra ID et aux API..."):
-                    azure_results = test_azure_app(test_config)
-
-                failures = [r for r in azure_results if not r["ok"]]
-
-                if failures:
-                    st.error(
-                        f"{len(failures)} vérification(s) en échec sur "
-                        f"{len(azure_results)}."
+                try:
+                    create_user(
+                        new_user_name,
+                        new_user_password,
+                        role=new_user_role,
+                        must_change_password=new_user_must_change,
+                        created_by=current_username
                     )
+                except ValueError as error:
+                    st.error(str(error))
                 else:
-                    st.success("Connexion et permissions OK.")
+                    for key in ("new_user_name", "new_user_password"):
+                        st.session_state.pop(key, None)
+                    st.success(f"Compte « {new_user_name.strip()} » créé.")
+                    st.rerun()
 
-                for result in azure_results:
+            others = [u["username"] for u in users if u["username"] != current_username]
+
+            if others:
+
+                st.markdown("**Gérer un compte**")
+
+                managed_name = st.selectbox(
+                    "Utilisateur", others, key="managed_user"
+                )
+
+                managed = get_user(managed_name)
+
+                managed_role = st.selectbox(
+                    "Rôle",
+                    list(ROLES),
+                    index=list(ROLES).index(managed["role"]),
+                    format_func=ROLES.get,
+                    key=f"managed_role_{managed_name}"
+                )
+
+                managed_active = st.checkbox(
+                    "Compte actif",
+                    value=managed["active"],
+                    key=f"managed_active_{managed_name}"
+                )
+
+                if st.button(
+                    "Enregistrer", use_container_width=True,
+                    key=f"managed_save_{managed_name}"
+                ):
+                    try:
+                        update_user(
+                            managed_name,
+                            role=managed_role if managed_role != managed["role"] else None,
+                            active=managed_active if managed_active != managed["active"] else None
+                        )
+                    except ValueError as error:
+                        st.error(str(error))
+                    else:
+                        st.success("Compte mis à jour.")
+                        st.rerun()
+
+                reset_password = st.text_input(
+                    "Nouveau mot de passe provisoire",
+                    type="password",
+                    key=f"managed_reset_{managed_name}"
+                )
+
+                if reset_password:
+                    render_password_policy(reset_password)
+
+                if st.button(
+                    "Réinitialiser le mot de passe",
+                    use_container_width=True,
+                    key=f"managed_reset_btn_{managed_name}",
+                    help="L'utilisateur devra le changer à sa prochaine "
+                         "connexion ; ses sessions ouvertes sont fermées."
+                ):
+                    try:
+                        set_user_password(
+                            managed_name, reset_password,
+                            must_change_password=True
+                        )
+                    except ValueError as error:
+                        st.error(str(error))
+                    else:
+                        st.session_state.pop(f"managed_reset_{managed_name}", None)
+                        st.success(
+                            "Mot de passe réinitialisé : à changer à la "
+                            "prochaine connexion."
+                        )
+
+                if st.button(
+                    f"Supprimer « {managed_name} »",
+                    use_container_width=True,
+                    key=f"managed_delete_{managed_name}"
+                ):
+                    try:
+                        delete_user(managed_name)
+                    except ValueError as error:
+                        st.error(str(error))
+                    else:
+                        st.success("Compte supprimé.")
+                        st.rerun()
+
+    # Configuration réservée aux administrateurs.
+    if IS_ADMIN:
+
+        with st.expander("☁️ Application Azure (Defender / Graph)"):
+
+            azure_config = get_azure_app_config()
+
+            if is_azure_app_configured(azure_config):
+                st.success("Synchros Defender via l'application Azure.")
+            else:
+                st.caption(
+                    "Non configurée : les synchros Defender utilisent le "
+                    "compte connecté à Azure CLI (az login)."
+                )
+
+            with st.popover("Comment créer l'application ?", use_container_width=True):
+
+                st.markdown(
+                    "1. **Portail Entra ID** > Inscriptions d'applications > "
+                    "**Nouvelle inscription** (ex. *VulnWatch*), comptes de "
+                    "cet annuaire uniquement, sans URI de redirection.\n"
+                    "2. Noter l'**ID d'application (client)** et l'**ID de "
+                    "l'annuaire (tenant)**.\n"
+                    "3. **Certificats et secrets** > Nouveau secret client : "
+                    "copier la **valeur** (affichée une seule fois). Notez la "
+                    "date d'expiration.\n"
+                    "4. **Autorisations d'API** > Ajouter une autorisation, "
+                    "type **Autorisations d'application** :"
+                )
+
+                for resource, roles in REQUIRED_ROLES.items():
                     st.markdown(
-                        f"{'✅' if result['ok'] else '❌'} **{result['check']}** "
-                        f"— {result['api']}"
+                        f"**{API_LABELS[resource]}**"
+                        + (" — onglet *API utilisées par mon organisation*, "
+                           "rechercher *WindowsDefenderATP*"
+                           if "Defender" in API_LABELS[resource] else "")
                     )
-                    # Texte brut : le détail peut contenir la réponse
-                    # d'Entra ID ou de l'API.
-                    st.text(result["detail"])
+                    for role, usage in roles.items():
+                        st.markdown(f"- `{role}` : {usage}")
+
+                st.markdown(
+                    "5. **Accorder un consentement d'administrateur** pour "
+                    "l'organisation (bouton dans *Autorisations d'API*).\n"
+                    "6. Renseigner les trois valeurs ci-dessous, enregistrer, "
+                    "puis **Tester**."
+                )
+
+            azure_tenant = st.text_input(
+                "ID de l'annuaire (tenant)",
+                value=azure_config["tenant_id"],
+                key="azure_tenant_id"
+            )
+
+            azure_client = st.text_input(
+                "ID d'application (client)",
+                value=azure_config["client_id"],
+                key="azure_client_id"
+            )
+
+            azure_secret = st.text_input(
+                "Secret client",
+                type="password",
+                value="",
+                placeholder=(
+                    "Défini (variable d'environnement)" if azure_config["secret_from_env"]
+                    else "Enregistré — laisser vide pour le conserver"
+                    if azure_config["client_secret"] else "Valeur du secret"
+                ),
+                key="azure_client_secret",
+                help="Stocké dans la base VulnWatch (comme le mot de passe "
+                     "SMTP). Pour ne pas le stocker : variable d'environnement "
+                     "VULNWATCH_AZURE_CLIENT_SECRET."
+            )
+
+            azure_enabled = st.checkbox(
+                "Utiliser cette application pour les synchros Defender",
+                value=azure_config["enabled"] or not azure_config["client_id"],
+                key="azure_enabled"
+            )
+
+            az1, az2, az3 = st.columns(3)
+
+            with az1:
+                azure_save = st.button("Enregistrer", use_container_width=True, key="azure_save")
+
+            with az2:
+                azure_test = st.button("Tester", use_container_width=True, key="azure_test")
+
+            with az3:
+                azure_clear = st.button("Supprimer", use_container_width=True, key="azure_clear")
+
+            if azure_save:
+
+                if not azure_tenant.strip() or not azure_client.strip():
+                    st.error("ID de l'annuaire et ID d'application obligatoires.")
+                elif not azure_secret and not azure_config["client_secret"]:
+                    st.error("Secret client obligatoire.")
+                else:
+                    set_azure_app_config(
+                        azure_tenant, azure_client, azure_secret, azure_enabled
+                    )
+                    st.success("Application Azure enregistrée.")
+                    st.rerun()
+
+            if azure_clear:
+                clear_azure_app_config()
+                st.success("Application Azure supprimée : retour à Azure CLI.")
+                st.rerun()
+
+            if azure_test:
+
+                # Test avec les valeurs saisies (même non enregistrées).
+                test_config = dict(
+                    azure_config,
+                    tenant_id=azure_tenant.strip(),
+                    client_id=azure_client.strip(),
+                    client_secret=azure_secret.strip() or azure_config["client_secret"]
+                )
+
+                if not (
+                    test_config["tenant_id"] and test_config["client_id"]
+                    and test_config["client_secret"]
+                ):
+                    st.error("Renseignez le tenant, l'ID d'application et le secret.")
+                else:
+                    with st.spinner("Test de connexion à Entra ID et aux API..."):
+                        azure_results = test_azure_app(test_config)
+
+                    failures = [r for r in azure_results if not r["ok"]]
+
+                    if failures:
+                        st.error(
+                            f"{len(failures)} vérification(s) en échec sur "
+                            f"{len(azure_results)}."
+                        )
+                    else:
+                        st.success("Connexion et permissions OK.")
+
+                    for result in azure_results:
+                        st.markdown(
+                            f"{'✅' if result['ok'] else '❌'} **{result['check']}** "
+                            f"— {result['api']}"
+                        )
+                        # Texte brut : le détail peut contenir la réponse
+                        # d'Entra ID ou de l'API.
+                        st.text(result["detail"])
 
     st.divider()
 
@@ -1950,7 +2198,7 @@ with st.sidebar:
     if st.button(
         "Synchroniser CISA",
         use_container_width=True,
-        disabled=is_job_running("sync")
+        disabled=(is_job_running("sync")) or not IS_ADMIN
     ):
 
         launch_job("sync.py")
@@ -1990,7 +2238,7 @@ with st.sidebar:
     if st.button(
         "Enrichir NVD maintenant",
         use_container_width=True,
-        disabled=is_job_running("enrich")
+        disabled=(is_job_running("enrich")) or not IS_ADMIN
     ):
 
         env = os.environ.copy()
@@ -2020,7 +2268,7 @@ with st.sidebar:
     if st.button(
         "Analyser avec l'IA locale",
         use_container_width=True,
-        disabled=is_job_running("ai_enrich")
+        disabled=(is_job_running("ai_enrich")) or not IS_ADMIN
     ):
 
         env = os.environ.copy()
@@ -2485,7 +2733,8 @@ with tab_servers:
         owners_csv = st.file_uploader(
             "Fichier CSV",
             type=["csv"],
-            key="owners_csv_uploader"
+            key="owners_csv_uploader",
+            disabled=not IS_ADMIN
         )
 
         if owners_csv is not None:
@@ -2587,7 +2836,8 @@ with tab_servers:
 
                     if st.button(
                         "Importer",
-                        key="import_owners_btn"
+                        key="import_owners_btn",
+                        disabled=not IS_ADMIN
                     ):
 
                         imported = import_manual_server_owners(
@@ -2656,7 +2906,7 @@ with tab_servers:
             servers_editable,
             use_container_width=True,
             hide_index=True,
-            disabled=[
+            disabled=([
                 "ID équipement",
                 "Server",
                 "OS",
@@ -2664,7 +2914,7 @@ with tab_servers:
                 "Nombre de CVE CISA",
                 "CVE critiques",
                 "CVE moyennes"
-            ],
+            ]) if IS_ADMIN else True,
             column_config={
                 "Propriétaire": st.column_config.TextColumn(
                     "Propriétaire"
@@ -2678,7 +2928,8 @@ with tab_servers:
 
         if st.button(
             "Enregistrer les modifications",
-            key="save_server_inventory_btn"
+            key="save_server_inventory_btn",
+            disabled=not IS_ADMIN
         ):
 
             rows_to_save = [
@@ -4126,7 +4377,8 @@ with tab_investigation:
 
         if st.button(
             "Générer l'analyse IA pour cette CVE",
-            key="ai_single_cve"
+            key="ai_single_cve",
+            disabled=not IS_ADMIN
         ):
 
             from services.ai_engine import (
@@ -4313,7 +4565,8 @@ with tab_notifications:
             )
 
         smtp_submitted = st.form_submit_button(
-            "Enregistrer la configuration SMTP"
+            "Enregistrer la configuration SMTP",
+            disabled=not IS_ADMIN
         )
 
         if smtp_submitted:
@@ -4347,7 +4600,7 @@ with tab_notifications:
         st.write("")
         st.write("")
 
-        if st.button("Envoyer un test", use_container_width=True):
+        if st.button("Envoyer un test", use_container_width=True, disabled=not IS_ADMIN):
 
             if not test_email_addr.strip():
 
@@ -4396,7 +4649,7 @@ with tab_notifications:
         else 1
     )
 
-    if st.button("Enregistrer le seuil de déclenchement"):
+    if st.button("Enregistrer le seuil de déclenchement", disabled=not IS_ADMIN):
 
         set_notification_min_priority(selected_min_priority)
 
@@ -4443,7 +4696,7 @@ with tab_notifications:
                 key=f"delay_{priority}"
             )
 
-    if st.button("Enregistrer les délais"):
+    if st.button("Enregistrer les délais", disabled=not IS_ADMIN):
 
         for priority, hours in new_delays.items():
             set_notification_delay(priority, hours)
@@ -4461,7 +4714,7 @@ with tab_notifications:
     if st.button(
         "Vérifier et envoyer les notifications maintenant",
         use_container_width=True,
-        disabled=is_job_running("notify")
+        disabled=(is_job_running("notify")) or not IS_ADMIN
     ):
 
         if not is_smtp_configured():
@@ -4656,7 +4909,8 @@ with tab_attack_surface:
             )
 
         hx_submitted = st.form_submit_button(
-            "Enregistrer la configuration"
+            "Enregistrer la configuration",
+            disabled=not IS_ADMIN
         )
 
         if hx_submitted:
@@ -4681,7 +4935,7 @@ with tab_attack_surface:
 
             st.rerun()
 
-    if st.button("Tester la connexion"):
+    if st.button("Tester la connexion", disabled=not IS_ADMIN):
 
         if not is_hexiosec_configured():
 
@@ -4723,7 +4977,7 @@ with tab_attack_surface:
     if st.button(
         "Synchroniser les risques Hexiosec",
         use_container_width=True,
-        disabled=is_job_running("sync_hexiosec")
+        disabled=(is_job_running("sync_hexiosec")) or not IS_ADMIN
     ):
 
         if not is_hexiosec_configured():
@@ -5058,7 +5312,7 @@ with tab_watch:
         "Synchroniser NVD maintenant",
         use_container_width=True,
         key="watch_nvd_sync_button",
-        disabled=is_job_running("sync_nvd_feed")
+        disabled=(is_job_running("sync_nvd_feed")) or not IS_ADMIN
     ):
 
         env = os.environ.copy()
@@ -5102,7 +5356,7 @@ with tab_watch:
 
         st.caption(f"Clé actuelle : {nvd_key_status}")
 
-        if st.button("Enregistrer la clé API NVD"):
+        if st.button("Enregistrer la clé API NVD", disabled=not IS_ADMIN):
 
             if new_nvd_key:
 
@@ -5161,7 +5415,7 @@ with tab_watch:
         audit_check = st.button(
             "Vérifier l'état",
             use_container_width=True,
-            disabled=audit_running,
+            disabled=(audit_running) or not IS_ADMIN,
             key="nvd_audit_check_button"
         )
 
@@ -5171,7 +5425,7 @@ with tab_watch:
             "Rattraper les CVE manquantes",
             use_container_width=True,
             type="primary",
-            disabled=audit_running,
+            disabled=(audit_running) or not IS_ADMIN,
             key="nvd_audit_fix_button"
         )
 
@@ -5335,7 +5589,7 @@ with tab_watch:
             "Importer l'inventaire depuis Defender",
             use_container_width=True,
             type="primary",
-            disabled=is_job_running("sync_software_inventory"),
+            disabled=(is_job_running("sync_software_inventory")) or not IS_ADMIN,
             key="inventory_defender_button",
             help="Export SoftwareInventoryExport de l'API Defender, avec "
                  "l'application Azure (barre latérale) ou à défaut Azure "
@@ -5349,7 +5603,7 @@ with tab_watch:
         if st.button(
             "Recalculer les équipements touchés",
             use_container_width=True,
-            disabled=is_job_running("nvd_match"),
+            disabled=(is_job_running("nvd_match")) or not IS_ADMIN,
             key="inventory_match_button"
         ):
             launch_job("nvd_match.py")
@@ -5398,7 +5652,7 @@ with tab_watch:
             if st.button(
                 "Télécharger les produits NVD",
                 use_container_width=True,
-                disabled=is_job_running("nvd_cpe_sync"),
+                disabled=(is_job_running("nvd_cpe_sync")) or not IS_ADMIN,
                 key="inventory_cpe_button"
             ):
                 env = os.environ.copy()
@@ -5434,13 +5688,14 @@ with tab_watch:
         inventory_csv = st.file_uploader(
             "Fichier CSV d'inventaire",
             type=["csv"],
-            key="inventory_csv_upload"
+            key="inventory_csv_upload",
+            disabled=not IS_ADMIN
         )
 
         if inventory_csv and st.button(
             "Importer le CSV",
             use_container_width=True,
-            disabled=is_job_running("sync_software_inventory"),
+            disabled=(is_job_running("sync_software_inventory")) or not IS_ADMIN,
             key="inventory_csv_button"
         ):
             upload_dir = Path("data/imports")
@@ -5618,7 +5873,8 @@ with tab_watch:
 
             if st.button(
                 "Enregistrer la date de départ",
-                key="nvd_backfill_start_save_button"
+                key="nvd_backfill_start_save_button",
+                disabled=not IS_ADMIN
             ):
 
                 set_nvd_backfill_start(
@@ -5651,7 +5907,8 @@ with tab_watch:
                 "Reprend depuis le dernier point atteint. Utile si le "
                 "téléchargement semble bloqué sans attendre le délai "
                 "de reprise automatique."
-            )
+            ),
+            disabled=not IS_ADMIN
         ):
 
             env = os.environ.copy()
@@ -5678,7 +5935,8 @@ with tab_watch:
 
             if st.button(
                 "Tout retélécharger depuis zéro",
-                key="watch_nvd_backfill_reset_button"
+                key="watch_nvd_backfill_reset_button",
+                disabled=not IS_ADMIN
             ):
 
                 reset_nvd_backfill()
@@ -5718,14 +5976,15 @@ with tab_watch:
             "Fichier(s) NVD",
             type=["json", "gz", "zip"],
             accept_multiple_files=True,
-            key="nvd_manual_upload_field"
+            key="nvd_manual_upload_field",
+            disabled=not IS_ADMIN
         )
 
         if uploaded_nvd_files and st.button(
             "Importer",
             use_container_width=True,
             key="nvd_manual_upload_button",
-            disabled=is_job_running("nvd_import_files")
+            disabled=(is_job_running("nvd_import_files")) or not IS_ADMIN
         ):
 
             # Import en arrière-plan (un flux annuel complet prend
@@ -5925,7 +6184,7 @@ with tab_watch:
             f"📧 Envoyer une alerte à la liste de diffusion "
             f"({len(active_recipients)} destinataire(s))",
             use_container_width=True,
-            disabled=not active_recipients
+            disabled=(not active_recipients) or not IS_ADMIN
         ):
 
             if not is_smtp_configured():
@@ -6028,7 +6287,8 @@ with tab_watch:
             st.write("")
             add_recipient_submitted = st.form_submit_button(
                 "Ajouter",
-                use_container_width=True
+                use_container_width=True,
+                disabled=not IS_ADMIN
             )
 
         if add_recipient_submitted:
@@ -6068,7 +6328,8 @@ with tab_watch:
                 new_active = st.checkbox(
                     "Actif",
                     value=bool(recipient["active"]),
-                    key=f"watch_recipient_active_{recipient['id']}"
+                    key=f"watch_recipient_active_{recipient['id']}",
+                    disabled=not IS_ADMIN
                 )
 
                 if new_active != bool(recipient["active"]):
@@ -6081,7 +6342,8 @@ with tab_watch:
 
                 if st.button(
                     "🗑️",
-                    key=f"watch_recipient_delete_{recipient['id']}"
+                    key=f"watch_recipient_delete_{recipient['id']}",
+                    disabled=not IS_ADMIN
                 ):
 
                     delete_watch_recipient(recipient["id"])
