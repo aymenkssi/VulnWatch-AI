@@ -5,7 +5,8 @@ from pathlib import Path
 
 from database import (
     get_connection,
-    initialize_database
+    initialize_database,
+    rebuild_defender_cve_summary
 )
 
 from collectors.defender import (
@@ -510,6 +511,12 @@ def main():
         final_count = promote_stage(
             conn
         )
+
+        print("Rebuilding Defender CVE summary...")
+
+        summary_count = rebuild_defender_cve_summary()
+
+        print(f"Distinct CVE in Defender summary: {summary_count:,}")
 
         print()
         print("=" * 70)
