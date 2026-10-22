@@ -5678,7 +5678,12 @@ with tab_watch:
             "(la synchro quotidienne les tient à jour)."
         )
 
-    render_job("sync_software_inventory")
+    render_job("sync_software_inventory", warning_state_key="software_inventory")
+
+    inventory_state = get_sync_state("software_inventory")
+
+    if inventory_state and inventory_state.get("status") == "WARNING":
+        st.warning(f"⚠️ Dernier import d'inventaire : {inventory_state.get('detail')}")
     render_job("nvd_match")
     render_job("nvd_cpe_sync")
 
