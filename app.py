@@ -9,7 +9,10 @@ import plotly.express as px
 import streamlit as st
 import streamlit.components.v1 as components
 
-from services.inventory_matcher import get_inventory_matched_at
+from services.inventory_matcher import (
+    get_inventory_matched_at,
+    refresh_matches_for_cves
+)
 from services.jobs import (
     start_job,
     get_job,
@@ -702,7 +705,10 @@ auto_notify_if_needed()
 # synchronisée séparément et sert toujours à notifier les propriétaires
 # de serveur (auto_notify_if_needed ci-dessus) : rien n'y change.
 
-AUTO_NVD_FEED_INTERVAL_MINUTES = 24 * 60
+# Toutes les 2 h : NVD déclare souvent les produits vulnérables quelques
+# heures après la publication ; la synchro récupère aussi ces
+# modifications (et alerte si une CVE récente devient applicable au parc).
+AUTO_NVD_FEED_INTERVAL_MINUTES = 2 * 60
 AUTO_NVD_FEED_ERROR_RETRY_MINUTES = 60
 
 
@@ -2903,7 +2909,16 @@ def load_nvd_record(cve_id, api_key):
 
     record = nvd_collector.fetch_nvd_cve_record(cve_id)
 
-    return nvd_collector.describe_nvd_record(record) if record else None
+    if not record:
+        return None
+
+    # La fiche affichée est aussi enregistrée : si NVD a déclaré les
+    # produits vulnérables depuis la dernière synchro, les équipements
+    # touchés selon NVD sont recalculés tout de suite.
+    bulk_save_nvd_discoveries([(cve_id, nvd_collector.parse_nvd_cve(record))])
+    refresh_matches_for_cves([cve_id])
+
+    return nvd_collector.describe_nvd_record(record)
 
 
 INVENTORY_DEVICE_COLUMNS = {
@@ -3115,6 +3130,19 @@ def render_nvd_cve_details(cve_id):
         if not record:
             st.info("NVD ne connaît pas (ou plus) cette CVE.")
             return
+
+        # La fiche NVD vient d'être enregistrée en base : si elle change
+        # les machines touchées (produits déclarés depuis la dernière
+        # synchro), on recharge une fois avec les chiffres à jour.
+        refreshed_key = f"nvd_refreshed_{cve_id}"
+
+        if (
+            get_inventory_device_count(cve_id) != inventory_devices
+            and not st.session_state.get(refreshed_key)
+        ):
+            st.session_state[refreshed_key] = True
+            st.cache_data.clear()
+            st.rerun()
 
         st.caption(
             f"Statut NVD : **{record['status'] or 'N/A'}** · "
@@ -4862,14 +4890,15 @@ with tab_watch:
         st.caption(
             f"{nvd_feed_icon} Dernière synchro : "
             f"{format_sync_timestamp(nvd_feed_state.get('last_run_at'))} "
-            f"(auto. toutes les 24h) — {nvd_feed_state.get('detail') or ''}"
+            f"(auto. toutes les {AUTO_NVD_FEED_INTERVAL_MINUTES // 60} h) — "
+            f"{nvd_feed_state.get('detail') or ''}"
         )
 
     else:
 
         st.caption(
             "⚪ Aucune synchronisation NVD effectuée pour le moment "
-            "(auto. toutes les 24h)"
+            f"(auto. toutes les {AUTO_NVD_FEED_INTERVAL_MINUTES // 60} h)"
         )
 
     if st.button(
