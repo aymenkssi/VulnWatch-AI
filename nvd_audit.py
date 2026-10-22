@@ -11,9 +11,13 @@ Pour chaque jour, le rapport indique aussi combien de CVE ont leurs
 produits vulnérables NVD (CPE) et combien sont "à compléter" (importées
 avant l'enregistrement des produits).
 
-Avec VULNWATCH_AUDIT_FIX=1, les jours incomplets (CVE manquantes ou à
-compléter) sont retéléchargés (CVE publiées ce jour-là) et enregistrés
-avec leurs produits, puis recomptés.
+Avec VULNWATCH_AUDIT_FIX=1, TOUS les jours de la période sont
+retéléchargés (CVE publiées ce jour-là) et enregistrés avec leurs
+produits, puis recomptés : en plus des CVE manquantes ou à compléter,
+cela met à jour les CVE dont NVD a déclaré ou corrigé les produits
+vulnérables après leur enregistrement (ex. CVE publiée sans produits,
+analysée par NVD une heure plus tard). Une page d'API par jour en
+général : moins d'une minute pour 30 jours avec une clé API.
 Le rattrapage n'envoie pas d'alerte e-mail (il peut ramener beaucoup de
 CVE d'un coup) : les CVE rattrapées présentes sur le parc sont listées
 dans le rapport et visibles dans l'onglet Veille.
@@ -43,6 +47,7 @@ from collectors.nvd import (
 )
 from services.jobs import report_progress
 from services.inventory_matcher import refresh_matches_for_cves
+from database import get_inventory_matched_cve_ids
 
 
 AUDIT_DAYS = int(os.getenv("VULNWATCH_AUDIT_DAYS", "30"))
@@ -123,7 +128,7 @@ def main():
         for offset in range(AUDIT_DAYS - 1, -1, -1)
     ]
 
-    total_steps = len(days) * (2 if FIX else 1)
+    total_steps = len(days) * 2 if FIX else len(days)
     step = 0
 
     print(f"Comptage NVD jour par jour ({days[0]} -> {days[-1]})...")
@@ -141,11 +146,12 @@ def main():
 
     recovered = 0
     completed = 0
+    updated = 0
     recovered_on_parc = []
 
-    if FIX and gaps:
+    if FIX:
 
-        for row in gaps:
+        for row in rows:
 
             report_progress(
                 step,
@@ -163,21 +169,30 @@ def main():
 
             known = get_known_cve_ids(ids)
             new_ids = [cve_id for cve_id in ids if cve_id not in known]
+            matched_before = get_inventory_matched_cve_ids(ids)
 
             bulk_save_nvd_discoveries(discoveries)
 
             recovered += len(new_ids)
             completed += row["unchecked"]
+            updated += len(ids) - len(new_ids)
 
-            # Produits désormais connus pour toutes les CVE du jour :
-            # équipements touchés selon NVD recalculés pour elles.
-            on_parc_inventory = refresh_matches_for_cves(ids)
+            # Produits à jour pour toutes les CVE du jour : équipements
+            # touchés selon NVD recalculés pour elles.
+            matched_after = refresh_matches_for_cves(ids)
 
+            # Nouvelles sur le parc : CVE rattrapées présentes chez
+            # Defender, et toute CVE du jour qui touche maintenant une
+            # machine selon NVD alors qu'elle n'en touchait aucune.
             on_parc = set(get_cve_ids_present_in_defender(new_ids))
-            on_parc |= on_parc_inventory & set(new_ids)
+            on_parc |= matched_after - matched_before
             recovered_on_parc.extend(on_parc)
 
-            print(f"  {row['day']} : {len(new_ids)} CVE rattrapée(s)")
+            print(
+                f"  {row['day']} : {len(new_ids)} CVE rattrapée(s), "
+                f"{len(ids) - len(new_ids)} mise(s) à jour, "
+                f"{len(on_parc)} nouvelle(s) sur le parc"
+            )
 
             step += 1
             time.sleep(PAGE_DELAY_SECONDS)
@@ -194,6 +209,7 @@ def main():
         "fixed": FIX,
         "recovered": recovered,
         "completed": completed,
+        "updated": updated,
         "recovered_on_parc": sorted(recovered_on_parc),
         "rows": rows
     }
