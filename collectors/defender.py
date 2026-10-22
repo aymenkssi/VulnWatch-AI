@@ -55,6 +55,25 @@ def find_az():
 
 
 def get_access_token():
+    """
+    Jeton pour l'API Defender : application Entra ID si elle est
+    configurée et activée (Interface > Application Azure), sinon le
+    compte connecté à Azure CLI.
+    """
+
+    from services.azure_auth import (
+        is_azure_app_configured,
+        request_app_token,
+        DEFENDER_RESOURCE
+    )
+
+    if is_azure_app_configured():
+        return request_app_token(DEFENDER_RESOURCE)
+
+    return _get_azure_cli_token()
+
+
+def _get_azure_cli_token():
 
     az = find_az()
 
@@ -85,7 +104,9 @@ def get_access_token():
             "Azure CLI n'a pas pu fournir de jeton pour l'API Defender "
             f"(compte Windows : {os.getenv('USERNAME') or os.getenv('USER') or 'inconnu'}). "
             "Ouvrez une console avec ce compte et lancez "
-            "« az login » (ou « az login --tenant <id-du-tenant> »). "
+            "« az login » (ou « az login --tenant <id-du-tenant> »), ou "
+            "configurez une application Azure (barre latérale > "
+            "Application Azure) pour ne plus dépendre d'un compte. "
             f"Réponse d'Azure CLI : {message}"
         )
 

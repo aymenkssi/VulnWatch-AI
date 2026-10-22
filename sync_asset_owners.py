@@ -43,11 +43,21 @@ TECHNICAL_ACCOUNT_PATTERNS = (
 
 def get_graph_token():
     """
-    Récupère un token Microsoft Graph avec Azure CLI.
+    Récupère un token Microsoft Graph : application Entra ID si elle est
+    configurée (Interface > Application Azure), sinon Azure CLI.
 
     Utilise find_az() du collector Defender afin de fonctionner
     même si az.exe n'est pas présent dans le PATH PowerShell.
     """
+    from services.azure_auth import (
+        is_azure_app_configured,
+        request_app_token,
+        GRAPH_RESOURCE
+    )
+
+    if is_azure_app_configured():
+        return request_app_token(GRAPH_RESOURCE)
+
     az = find_az()
 
     result = subprocess.run(

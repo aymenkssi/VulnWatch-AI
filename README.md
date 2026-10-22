@@ -73,6 +73,7 @@ Variables d'environnement (fichier `.env` possible, non versionné) :
 | `VULNWATCH_ADMIN_USER` | `admin` | Identifiant administrateur initial |
 | `VULNWATCH_ADMIN_PASSWORD` | généré | Mot de passe initial (affiché une seule fois s'il est généré) |
 | `VULNWATCH_SESSION_DAYS` | `30` | Durée de la connexion conservée dans le navigateur (jours), jusqu'à « Se déconnecter » |
+| `VULNWATCH_AZURE_TENANT_ID` / `VULNWATCH_AZURE_CLIENT_ID` / `VULNWATCH_AZURE_CLIENT_SECRET` | — | Application Entra ID pour Defender et Graph (prioritaires sur la configuration de l'interface) |
 | `VULNWATCH_NVD_API_KEY` | — | Clé API NVD (aussi configurable dans l'interface) |
 | `VULNWATCH_NVD_DELAY` | `6` | Délai (s) entre deux appels NVD |
 | `VULNWATCH_MAX_CVES` | `10` | CVE enrichies par passage NVD |
@@ -84,6 +85,21 @@ Variables d'environnement (fichier `.env` possible, non versionné) :
 
 Les paramètres SMTP, Hexiosec et les délais de notification se règlent dans
 l'interface et sont stockés dans la base SQLite.
+
+### Accès à Microsoft Defender et Graph
+
+Les synchros Defender (vulnérabilités, inventaire logiciel, propriétaires)
+utilisent de préférence une **application Entra ID** (barre latérale >
+« Application Azure », bouton « Tester »), sinon le compte connecté à Azure CLI
+(`az login`). Permissions **Application** à accorder, avec consentement
+administrateur :
+
+| API | Permission | Usage |
+|---|---|---|
+| WindowsDefenderATP | `Vulnerability.Read.All` | Export des vulnérabilités |
+| WindowsDefenderATP | `Software.Read.All` | Export de l'inventaire logiciel |
+| WindowsDefenderATP | `User.Read.All` | Utilisateurs connectés aux machines |
+| Microsoft Graph | `User.Read.All` | Nom et e-mail des propriétaires |
 
 ## Données
 
