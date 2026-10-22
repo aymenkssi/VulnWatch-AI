@@ -120,6 +120,9 @@ def get_job(key):
             status["status"] = "INTERRUPTED"
 
     status["running"] = status.get("status") == "RUNNING"
+    status["stop_requested"] = (
+        status["running"] and _path(key, "stop").exists()
+    )
     status["progress"] = _read_json(_path(key, "progress.json"))
 
     end = status.get("finished_at") if not status["running"] else None
@@ -154,6 +157,7 @@ def start_job(key, script, label, env=None):
     JOBS_DIR.mkdir(parents=True, exist_ok=True)
 
     _path(key, "progress.json").unlink(missing_ok=True)
+    _path(key, "stop").unlink(missing_ok=True)
 
     now = _now().isoformat()
 
@@ -188,6 +192,19 @@ def start_job(key, script, label, env=None):
     )
 
     return True
+
+
+def request_stop(key):
+    """
+    Demande l'arrêt d'une tâche en cours : le lanceur voit cette demande
+    dans la seconde et arrête le script (et ses sous-processus).
+    """
+
+    if is_job_running(key):
+        _path(key, "stop").touch()
+        return True
+
+    return False
 
 
 def read_job_log(key, max_chars=6000):
@@ -257,6 +274,27 @@ def report_progress(current, total=None, message=None, force=False):
 # LANCEUR
 # =========================================================
 
+def _kill_tree(process):
+    """
+    Arrête le script et ses éventuels sous-processus. Sous Windows, le
+    python.exe d'un venv relance le vrai interpréteur dans un processus
+    enfant : on arrête tout l'arbre avec taskkill /T.
+    """
+
+    if os.name == "nt":
+
+        subprocess.run(
+            ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=subprocess.CREATE_NO_WINDOW
+        )
+
+    else:
+
+        process.kill()
+
+
 def _run_job(key, script):
 
     status_path = _path(key, "status.json")
@@ -291,17 +329,40 @@ def _run_job(key, script):
             **kwargs
         )
 
+        stop_path = _path(key, "stop")
+        stopped = False
+        last_heartbeat = time.monotonic()
+
         while True:
 
             try:
-                returncode = process.wait(timeout=HEARTBEAT_SECONDS)
+                # Attente courte : une demande d'arrêt est prise en compte
+                # en moins d'une seconde.
+                returncode = process.wait(timeout=1)
                 break
             except subprocess.TimeoutExpired:
+                pass
+
+            if stop_path.exists() and not stopped:
+
+                stopped = True
+                log.write("\n[ARRÊT] Synchronisation arrêtée à la demande.\n")
+                log.flush()
+                _kill_tree(process)
+
+            if time.monotonic() - last_heartbeat >= HEARTBEAT_SECONDS:
+
+                last_heartbeat = time.monotonic()
                 status["status"] = "RUNNING"
                 status["heartbeat_at"] = _now().isoformat()
                 _write_json(status_path, status)
 
-    status["status"] = "DONE" if returncode == 0 else "ERROR"
+    stop_path.unlink(missing_ok=True)
+
+    if stopped:
+        status["status"] = "STOPPED"
+    else:
+        status["status"] = "DONE" if returncode == 0 else "ERROR"
     status["returncode"] = returncode
     status["finished_at"] = _now().isoformat()
     status["heartbeat_at"] = status["finished_at"]
