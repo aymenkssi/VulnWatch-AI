@@ -74,7 +74,7 @@ def build_exposure():
             v.known_ransomware
         FROM defender_vulnerabilities d
         INNER JOIN vulnerabilities v
-            ON UPPER(d.cve_id) = UPPER(v.cve_id)
+            ON v.cve_id = d.cve_id
         INNER JOIN asset_owners ao
             ON ao.device_id = d.device_id
         WHERE v.source = 'CISA KEV'

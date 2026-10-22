@@ -1248,7 +1248,20 @@ df_nvd = df[df["source"] == "NVD"].copy()
 # NVD, quel que soit son nombre réel de correspondances dans
 # l'inventaire XDR. On recalcule ici la vraie présence NVD <-> XDR
 # (voir get_nvd_defender_exposure() pour la différence de portée).
-_nvd_exposure = get_nvd_defender_exposure()
+@st.cache_data(ttl=60)
+def load_nvd_exposure():
+    return get_nvd_defender_exposure()
+
+
+# Agrège TOUT defender_vulnerabilities (plusieurs millions de lignes) :
+# Streamlit exécute le code de tous les onglets à chaque clic, donc
+# sans cache l'onglet Veille ralentissait toute l'application.
+@st.cache_data(ttl=60)
+def load_recent_defender_detections(limit=200, search=None):
+    return get_recent_defender_detections(limit=limit, search=search)
+
+
+_nvd_exposure = load_nvd_exposure()
 
 df_nvd["affected_devices"] = df_nvd["cve_id"].map(
     lambda cve_id: _nvd_exposure.get(cve_id, {}).get("affected_devices", 0)
@@ -4104,7 +4117,7 @@ with tab_watch:
         placeholder="ex: CVE-2026-109618, Apache, PHP..."
     )
 
-    detections = get_recent_defender_detections(
+    detections = load_recent_defender_detections(
         limit=200,
         search=watch_search.strip() if watch_search else None
     )
