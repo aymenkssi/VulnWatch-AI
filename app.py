@@ -267,6 +267,13 @@ def launch_background_sync(script, min_interval, env=None):
 # Streamlit (seul ce bloc est réexécuté, pas toute la page), puis le
 # résultat une fois le script terminé.
 
+# Durée de vie du cache des requêtes lourdes. Chaque clic relance toute
+# la page : au-delà de ce délai, elle relit la base (plusieurs secondes
+# sur un gros parc). Le cache est vidé dès qu'une synchro lancée depuis
+# l'interface se termine (render_job), donc 10 min suffisent.
+CACHE_TTL_SECONDS = 600
+
+
 JOB_LABELS = {
     "sync.py": "Synchronisation CISA KEV",
     "enrich.py": "Enrichissement NVD",
@@ -279,14 +286,14 @@ JOB_LABELS = {
 
 def launch_job(script, env=None):
 
+    # Pas de st.rerun() ici : le clic vient déjà de relancer la page, et
+    # render_job(), appelé juste sous le bouton, affiche la progression.
     start_job(
         Path(script).stem,
         script,
         JOB_LABELS.get(script, script),
         env=env
     )
-
-    st.rerun()
 
 
 def format_duration(seconds):
@@ -898,7 +905,7 @@ st.markdown("""
 # DATA LOADERS
 # =========================================================
 
-@st.cache_data(ttl=60)
+@st.cache_data(ttl=CACHE_TTL_SECONDS)
 def load_vulnerabilities():
 
     conn = get_connection()
@@ -946,7 +953,7 @@ def load_vulnerabilities():
     return df
 
 
-@st.cache_data(ttl=60)
+@st.cache_data(ttl=CACHE_TTL_SECONDS)
 def load_exposure():
 
     conn = get_connection()
@@ -974,7 +981,7 @@ def load_exposure():
     return df
 
 
-@st.cache_data(ttl=60)
+@st.cache_data(ttl=CACHE_TTL_SECONDS)
 def get_top_vulnerable_devices(limit=15):
 
     conn = get_connection()
@@ -1011,7 +1018,7 @@ def get_top_vulnerable_devices(limit=15):
     return df
 
 
-@st.cache_data(ttl=60)
+@st.cache_data(ttl=CACHE_TTL_SECONDS)
 def get_server_metrics():
 
     conn = get_connection()
@@ -1108,7 +1115,7 @@ def get_server_metrics():
     }
 
 
-@st.cache_data(ttl=60)
+@st.cache_data(ttl=CACHE_TTL_SECONDS)
 def get_server_cves():
 
     conn = get_connection()
@@ -1192,7 +1199,7 @@ def get_server_cves():
     return df
 
 
-@st.cache_data(ttl=60)
+@st.cache_data(ttl=CACHE_TTL_SECONDS)
 def get_server_inventory():
 
     conn = get_connection()
@@ -1274,7 +1281,7 @@ def get_server_inventory():
     return df
 
 
-@st.cache_data(ttl=60)
+@st.cache_data(ttl=CACHE_TTL_SECONDS)
 def get_server_cve_devices(cve_id):
 
     conn = get_connection()
@@ -1327,93 +1334,18 @@ def get_server_cve_devices(cve_id):
 # LOAD DATA
 # =========================================================
 
-df = load_vulnerabilities()
-exposure_df = load_exposure()
-
-if df.empty:
-
-    st.warning(
-        "Aucune vulnérabilité trouvée dans la base de données."
-    )
-
-    st.stop()
-
-
 # =========================================================
 # PREPARATION
 # =========================================================
-
-df["due_date_dt"] = pd.to_datetime(
-    df["due_date"],
-    errors="coerce"
-)
-
-today = pd.Timestamp(date.today())
-
-df["overdue"] = (
-    df["due_date_dt"].notna()
-    &
-    (df["due_date_dt"] < today)
-)
-
-df["ransomware_known"] = (
-    df["known_ransomware"]
-    .fillna("")
-    .str.lower()
-    .eq("known")
-)
+#
+# Toute la préparation (fusion avec l'exposition, colonnes calculées,
+# découpage CISA / NVD) porte sur l'ensemble de la table
+# vulnerabilities (plusieurs centaines de milliers de CVE avec
+# l'historique NVD) : la refaire à chaque clic coûtait plusieurs
+# secondes. Elle est mise en cache avec les requêtes qu'elle utilise.
 
 
-df = df.merge(
-    exposure_df,
-    on="cve_id",
-    how="left",
-    suffixes=("", "_exposure")
-)
-
-df["affected_devices"] = (
-    df["affected_devices"]
-    .fillna(0)
-    .astype(int)
-)
-
-df["affected_products"] = (
-    df["affected_products"]
-    .fillna(0)
-    .astype(int)
-)
-
-
-df["environment_status"] = (
-    df["affected_devices"]
-    .gt(0)
-    .map(
-        {
-            True: "PRESENT",
-            False: "NOT PRESENT"
-        }
-    )
-)
-
-
-# `df` ramène maintenant TOUTES les sources (CISA KEV + NVD, depuis
-# que sync_nvd_feed.py alimente aussi `vulnerabilities`). Le tableau
-# de bord, l'onglet "CISA KEV" et "Investigation CVE" sont, par leur
-# nom même, scopés CISA KEV : ils utilisent `df_cisa`. `df_nvd` sert
-# aux métriques NVD dédiées (voir tableau de bord ci-dessous) — pour
-# le détail et les alertes de correspondance XDR, voir l'onglet
-# "Veille", qui n'est volontairement pas limité à une seule source.
-df_cisa = df[df["source"] == "CISA KEV"].copy()
-df_nvd = df[df["source"] == "NVD"].copy()
-
-# `cisa_defender_exposure` (fusionné dans `df` plus haut) est
-# volontairement limité aux CVE CISA KEV avec un propriétaire résolu
-# -- il ne contient donc JAMAIS de ligne pour une CVE source='NVD',
-# et `affected_devices`/`affected_products` valaient 0 pour TOUTE CVE
-# NVD, quel que soit son nombre réel de correspondances dans
-# l'inventaire XDR. On recalcule ici la vraie présence NVD <-> XDR
-# (voir get_nvd_defender_exposure() pour la différence de portée).
-@st.cache_data(ttl=60)
+@st.cache_data(ttl=CACHE_TTL_SECONDS)
 def load_nvd_exposure():
     return get_nvd_defender_exposure()
 
@@ -1421,20 +1353,120 @@ def load_nvd_exposure():
 # Agrège TOUT defender_vulnerabilities (plusieurs millions de lignes) :
 # Streamlit exécute le code de tous les onglets à chaque clic, donc
 # sans cache l'onglet Veille ralentissait toute l'application.
-@st.cache_data(ttl=60)
+@st.cache_data(ttl=CACHE_TTL_SECONDS)
 def load_recent_defender_detections(limit=200, search=None):
     return get_recent_defender_detections(limit=limit, search=search)
 
 
-_nvd_exposure = load_nvd_exposure()
+@st.cache_data(ttl=CACHE_TTL_SECONDS)
+def prepare_vulnerability_frames():
+    """
+    Retourne (df_cisa, df_nvd), ou (None, None) si la base est vide.
+    """
 
-df_nvd["affected_devices"] = df_nvd["cve_id"].map(
-    lambda cve_id: _nvd_exposure.get(cve_id, {}).get("affected_devices", 0)
-)
+    df = load_vulnerabilities()
+    exposure_df = load_exposure()
 
-df_nvd["affected_products"] = df_nvd["cve_id"].map(
-    lambda cve_id: _nvd_exposure.get(cve_id, {}).get("affected_products", 0)
-)
+    if df.empty:
+        return None, None
+
+    df["due_date_dt"] = pd.to_datetime(
+        df["due_date"],
+        errors="coerce"
+    )
+
+    today = pd.Timestamp(date.today())
+
+    df["overdue"] = (
+        df["due_date_dt"].notna()
+        &
+        (df["due_date_dt"] < today)
+    )
+
+    df["ransomware_known"] = (
+        df["known_ransomware"]
+        .fillna("")
+        .str.lower()
+        .eq("known")
+    )
+
+    df = df.merge(
+        exposure_df,
+        on="cve_id",
+        how="left",
+        suffixes=("", "_exposure")
+    )
+
+    df["affected_devices"] = (
+        df["affected_devices"]
+        .fillna(0)
+        .astype(int)
+    )
+
+    df["affected_products"] = (
+        df["affected_products"]
+        .fillna(0)
+        .astype(int)
+    )
+
+    df["environment_status"] = (
+        df["affected_devices"]
+        .gt(0)
+        .map(
+            {
+                True: "PRESENT",
+                False: "NOT PRESENT"
+            }
+        )
+    )
+
+    # `df` ramène TOUTES les sources (CISA KEV + NVD, depuis que
+    # sync_nvd_feed.py alimente aussi `vulnerabilities`). Le tableau
+    # de bord, l'onglet "CISA KEV" et "Investigation CVE" sont, par
+    # leur nom même, scopés CISA KEV : ils utilisent `df_cisa`.
+    # `df_nvd` sert aux métriques NVD dédiées (voir tableau de bord
+    # ci-dessous) — pour le détail et les alertes de correspondance
+    # XDR, voir l'onglet "Veille", qui n'est volontairement pas limité
+    # à une seule source.
+    df_cisa = df[df["source"] == "CISA KEV"].copy()
+
+    # Seules ces colonnes servent aux métriques NVD : on évite de
+    # garder (et de recopier à chaque lecture du cache) toute la table.
+    df_nvd = df.loc[
+        df["source"] == "NVD",
+        ["cve_id", "priority"]
+    ].copy()
+
+    # `cisa_defender_exposure` (fusionné dans `df` plus haut) est
+    # volontairement limité aux CVE CISA KEV avec un propriétaire
+    # résolu -- il ne contient donc JAMAIS de ligne pour une CVE
+    # source='NVD', et `affected_devices`/`affected_products` valaient
+    # 0 pour TOUTE CVE NVD, quel que soit son nombre réel de
+    # correspondances dans l'inventaire XDR. On recalcule ici la vraie
+    # présence NVD <-> XDR (voir get_nvd_defender_exposure() pour la
+    # différence de portée).
+    nvd_exposure = load_nvd_exposure()
+
+    df_nvd["affected_devices"] = df_nvd["cve_id"].map(
+        lambda cve_id: nvd_exposure.get(cve_id, {}).get("affected_devices", 0)
+    )
+
+    df_nvd["affected_products"] = df_nvd["cve_id"].map(
+        lambda cve_id: nvd_exposure.get(cve_id, {}).get("affected_products", 0)
+    )
+
+    return df_cisa, df_nvd
+
+
+df_cisa, df_nvd = prepare_vulnerability_frames()
+
+if df_cisa is None:
+
+    st.warning(
+        "Aucune vulnérabilité trouvée dans la base de données."
+    )
+
+    st.stop()
 
 
 # =========================================================

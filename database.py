@@ -3,6 +3,7 @@ import os
 import hmac
 import hashlib
 import secrets
+import threading
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 
@@ -2576,8 +2577,164 @@ def get_hexiosec_asset_type_counts():
 # liste de diffusion dédiée (indépendante des propriétaires de
 # serveur) pour alerter par e-mail.
 
+# =========================================================
+# RÉSUMÉ DEFENDER PAR CVE (précalculé)
+# =========================================================
+#
+# defender_vulnerabilities contient une ligne par machine x logiciel x
+# CVE (plusieurs millions de lignes). Agréger tout ça à chaque
+# affichage (exposition NVD, onglet Veille) prenait des dizaines de
+# secondes et figeait la page. Ces données ne changent qu'à l'import
+# Defender : on calcule donc UNE ligne par CVE dans
+# defender_cve_summary, reconstruite par sync_defender.py après chaque
+# import (et une première fois automatiquement sur une base existante).
+
+DEFENDER_SUMMARY_READY_KEY = "defender_cve_summary_ready"
+
+
+def rebuild_defender_cve_summary():
+    """
+    (Re)construit defender_cve_summary. La table est préparée sous un
+    autre nom puis échangée dans une seule transaction : l'interface
+    ne voit jamais une table absente ou à moitié remplie.
+    """
+
+    conn = get_connection()
+
+    conn.execute("DROP TABLE IF EXISTS defender_cve_summary_new")
+
+    conn.execute("""
+        CREATE TABLE defender_cve_summary_new AS
+        SELECT
+            cve_id,
+            MAX(software_vendor) AS software_vendor,
+            MAX(software_name) AS software_name,
+            MAX(defender_severity) AS defender_severity,
+            MAX(cvss_score) AS defender_cvss_score,
+            MAX(exploitability_level) AS exploitability_level,
+            COUNT(DISTINCT device_id) AS affected_devices,
+            COUNT(
+                DISTINCT software_vendor || '|' || software_name
+            ) AS affected_products,
+            SUM(security_update_available) AS devices_with_update_available,
+            MAX(recommended_security_update) AS recommended_security_update,
+            MIN(first_seen_timestamp) AS first_seen,
+            MAX(last_seen_timestamp) AS last_seen
+        FROM defender_vulnerabilities
+        WHERE cve_id IS NOT NULL AND TRIM(cve_id) <> ''
+        GROUP BY cve_id
+    """)
+
+    conn.commit()
+
+    conn.execute("BEGIN")
+    conn.execute("DROP TABLE IF EXISTS defender_cve_summary")
+    conn.execute(
+        "ALTER TABLE defender_cve_summary_new RENAME TO defender_cve_summary"
+    )
+    conn.execute("""
+        CREATE UNIQUE INDEX idx_defender_cve_summary_cve
+        ON defender_cve_summary (cve_id)
+    """)
+    conn.execute("""
+        CREATE INDEX idx_defender_cve_summary_first_seen
+        ON defender_cve_summary (first_seen)
+    """)
+    conn.commit()
+
+    count = conn.execute(
+        "SELECT COUNT(*) FROM defender_cve_summary"
+    ).fetchone()[0]
+
+    conn.close()
+
+    set_app_config(DEFENDER_SUMMARY_READY_KEY, "1")
+
+    return count
+
+
+# Plusieurs sessions Streamlit (onglets) tournent dans le même process :
+# une seule construit le résumé la première fois, les autres attendent.
+_DEFENDER_SUMMARY_LOCK = threading.Lock()
+
+
+def _ensure_defender_cve_summary():
+
+    if get_app_config(DEFENDER_SUMMARY_READY_KEY) == "1":
+        return
+
+    with _DEFENDER_SUMMARY_LOCK:
+
+        if get_app_config(DEFENDER_SUMMARY_READY_KEY) != "1":
+            rebuild_defender_cve_summary()
+
+
 def get_recent_defender_detections(limit=200, search=None):
     """
+    Une ligne par CVE vue par Defender (TOUT le catalogue Defender, pas
+    seulement CISA KEV), triées par date de première détection la plus
+    récente — c'est la vue "qu'est-ce qui vient d'apparaître dans
+    l'environnement", y compris une CVE qui n'est pas encore dans notre
+    table `vulnerabilities`.
+
+    `search` filtre sur le CVE ID, l'éditeur ou le produit (LIKE).
+
+    Enrichit avec les colonnes CISA KEV / NVD / IA quand la CVE s'y
+    trouve aussi (LEFT JOIN, donc jamais bloquant).
+
+    Sans recherche (affichage par défaut, à chaque chargement de la
+    page) : lit le résumé précalculé defender_cve_summary.
+    """
+
+    if search:
+        return _search_defender_detections(limit, search)
+
+    _ensure_defender_cve_summary()
+
+    conn = get_connection()
+
+    rows = conn.execute(
+        """
+        SELECT
+            s.cve_id,
+            s.software_vendor,
+            s.software_name,
+            s.defender_severity,
+            s.defender_cvss_score,
+            s.exploitability_level,
+            s.affected_devices,
+            s.devices_with_update_available,
+            s.recommended_security_update,
+            s.first_seen,
+            s.last_seen,
+            v.source AS cisa_source,
+            v.priority AS cisa_priority,
+            v.vulnerability_name,
+            v.cvss_v3_score AS nvd_cvss_v3_score,
+            v.nvd_published,
+            v.due_date AS cisa_due_date
+        FROM defender_cve_summary s
+        LEFT JOIN vulnerabilities v
+            ON v.cve_id = s.cve_id
+        ORDER BY s.first_seen DESC, s.cve_id DESC
+        LIMIT ?
+        """,
+        (limit,)
+    ).fetchall()
+
+    conn.close()
+
+    return [dict(row) for row in rows]
+
+
+def _search_defender_detections(limit, search):
+    """
+    Recherche de l'onglet Veille : agrège les lignes Defender qui
+    correspondent à la recherche (pas le résumé précalculé), pour que
+    l'éditeur, le produit et le nombre d'équipements affichés soient
+    ceux du produit recherché. Ne tourne que quand une recherche est
+    saisie (résultat mis en cache par l'interface).
+
     Regroupe defender_vulnerabilities par CVE (TOUT le catalogue
     Defender, pas seulement CISA KEV), triées par date de première
     détection la plus récente — c'est la vue "qu'est-ce qui vient
@@ -3263,21 +3420,21 @@ def get_nvd_defender_exposure():
     Retourne {cve_id: {"affected_devices": n, "affected_products": m}}.
     """
 
+    # Lit le résumé précalculé (voir rebuild_defender_cve_summary) au
+    # lieu d'agréger les millions de lignes Defender à chaque affichage.
+    _ensure_defender_cve_summary()
+
     conn = get_connection()
 
     rows = conn.execute("""
         SELECT
-            d.cve_id AS cve_id,
-            COUNT(DISTINCT d.device_id) AS affected_devices,
-            COUNT(
-                DISTINCT d.software_vendor || '|' || d.software_name
-            ) AS affected_products
-        FROM defender_vulnerabilities d
+            s.cve_id,
+            s.affected_devices,
+            s.affected_products
+        FROM defender_cve_summary s
         INNER JOIN vulnerabilities v
-            ON v.cve_id = d.cve_id
+            ON v.cve_id = s.cve_id
         WHERE v.source = 'NVD'
-          AND d.cve_id IS NOT NULL
-        GROUP BY d.cve_id
     """).fetchall()
 
     conn.close()
