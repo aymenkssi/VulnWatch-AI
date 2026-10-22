@@ -8,6 +8,14 @@ import pandas as pd
 import plotly.express as px
 import streamlit as st
 
+from services.jobs import (
+    start_job,
+    get_job,
+    is_job_running,
+    read_job_log,
+    last_log_line
+)
+
 from database import (
     get_connection,
     initialize_database,
@@ -232,17 +240,174 @@ def launch_background_sync(script, min_interval, env=None):
 
             pass
 
+    if is_job_running(Path(script).stem):
+        return
+
     set_app_config(key, now.isoformat())
 
-    subprocess.Popen(
-        [
-            sys.executable,
-            script
-        ],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+    # Même clé que le bouton manuel correspondant : la synchro auto
+    # apparaît avec sa barre de progression, et un clic pendant qu'elle
+    # tourne ne la lance pas une seconde fois.
+    start_job(
+        Path(script).stem,
+        script,
+        JOB_LABELS.get(script, script),
         env=env
     )
+
+
+# =========================================================
+# SYNCHROS EN ARRIÈRE-PLAN : BARRE DE PROGRESSION
+# =========================================================
+#
+# Les boutons "Synchroniser ..." lancent le script via start_job()
+# (services/jobs.py) au lieu d'attendre sa fin : l'application reste
+# utilisable pendant la synchro. render_job() affiche sous le bouton
+# une barre de progression rafraîchie toutes les 2 s par un fragment
+# Streamlit (seul ce bloc est réexécuté, pas toute la page), puis le
+# résultat une fois le script terminé.
+
+JOB_LABELS = {
+    "sync.py": "Synchronisation CISA KEV",
+    "enrich.py": "Enrichissement NVD",
+    "ai_enrich.py": "Analyse IA (Ollama)",
+    "notify.py": "Notifications e-mail",
+    "sync_hexiosec.py": "Synchronisation Hexiosec ASM",
+    "sync_nvd_feed.py": "Synchronisation NVD"
+}
+
+
+def launch_job(script, env=None):
+
+    start_job(
+        Path(script).stem,
+        script,
+        JOB_LABELS.get(script, script),
+        env=env
+    )
+
+    st.rerun()
+
+
+def format_duration(seconds):
+
+    if seconds is None:
+        return ""
+
+    seconds = int(seconds)
+
+    if seconds < 60:
+        return f"{seconds} s"
+
+    return f"{seconds // 60} min {seconds % 60:02d} s"
+
+
+@st.fragment(run_every=2)
+def _job_progress_fragment(key):
+
+    job = get_job(key)
+
+    if not job or not job["running"]:
+        # Terminé : on relance toute la page pour afficher le résultat
+        # et les données à jour.
+        st.rerun()
+
+    progress = job.get("progress") or {}
+    current = progress.get("current")
+    total = progress.get("total")
+    elapsed = format_duration(job.get("elapsed_seconds"))
+
+    if total:
+
+        ratio = min(max(current or 0, 0) / total, 1.0)
+
+        st.progress(
+            ratio,
+            text=(
+                f"⏳ {job['label']} — {current}/{total} "
+                f"({ratio:.0%}) · {elapsed}"
+            )
+        )
+
+    else:
+
+        # Étape sans total connu (téléchargement, écriture en base...) :
+        # barre animée pour montrer que la synchro avance toujours.
+        st.progress(
+            (int(job.get("elapsed_seconds") or 0) % 20) / 20,
+            text=f"⏳ {job['label']} en cours · {elapsed}"
+        )
+
+    detail = progress.get("message") or last_log_line(key)
+
+    if detail:
+        st.caption(detail)
+
+
+def render_job(key, warning_state_key=None):
+    """
+    Sous le bouton d'une synchro : barre de progression tant qu'elle
+    tourne, puis résultat (succès / échec + journal) dans la session
+    qui l'a vue tourner.
+    """
+
+    job = get_job(key)
+
+    if not job:
+        return
+
+    watched_key = f"job_watched_{key}"
+
+    if job["running"]:
+
+        st.session_state[watched_key] = True
+        _job_progress_fragment(key)
+        return
+
+    if not st.session_state.get(watched_key):
+        return
+
+    # Une seule fois par exécution terminée : les tableaux relisent la
+    # base au lieu d'afficher le cache d'avant la synchro.
+    done_key = f"job_done_{key}"
+
+    if st.session_state.get(done_key) != job.get("finished_at"):
+        st.session_state[done_key] = job.get("finished_at")
+        st.cache_data.clear()
+
+    duration = format_duration(job.get("elapsed_seconds"))
+
+    if job["status"] == "DONE":
+
+        state = get_sync_state(warning_state_key) if warning_state_key else None
+
+        if state and state.get("status") == "WARNING":
+            st.warning(
+                f"{job['label']} terminée en {duration}, avec un "
+                f"avertissement :\n\n{state.get('detail')}"
+            )
+        else:
+            st.success(f"{job['label']} terminée en {duration}.")
+
+    elif job["status"] == "INTERRUPTED":
+
+        st.warning(
+            f"{job['label']} interrompue (redémarrage du serveur ?). "
+            "Vous pouvez la relancer."
+        )
+
+    else:
+
+        st.error(
+            f"Échec : {job['label']} (code {job.get('returncode')})."
+        )
+
+    with st.expander("Journal de la synchronisation"):
+        st.code(read_job_log(key) or "(vide)", language="text")
+
+    if st.button("Masquer", key=f"job_hide_{key}"):
+        st.session_state[watched_key] = False
+        st.rerun()
 
 
 def auto_sync_cisa_if_needed():
@@ -1432,54 +1597,13 @@ with st.sidebar:
 
     if st.button(
         "Synchroniser CISA",
-        use_container_width=True
+        use_container_width=True,
+        disabled=is_job_running("sync")
     ):
 
-        with st.spinner(
-            "Synchronisation CISA en cours..."
-        ):
+        launch_job("sync.py")
 
-            result = subprocess.run(
-                [
-                    sys.executable,
-                    "sync.py"
-                ],
-                capture_output=True,
-                text=True
-            )
-
-        if result.returncode == 0:
-
-            refreshed_state = get_sync_state("cisa_kev")
-
-            if refreshed_state and refreshed_state.get("status") == "WARNING":
-
-                st.warning(
-                    "Synchronisation CISA terminée, mais une perte "
-                    "d'enrichissement NVD/IA a été détectée :\n\n"
-                    f"{refreshed_state.get('detail')}"
-                )
-
-            else:
-
-                st.success(
-                    "Synchronisation CISA terminée."
-                )
-
-            st.cache_data.clear()
-
-            st.rerun()
-
-        else:
-
-            st.error(
-                "Échec de la synchronisation CISA."
-            )
-
-            st.code(
-                result.stderr,
-                language="text"
-            )
+    render_job("sync", warning_state_key="cisa_kev")
 
 
     nvd_pending = get_pending_nvd_count()
@@ -1513,7 +1637,8 @@ with st.sidebar:
 
     if st.button(
         "Enrichir NVD maintenant",
-        use_container_width=True
+        use_container_width=True,
+        disabled=is_job_running("enrich")
     ):
 
         env = os.environ.copy()
@@ -1524,46 +1649,9 @@ with st.sidebar:
         if nvd_api_key_for_manual_enrich:
             env["VULNWATCH_NVD_API_KEY"] = nvd_api_key_for_manual_enrich
 
-        with st.spinner(
-            f"Enrichissement NVD en cours ({int(nvd_batch_size)} CVE, "
-            "peut prendre plusieurs minutes)..."
-        ):
+        launch_job("enrich.py", env=env)
 
-            result = subprocess.run(
-                [
-                    sys.executable,
-                    "enrich.py"
-                ],
-                capture_output=True,
-                text=True,
-                env=env
-            )
-
-        if result.returncode == 0:
-
-            st.success(
-                "Enrichissement NVD terminé."
-            )
-
-            st.code(
-                result.stdout,
-                language="text"
-            )
-
-            st.cache_data.clear()
-
-            st.rerun()
-
-        else:
-
-            st.error(
-                "Échec de l'enrichissement NVD."
-            )
-
-            st.code(
-                result.stdout + result.stderr,
-                language="text"
-            )
+    render_job("enrich")
 
 
     st.divider()
@@ -1579,52 +1667,16 @@ with st.sidebar:
 
     if st.button(
         "Analyser avec l'IA locale",
-        use_container_width=True
+        use_container_width=True,
+        disabled=is_job_running("ai_enrich")
     ):
 
-        with st.spinner(
-            "Analyse IA en cours (LLM local via Ollama)..."
-        ):
+        env = os.environ.copy()
+        env["VULNWATCH_AI_MAX_CVES"] = str(int(ai_batch_size))
 
-            env = os.environ.copy()
-            env["VULNWATCH_AI_MAX_CVES"] = str(int(ai_batch_size))
+        launch_job("ai_enrich.py", env=env)
 
-            result = subprocess.run(
-                [
-                    sys.executable,
-                    "ai_enrich.py"
-                ],
-                capture_output=True,
-                text=True,
-                env=env
-            )
-
-        if result.returncode == 0:
-
-            st.success(
-                "Analyse IA terminée."
-            )
-
-            st.code(
-                result.stdout,
-                language="text"
-            )
-
-            st.cache_data.clear()
-
-            st.rerun()
-
-        else:
-
-            st.error(
-                "Échec de l'analyse IA. "
-                "Vérifiez qu'Ollama est démarré en local."
-            )
-
-            st.code(
-                result.stdout + result.stderr,
-                language="text"
-            )
+    render_job("ai_enrich")
 
 
     st.divider()
@@ -3159,7 +3211,8 @@ with tab_notifications:
 
     if st.button(
         "Vérifier et envoyer les notifications maintenant",
-        use_container_width=True
+        use_container_width=True,
+        disabled=is_job_running("notify")
     ):
 
         if not is_smtp_configured():
@@ -3171,32 +3224,10 @@ with tab_notifications:
 
         else:
 
-            with st.spinner(
-                "Envoi des notifications / relances en cours..."
-            ):
+            launch_job("notify.py")
 
-                result = subprocess.run(
-                    [
-                        sys.executable,
-                        "notify.py"
-                    ],
-                    capture_output=True,
-                    text=True
-                )
+    render_job("notify")
 
-            if result.returncode == 0:
-
-                st.success("Vérification des notifications terminée.")
-
-                st.cache_data.clear()
-
-                st.rerun()
-
-            else:
-
-                st.error("Échec du script de notification.")
-
-                st.code(result.stderr, language="text")
 
     st.divider()
 
@@ -3442,7 +3473,8 @@ with tab_attack_surface:
 
     if st.button(
         "Synchroniser les risques Hexiosec",
-        use_container_width=True
+        use_container_width=True,
+        disabled=is_job_running("sync_hexiosec")
     ):
 
         if not is_hexiosec_configured():
@@ -3453,30 +3485,10 @@ with tab_attack_surface:
 
         else:
 
-            with st.spinner("Synchronisation Hexiosec ASM en cours..."):
+            launch_job("sync_hexiosec.py")
 
-                result = subprocess.run(
-                    [
-                        sys.executable,
-                        "sync_hexiosec.py"
-                    ],
-                    capture_output=True,
-                    text=True
-                )
+    render_job("sync_hexiosec")
 
-            if result.returncode == 0:
-
-                st.success("Synchronisation Hexiosec terminée.")
-
-                st.cache_data.clear()
-
-                st.rerun()
-
-            else:
-
-                st.error("Échec de la synchronisation Hexiosec.")
-
-                st.code(result.stdout + "\n" + result.stderr, language="text")
 
     st.divider()
 
@@ -3795,7 +3807,8 @@ with tab_watch:
     if st.button(
         "Synchroniser NVD maintenant",
         use_container_width=True,
-        key="watch_nvd_sync_button"
+        key="watch_nvd_sync_button",
+        disabled=is_job_running("sync_nvd_feed")
     ):
 
         env = os.environ.copy()
@@ -3805,30 +3818,10 @@ with tab_watch:
         if nvd_key_for_run:
             env["VULNWATCH_NVD_API_KEY"] = nvd_key_for_run
 
-        with st.spinner(
-            "Récupération des nouvelles CVE NVD et croisement XDR..."
-        ):
+        launch_job("sync_nvd_feed.py", env=env)
 
-            nvd_sync_result = subprocess.run(
-                [sys.executable, "sync_nvd_feed.py"],
-                capture_output=True,
-                text=True,
-                env=env
-            )
+    render_job("sync_nvd_feed")
 
-        if nvd_sync_result.returncode == 0:
-
-            st.success("Synchronisation NVD terminée.")
-
-            st.cache_data.clear()
-
-            st.rerun()
-
-        else:
-
-            st.error("Échec de la synchronisation NVD.")
-
-            st.code(nvd_sync_result.stderr, language="text")
 
     with st.expander("Clé API NVD (optionnel)"):
 

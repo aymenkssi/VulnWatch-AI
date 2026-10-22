@@ -15,6 +15,7 @@ from database import (
     is_smtp_configured
 )
 from services.mailer import send_email, SmtpNotConfigured
+from services.jobs import report_progress
 from services.ai_engine import generate_notification_email
 
 
@@ -80,9 +81,15 @@ def send_new_notifications():
     sent = 0
     errors = 0
 
-    for candidate in candidates:
+    for index, candidate in enumerate(candidates):
 
         device_name = candidate["device_name"]
+
+        report_progress(
+            index,
+            len(candidates),
+            f"Nouvelle notification : {device_name}"
+        )
         owner_email = candidate["owner_email"]
         cves = candidate["cves"]
 
@@ -159,10 +166,12 @@ def process_due_reminders():
     resolved = 0
     errors = 0
 
-    for notification in due:
+    for index, notification in enumerate(due):
 
         notification_id = notification["id"]
         device_name = notification["device_name"]
+
+        report_progress(index, len(due), f"Relance : {device_name}")
         owner_email = notification["owner_email"]
 
         tracked_cves = get_notification_cves(

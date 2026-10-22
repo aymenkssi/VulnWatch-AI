@@ -16,6 +16,7 @@ from database import (
 from collectors.nvd import fetch_recent_nvd_cves
 from services.mailer import send_email
 from services.ai_engine import generate_watch_alert_email
+from services.jobs import report_progress
 
 
 SYNC_KEY = "nvd_daily_feed"
@@ -141,9 +142,23 @@ def main():
 
     print(f"{len(discoveries)} CVE publiée(s) par NVD sur la fenêtre")
 
+    report_progress(
+        None,
+        None,
+        f"Enregistrement de {len(discoveries)} CVE en base",
+        force=True
+    )
+
     bulk_save_nvd_discoveries(discoveries)
 
     print(f"{len(discoveries)} CVE enregistrée(s) / mise(s) à jour en base")
+
+    report_progress(
+        None,
+        None,
+        "Croisement avec l'inventaire Defender XDR",
+        force=True
+    )
 
     # =====================================================
     # CROISEMENT AVEC L'INVENTAIRE XDR
@@ -183,7 +198,14 @@ def main():
 
             else:
 
-                for cve_id in matches:
+                for index, cve_id in enumerate(matches):
+
+                    report_progress(
+                        index,
+                        len(matches),
+                        f"Alerte {cve_id} (rédaction IA + envoi)",
+                        force=True
+                    )
 
                     ok, errors = _send_match_alert(cve_id, recipient_emails)
 

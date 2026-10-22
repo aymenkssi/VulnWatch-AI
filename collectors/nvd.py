@@ -7,6 +7,8 @@ import requests
 import time
 from datetime import datetime, timezone
 
+from services.jobs import report_progress
+
 
 NVD_API_URL = (
     "https://services.nvd.nist.gov/rest/json/cves/2.0"
@@ -409,6 +411,12 @@ def fetch_recent_nvd_cves(start_dt, end_dt):
         data = _get_cve_page(params, headers)
 
         total_results = data.get("totalResults", 0)
+
+        report_progress(
+            min(start_index + RESULTS_PER_PAGE, total_results),
+            total_results,
+            "Téléchargement des CVE NVD"
+        )
 
         for item in data.get("vulnerabilities", []):
 

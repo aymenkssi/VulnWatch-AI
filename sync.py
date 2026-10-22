@@ -9,6 +9,7 @@ from database import (
 )
 from collectors.cisa import fetch_cisa_kev
 from services.risk_engine import calculate_risk
+from services.jobs import report_progress
 
 
 SYNC_KEY = "cisa_kev"
@@ -66,7 +67,13 @@ def main():
     # à chaque resynchro périodique (voir get_cvss_lookup()).
     cvss_lookup = get_cvss_lookup()
 
-    for vulnerability in vulnerabilities:
+    for index, vulnerability in enumerate(vulnerabilities):
+
+        report_progress(
+            index,
+            len(vulnerabilities),
+            f"Enregistrement de {vulnerability.get('cveID')}"
+        )
 
         enrichment = cvss_lookup.get(vulnerability.get("cveID"))
 
