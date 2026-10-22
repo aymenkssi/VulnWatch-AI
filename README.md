@@ -38,7 +38,10 @@ app.py               Interface Streamlit (tableau de bord, serveurs, KEV,
 | `notify.py` | Notifications et relances e-mail aux propriétaires |
 
 L'application Streamlit lance automatiquement la plupart de ces scripts en
-arrière-plan lorsque les données sont périmées.
+arrière-plan lorsque les données sont périmées. Les boutons « Synchroniser … »
+les lancent aussi en arrière-plan (`services/jobs.py`) : l'interface reste
+utilisable et affiche une barre de progression. L'état et le journal de chaque
+synchro sont écrits dans `data/jobs/`.
 
 ## Installation
 

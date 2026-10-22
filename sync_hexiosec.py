@@ -17,6 +17,8 @@ from collectors.hexiosec import (
 )
 
 
+from services.jobs import report_progress
+
 SYNC_KEY = "hexiosec"
 
 
@@ -46,6 +48,10 @@ def main():
         sys.exit(1)
 
     config = get_hexiosec_config()
+
+    total_steps = 1 + len(ASSET_ENDPOINTS)
+
+    report_progress(0, total_steps, "Récupération des risques", force=True)
 
     try:
 
@@ -94,7 +100,14 @@ def main():
     asset_totals = {}
     asset_errors = []
 
-    for asset_type in ASSET_ENDPOINTS:
+    for step, asset_type in enumerate(ASSET_ENDPOINTS, start=1):
+
+        report_progress(
+            step,
+            total_steps,
+            f"Récupération des actifs : {asset_type}",
+            force=True
+        )
 
         try:
 

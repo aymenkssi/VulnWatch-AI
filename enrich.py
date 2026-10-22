@@ -1,5 +1,6 @@
 ﻿import os
 import time
+from services.jobs import report_progress
 
 from database import (
     get_connection,
@@ -251,6 +252,8 @@ def main():
     ):
 
         cve_id = row["cve_id"]
+
+        report_progress(index - 1, len(rows), f"Analyse de {cve_id}")
 
         print(
             f"[{index}/{len(rows)}] "
