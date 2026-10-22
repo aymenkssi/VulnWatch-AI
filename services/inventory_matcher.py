@@ -155,7 +155,11 @@ def normalize_inventory_record(record, imported_at):
         cpe_vendor,
         cpe_product,
         record.get("EndOfSupportStatus") or None,
-        record.get("EndOfSupportDate") or None,
+        # Defender exporte "Invalid date" quand il n'a pas de date.
+        (
+            None if record.get("EndOfSupportDate") in (None, "", "Invalid date")
+            else record.get("EndOfSupportDate")
+        ),
         imported_at
     )
 
