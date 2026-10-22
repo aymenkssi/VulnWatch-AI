@@ -1,4 +1,5 @@
 import sqlite3
+import json
 import os
 import hmac
 import hashlib
@@ -523,6 +524,13 @@ def initialize_database():
     conn.execute("""
         CREATE INDEX IF NOT EXISTS idx_vulnerabilities_source
         ON vulnerabilities (source)
+    """)
+
+    # Comptage par jour de publication (état de la base NVD, voir
+    # count_cves_by_published_day / nvd_audit.py).
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_vulnerabilities_nvd_published
+        ON vulnerabilities (nvd_published)
     """)
 
 
@@ -3274,6 +3282,105 @@ def reset_nvd_backfill():
     )
     conn.commit()
     conn.close()
+
+
+# =========================================================
+# SYNCHRO NVD : CURSEUR ET ÉTAT DE LA BASE
+# =========================================================
+#
+# La synchro quotidienne repartait de sync_state.last_run_at, qui avance
+# aussi quand la synchro ÉCHOUE : les CVE publiées pendant une fenêtre
+# ratée n'étaient jamais récupérées. Le curseur ci-dessous n'avance
+# qu'après une fenêtre téléchargée et enregistrée avec succès.
+
+NVD_FEED_CURSOR_KEY = "nvd_feed_covered_until"
+NVD_AUDIT_REPORT_KEY = "nvd_audit_report"
+
+
+def get_nvd_feed_cursor():
+
+    return get_app_config(NVD_FEED_CURSOR_KEY)
+
+
+def set_nvd_feed_cursor(covered_until_iso):
+
+    set_app_config(NVD_FEED_CURSOR_KEY, covered_until_iso)
+
+
+def get_known_cve_ids(cve_ids):
+    """Sous-ensemble de cve_ids déjà présent dans `vulnerabilities`."""
+
+    cve_ids = list(cve_ids)
+    known = set()
+
+    if not cve_ids:
+        return known
+
+    conn = get_connection()
+
+    for i in range(0, len(cve_ids), 900):
+
+        chunk = cve_ids[i:i + 900]
+        placeholders = ", ".join("?" for _ in chunk)
+
+        known.update(
+            row[0]
+            for row in conn.execute(
+                f"SELECT cve_id FROM vulnerabilities "
+                f"WHERE cve_id IN ({placeholders})",
+                chunk
+            )
+        )
+
+    conn.close()
+
+    return known
+
+
+def count_cves_by_published_day(start_day, end_day):
+    """
+    {"AAAA-MM-JJ": n} : CVE de la base dont la date de publication NVD
+    (UTC, format NVD "AAAA-MM-JJTHH:MM:SS.mmm") tombe entre start_day et
+    end_day inclus (objets date). Toutes sources confondues : une CVE
+    CISA KEV enrichie par NVD compte aussi.
+    """
+
+    conn = get_connection()
+
+    rows = conn.execute(
+        """
+        SELECT substr(nvd_published, 1, 10) AS day, COUNT(*) AS n
+        FROM vulnerabilities
+        WHERE nvd_published >= ? AND nvd_published < ?
+        GROUP BY day
+        """,
+        (
+            start_day.isoformat(),
+            (end_day + timedelta(days=1)).isoformat()
+        )
+    ).fetchall()
+
+    conn.close()
+
+    return {row["day"]: row["n"] for row in rows}
+
+
+def get_nvd_audit_report():
+
+    raw = get_app_config(NVD_AUDIT_REPORT_KEY)
+
+    if not raw:
+        return None
+
+    try:
+        return json.loads(raw)
+    except ValueError:
+        return None
+
+
+def set_nvd_audit_report(report):
+
+    set_app_config(NVD_AUDIT_REPORT_KEY, json.dumps(report))
 
 
 def get_nvd_total_count():

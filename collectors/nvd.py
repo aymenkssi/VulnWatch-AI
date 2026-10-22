@@ -352,7 +352,13 @@ def _get_cve_page(params, headers):
 
         except (
             requests.exceptions.Timeout,
-            requests.exceptions.ConnectionError
+            requests.exceptions.ConnectionError,
+            # "Response ended prematurely" : la connexion est coupée en
+            # plein transfert d'une grosse page (2000 CVE). Sans ce
+            # retry, toute la synchro échouait sur une seule coupure.
+            requests.exceptions.ChunkedEncodingError,
+            # Réponse tronquée : JSON invalide.
+            ValueError
         ):
 
             if attempt < MAX_RETRIES:
@@ -370,7 +376,42 @@ def _get_cve_page(params, headers):
     raise RuntimeError("Échec de la requête NVD après plusieurs tentatives.")
 
 
-def fetch_recent_nvd_cves(start_dt, end_dt):
+# Champs de date acceptés par l'API NVD 2.0 pour filtrer une fenêtre.
+NVD_DATE_FIELDS = {
+    "published": ("pubStartDate", "pubEndDate"),
+    "modified": ("lastModStartDate", "lastModEndDate")
+}
+
+
+def _window_params(start_dt, end_dt, date_field):
+
+    start_key, end_key = NVD_DATE_FIELDS[date_field]
+
+    return {
+        start_key: _format_nvd_datetime(start_dt),
+        end_key: _format_nvd_datetime(end_dt)
+    }
+
+
+def count_nvd_cves(start_dt, end_dt, date_field="published"):
+    """
+    Nombre de CVE que NVD connaît sur la fenêtre, sans les télécharger
+    (resultsPerPage=1, on ne lit que totalResults). Sert à comparer la
+    base locale avec NVD jour par jour (voir nvd_audit.py).
+    """
+
+    params = dict(
+        _window_params(start_dt, end_dt, date_field),
+        resultsPerPage=1,
+        startIndex=0
+    )
+
+    data = _get_cve_page(params, _headers())
+
+    return data.get("totalResults", 0)
+
+
+def fetch_recent_nvd_cves(start_dt, end_dt, date_field="published"):
     """
     Récupère TOUTES les CVE publiées par NVD entre start_dt et end_dt
     (datetimes timezone-aware, bornes incluses), toutes plateformes/
@@ -381,6 +422,10 @@ def fetch_recent_nvd_cves(start_dt, end_dt):
     Paginé (resultsPerPage/startIndex), avec une pause entre pages
     pour respecter la limite de débit NVD (5 requêtes/30s sans clé
     API, 50/30s avec — voir NVD_API_KEY).
+
+    date_field="modified" : CVE dont la fiche NVD a été MODIFIÉE sur la
+    fenêtre (score CVSS ajouté après coup, analyse terminée, ...), ce
+    qui inclut aussi les nouvelles publications.
 
     Retourne une liste de tuples (cve_id, enrichment_dict), où
     enrichment_dict a le même format que parse_nvd_cve() — prêt pour
@@ -393,11 +438,10 @@ def fetch_recent_nvd_cves(start_dt, end_dt):
     start_index = 0
     total_results = None
 
-    params_base = {
-        "pubStartDate": _format_nvd_datetime(start_dt),
-        "pubEndDate": _format_nvd_datetime(end_dt),
-        "resultsPerPage": RESULTS_PER_PAGE
-    }
+    params_base = dict(
+        _window_params(start_dt, end_dt, date_field),
+        resultsPerPage=RESULTS_PER_PAGE
+    )
 
     while total_results is None or start_index < total_results:
 
