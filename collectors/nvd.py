@@ -482,6 +482,139 @@ def fetch_recent_nvd_cves(start_dt, end_dt, date_field="published"):
     return results
 
 
+def fetch_nvd_cve_record(cve_id):
+    """
+    Fiche NVD COMPLÈTE d'une CVE (brute, telle que renvoyée par l'API) :
+    références, produits concernés (configurations CPE), toutes les
+    métriques CVSS, statut d'analyse... Utilisée par l'onglet "CVE NVD"
+    pour afficher le détail à la demande.
+
+    Appel interactif : pas de longues pauses de retry comme pour les
+    synchros (l'utilisateur attend), une seule nouvelle tentative.
+    Retourne None si NVD ne connaît pas la CVE.
+    """
+
+    last_error = None
+
+    for attempt in range(2):
+
+        try:
+
+            response = requests.get(
+                NVD_API_URL,
+                params={"cveId": cve_id},
+                headers=_headers(),
+                timeout=(10, 30)
+            )
+
+            if response.status_code == 404:
+                return None
+
+            response.raise_for_status()
+
+            vulnerabilities = response.json().get("vulnerabilities", [])
+
+            return vulnerabilities[0]["cve"] if vulnerabilities else None
+
+        except (
+            requests.exceptions.RequestException,
+            ValueError
+        ) as error:
+
+            last_error = error
+            time.sleep(2)
+
+    raise RuntimeError(f"NVD injoignable : {last_error}")
+
+
+def describe_nvd_record(cve):
+    """
+    Extrait d'une fiche NVD brute ce que l'interface affiche :
+    statut, CWE, références, produits concernés et métriques CVSS.
+    """
+
+    weaknesses = sorted({
+        description.get("value")
+        for weakness in cve.get("weaknesses", [])
+        for description in weakness.get("description", [])
+        if description.get("value")
+    })
+
+    references = [
+        {
+            "url": reference.get("url"),
+            "source": reference.get("source"),
+            "tags": ", ".join(reference.get("tags", []))
+        }
+        for reference in cve.get("references", [])
+    ]
+
+    part_labels = {"a": "Application", "o": "Système", "h": "Matériel"}
+
+    products = []
+
+    for configuration in cve.get("configurations", []):
+        for node in configuration.get("nodes", []):
+            for match in node.get("cpeMatch", []):
+
+                # cpe:2.3:<part>:<vendor>:<product>:<version>:...
+                parts = (match.get("criteria") or "").split(":")
+
+                if len(parts) < 6:
+                    continue
+
+                bounds = []
+
+                if match.get("versionStartIncluding"):
+                    bounds.append(f">= {match['versionStartIncluding']}")
+                if match.get("versionStartExcluding"):
+                    bounds.append(f"> {match['versionStartExcluding']}")
+                if match.get("versionEndIncluding"):
+                    bounds.append(f"<= {match['versionEndIncluding']}")
+                if match.get("versionEndExcluding"):
+                    bounds.append(f"< {match['versionEndExcluding']}")
+
+                version = parts[5] if parts[5] not in ("*", "-") else ""
+
+                products.append({
+                    "type": part_labels.get(parts[2], parts[2]),
+                    "vendor": parts[3].replace("_", " "),
+                    "product": parts[4].replace("_", " "),
+                    "version": version or " ".join(bounds) or "toutes",
+                    "vulnerable": "Oui" if match.get("vulnerable") else "Non"
+                })
+
+    metrics = []
+
+    for key, label in (
+        ("cvssMetricV40", "CVSS 4.0"),
+        ("cvssMetricV31", "CVSS 3.1"),
+        ("cvssMetricV30", "CVSS 3.0"),
+        ("cvssMetricV2", "CVSS 2.0")
+    ):
+        for metric in cve.get("metrics", {}).get(key, []):
+
+            data = metric.get("cvssData", {})
+
+            metrics.append({
+                "version": label,
+                "source": metric.get("source"),
+                "type": metric.get("type"),
+                "score": data.get("baseScore"),
+                "severity": data.get("baseSeverity") or metric.get("baseSeverity"),
+                "vector": data.get("vectorString")
+            })
+
+    return {
+        "status": cve.get("vulnStatus"),
+        "source_identifier": cve.get("sourceIdentifier"),
+        "weaknesses": weaknesses,
+        "references": references,
+        "products": products,
+        "metrics": metrics
+    }
+
+
 def parse_nvd_feed_bytes(raw_bytes, filename=""):
     """
     Parse un fichier NVD téléchargé MANUELLEMENT (hors appli, par

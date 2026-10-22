@@ -18,7 +18,7 @@ services/
   ai_engine.py       Enrichissement et rédaction d'e-mails via Ollama (qwen2.5:7b par défaut)
   mailer.py          Envoi SMTP
 database.py          Schéma SQLite (data/vulnwatch.db) et accès aux données
-app.py               Interface Streamlit (tableau de bord, serveurs, KEV,
+app.py               Interface Streamlit (tableau de bord, serveurs, KEV, CVE NVD,
                      investigation, notifications, surface d'attaque, veille)
 ```
 
