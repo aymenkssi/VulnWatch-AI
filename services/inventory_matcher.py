@@ -105,6 +105,92 @@ def match_rule(cpe_row, installed_version):
 # INVENTAIRE
 # =========================================================
 
+# =========================================================
+# PAQUETS DE DISTRIBUTIONS LINUX
+# =========================================================
+#
+# Defender nomme les paquets Linux d'après la distribution (ex.
+# "debian : php8.4-common_for_linux"), alors que NVD décrit le produit
+# amont ("php : php"). Ces règles relient les paquets courants à leur
+# produit NVD, et la version comparée est la version amont (sans époque
+# "1:" ni révision "-25+0~..." de la distribution).
+#
+# Limite : une distribution corrige souvent une faille en gardant le
+# numéro de version amont (correctif rétroporté). Ces correspondances
+# sont donc marquées "paquet Linux, à vérifier" (distro_package = 1).
+
+DISTRO_VENDORS = {
+    "debian", "ubuntu", "canonical", "redhat", "red_hat", "centos",
+    "rocky", "rockylinux", "almalinux", "suse", "opensuse", "oracle",
+    "fedora", "amazon", "alpine"
+}
+
+DISTRO_PACKAGE_RULES = [
+    # PHP : paquets du moteur seulement (pas les extensions php8.x-zip,
+    # ni le méta-paquet php-common dont la version n'est pas celle de PHP).
+    (r"php\d+(\.\d+)?(-(common|cli|fpm|cgi))?", "php", "php"),
+    (r"openssl|libssl\d+(\.\d+)?[a-z]?(t64)?", "openssl", "openssl"),
+    (r"openssh-(server|client|sftp-server)", "openbsd", "openssh"),
+    (r"apache2(-bin)?|httpd", "apache", "http_server"),
+    (r"nginx(-core|-full|-light)?", "f5", "nginx"),
+    (r"curl|libcurl\d+(t64)?(-gnutls|-openssl)?", "haxx", "curl"),
+    (r"sudo", "sudo_project", "sudo"),
+    (r"bash", "gnu", "bash"),
+    (r"libc6|glibc", "gnu", "glibc"),
+    (r"python3\.\d+(-minimal)?", "python", "python"),
+    (r"mariadb-server(-core)?(-\d+(\.\d+)?)?", "mariadb", "mariadb"),
+    (r"postgresql-\d+", "postgresql", "postgresql"),
+    (r"git", "git-scm", "git"),
+    (r"vim(-common|-runtime|-tiny)?", "vim", "vim"),
+    (r"samba", "samba", "samba"),
+    (r"bind9", "isc", "bind"),
+    (r"xz-utils|liblzma\d+", "tukaani", "xz"),
+    (r"libxml2", "xmlsoft", "libxml2"),
+    (r"zlib1g", "zlib", "zlib"),
+    (r"systemd", "systemd_project", "systemd"),
+    (r"openjdk-\d+-jre(-headless)?", "oracle", "openjdk")
+]
+
+_DISTRO_RULES = [
+    (re.compile(f"^(?:{pattern})$"), vendor, product)
+    for pattern, vendor, product in DISTRO_PACKAGE_RULES
+]
+
+
+def upstream_version(version):
+    """
+    Version amont d'un paquet de distribution :
+    "1:8.0.30-25+0~20261021.88+debian12~1.gbp" -> "8.0.30",
+    "3.0.2-0ubuntu1.10" -> "3.0.2", "2.4.57-2.el9" -> "2.4.57".
+    """
+
+    version = str(version or "").strip()
+    version = re.sub(r"^\d+:", "", version)       # époque Debian/RPM
+
+    if "-" in version:
+        version = version.rsplit("-", 1)[0]       # révision du paquet
+
+    return re.split(r"[+~]", version)[0]
+
+
+def map_distro_package(cpe_vendor, cpe_product):
+    """
+    (éditeur, produit) NVD pour un paquet de distribution reconnu, sinon
+    None.
+    """
+
+    if cpe_vendor not in DISTRO_VENDORS:
+        return None
+
+    name = re.sub(r"_for_linux$", "", cpe_product)
+
+    for pattern, vendor, product in _DISTRO_RULES:
+        if pattern.match(name):
+            return vendor, product
+
+    return None
+
+
 def _cpe_name(value):
 
     return re.sub(r"\s+", "_", str(value or "").strip().lower())
@@ -139,6 +225,15 @@ def normalize_inventory_record(record, imported_at):
     if not cpe_vendor or not cpe_product or not version:
         return None
 
+    distro_package = 0
+    match_version = None
+    mapped = map_distro_package(cpe_vendor, cpe_product)
+
+    if mapped:
+        cpe_vendor, cpe_product = mapped
+        distro_package = 1
+        match_version = upstream_version(version)
+
     device_name = _CONTROL_CHARS.sub(
         "", str(record.get("DeviceName") or "")
     ).strip()
@@ -160,7 +255,9 @@ def normalize_inventory_record(record, imported_at):
             None if record.get("EndOfSupportDate") in (None, "", "Invalid date")
             else record.get("EndOfSupportDate")
         ),
-        imported_at
+        imported_at,
+        distro_package,
+        match_version
     )
 
 
@@ -184,7 +281,7 @@ def replace_software_inventory(records, progress=None):
 
     insert_sql = (
         "INSERT INTO software_inventory_stage VALUES "
-        "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     )
 
     batch = []
@@ -296,6 +393,48 @@ def _refresh_summary(conn, cve_ids=None):
     )
 
 
+def apply_distro_mapping(conn):
+    """
+    Applique les règles de paquets Linux à l'inventaire déjà importé
+    (importé avant ces règles, ou règles complétées depuis). Retourne le
+    nombre de lignes converties.
+    """
+
+    placeholders = ", ".join("?" for _ in DISTRO_VENDORS)
+    updates = []
+
+    for row in conn.execute(
+        f"""
+        SELECT rowid, cpe_vendor, cpe_product, software_version
+        FROM software_inventory
+        WHERE distro_package = 0 AND cpe_vendor IN ({placeholders})
+        """,
+        sorted(DISTRO_VENDORS)
+    ):
+        mapped = map_distro_package(row["cpe_vendor"], row["cpe_product"])
+
+        if mapped:
+            updates.append((
+                mapped[0], mapped[1],
+                upstream_version(row["software_version"]),
+                row["rowid"]
+            ))
+
+    if updates:
+        conn.executemany(
+            """
+            UPDATE software_inventory
+            SET cpe_vendor = ?, cpe_product = ?, distro_package = 1,
+                match_version = ?
+            WHERE rowid = ?
+            """,
+            updates
+        )
+        conn.commit()
+
+    return len(updates)
+
+
 def rebuild_all_matches(progress=None):
     """
     Recalcule toutes les correspondances inventaire x NVD (après un
@@ -305,13 +444,18 @@ def rebuild_all_matches(progress=None):
 
     conn = get_connection()
 
+    apply_distro_mapping(conn)
+
+    # (version installée, version comparée) : pour un paquet Linux, la
+    # version comparée est la version amont.
     installed = defaultdict(set)
 
     for row in conn.execute(
-        "SELECT DISTINCT cpe_vendor, cpe_product, software_version "
+        "SELECT DISTINCT cpe_vendor, cpe_product, software_version, "
+        "COALESCE(match_version, software_version) "
         "FROM software_inventory"
     ):
-        installed[(row[0], row[1])].add(row[2])
+        installed[(row[0], row[1])].add((row[2], row[3]))
 
     matches = []
     products = list(installed.items())
@@ -325,9 +469,9 @@ def rebuild_all_matches(progress=None):
             "SELECT * FROM nvd_cpe_matches WHERE vendor = ? AND product = ?",
             (vendor, product)
         ):
-            for version in versions:
+            for version, compared in versions:
 
-                rule = match_rule(cpe_row, version)
+                rule = match_rule(cpe_row, compared)
 
                 if rule:
                     matches.append(
@@ -395,16 +539,18 @@ def refresh_matches_for_cves(cve_ids):
 
             if key not in versions_cache:
                 versions_cache[key] = [
-                    row[0] for row in conn.execute(
-                        "SELECT DISTINCT software_version FROM software_inventory "
+                    (row[0], row[1]) for row in conn.execute(
+                        "SELECT DISTINCT software_version, "
+                        "COALESCE(match_version, software_version) "
+                        "FROM software_inventory "
                         "WHERE cpe_vendor = ? AND cpe_product = ?",
                         key
                     )
                 ]
 
-            for version in versions_cache[key]:
+            for version, compared in versions_cache[key]:
 
-                rule = match_rule(cpe_row, version)
+                rule = match_rule(cpe_row, compared)
 
                 if rule:
                     matches.append(

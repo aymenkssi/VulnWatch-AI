@@ -159,7 +159,11 @@ def main():
 
     if FIX:
 
-        for row in rows:
+        # Du jour le plus récent au plus ancien : les CVE récentes sont
+        # les plus souvent modifiées par NVD (produits déclarés après la
+        # publication) et les plus utiles pour la veille. Si le
+        # rattrapage est arrêté en cours, elles sont déjà à jour.
+        for row in reversed(rows):
 
             day = datetime.fromisoformat(row["day"]).date()
             start, end = _day_bounds(day)

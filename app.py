@@ -3333,7 +3333,8 @@ INVENTORY_DEVICE_COLUMNS = {
     "software_name": "Logiciel",
     "software_version": "Version installée",
     "rule": "Versions vulnérables (NVD)",
-    "end_of_support_status": "Fin de support"
+    "end_of_support_status": "Fin de support",
+    "distro_note": "À vérifier"
 }
 
 
@@ -3517,7 +3518,8 @@ def render_nvd_cve_details(cve_id):
     # produits concernés, toutes les métriques (non conservés en base).
     if st.toggle(
         "Afficher le détail complet depuis NVD (références, produits "
-        "concernés, toutes les métriques)",
+        "concernés, toutes les métriques) et mettre à jour cette CVE "
+        "dans VulnWatch",
         key=f"nvd_full_{cve_id}"
     ):
 
@@ -3836,6 +3838,7 @@ def nvd_cves_frame(rows):
         "software_version": "Version installée",
         "versions": "Versions installées touchées",
         "rule": "Versions vulnérables (NVD)",
+        "distro_note": "À vérifier",
         "description": "Description"
     })
 
@@ -3900,8 +3903,8 @@ def render_machine_details(machine):
             st.dataframe(
                 nvd_cves_frame(nvd_cves)[[
                     "CVE", "Sévérité", "CVSS", "Logiciel", "Version installée",
-                    "Versions vulnérables (NVD)", "Publiée", "CISA KEV",
-                    "Description"
+                    "Versions vulnérables (NVD)", "À vérifier", "Publiée",
+                    "CISA KEV", "Description"
                 ]],
                 column_config=CVSS_COLUMN,
                 use_container_width=True,
@@ -3992,7 +3995,9 @@ def render_product_details(product):
                 "os_platform": "Système",
                 "os_version": "Version OS",
                 "software_version": "Version installée",
-                "end_of_support_status": "Fin de support"
+                "end_of_support_status": "Fin de support",
+                "software_name": "Paquet / logiciel",
+                "distro_note": "À vérifier"
             }),
             use_container_width=True,
             hide_index=True
