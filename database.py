@@ -506,6 +506,71 @@ def initialize_database():
 
 
     # =====================================================
+    # INVENTAIRE LOGICIEL x NVD (équipements touchés selon NVD)
+    # =====================================================
+    #
+    # nvd_cpe_matches     : produits/versions vulnérables déclarés par
+    #                       NVD pour chaque CVE (configurations CPE) ;
+    # software_inventory  : logiciels installés sur chaque machine
+    #                       (export Defender SoftwareInventoryExport
+    #                       ou fichier CSV) ;
+    # inventory_cve_matches : (produit, version installée) -> CVE, calculé
+    #                       par services/inventory_matcher.py ;
+    # inventory_cve_summary : nombre de machines touchées par CVE.
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS nvd_cpe_matches (
+            cve_id TEXT NOT NULL,
+            part TEXT,
+            vendor TEXT NOT NULL,
+            product TEXT NOT NULL,
+            version TEXT,
+            version_start_including TEXT,
+            version_start_excluding TEXT,
+            version_end_including TEXT,
+            version_end_excluding TEXT
+        )
+    """)
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS software_inventory (
+            device_id TEXT NOT NULL,
+            device_name TEXT,
+            os_platform TEXT,
+            os_version TEXT,
+            os_architecture TEXT,
+            software_vendor TEXT,
+            software_name TEXT,
+            software_version TEXT,
+            cpe_vendor TEXT,
+            cpe_product TEXT,
+            end_of_support_status TEXT,
+            end_of_support_date TEXT,
+            imported_at TEXT
+        )
+    """)
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS inventory_cve_matches (
+            cve_id TEXT NOT NULL,
+            cpe_vendor TEXT NOT NULL,
+            cpe_product TEXT NOT NULL,
+            software_version TEXT NOT NULL,
+            rule TEXT,
+            PRIMARY KEY (cve_id, cpe_vendor, cpe_product, software_version)
+        )
+    """)
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS inventory_cve_summary (
+            cve_id TEXT PRIMARY KEY,
+            affected_devices INTEGER,
+            affected_products INTEGER
+        )
+    """)
+
+
+    # =====================================================
     # AUTH SESSIONS (connexion conservée après rafraîchissement)
     # =====================================================
 
@@ -540,6 +605,20 @@ def initialize_database():
         CREATE INDEX IF NOT EXISTS idx_vulnerabilities_source
         ON vulnerabilities (source)
     """)
+
+    for index_sql in (
+        "CREATE INDEX IF NOT EXISTS idx_nvd_cpe_matches_cve "
+        "ON nvd_cpe_matches (cve_id)",
+        "CREATE INDEX IF NOT EXISTS idx_nvd_cpe_matches_product "
+        "ON nvd_cpe_matches (vendor, product)",
+        "CREATE INDEX IF NOT EXISTS idx_software_inventory_product "
+        "ON software_inventory (cpe_vendor, cpe_product, software_version)",
+        "CREATE INDEX IF NOT EXISTS idx_software_inventory_device "
+        "ON software_inventory (device_id)",
+        "CREATE INDEX IF NOT EXISTS idx_inventory_cve_matches_product "
+        "ON inventory_cve_matches (cpe_vendor, cpe_product, software_version)"
+    ):
+        conn.execute(index_sql)
 
     # Comptage par jour de publication (état de la base NVD, voir
     # count_cves_by_published_day / nvd_audit.py).
@@ -3697,6 +3776,166 @@ def get_cve_details(cve_id):
     return dict(row) if row else None
 
 
+# =========================================================
+# INVENTAIRE LOGICIEL x NVD : LECTURE POUR L'INTERFACE
+# =========================================================
+
+def get_inventory_status():
+    """Chiffres de l'inventaire et de la couverture produits NVD."""
+
+    conn = get_connection()
+
+    inventory = conn.execute(
+        """
+        SELECT
+            COUNT(*) AS rows_count,
+            COUNT(DISTINCT device_id) AS devices,
+            COUNT(DISTINCT cpe_vendor || ':' || cpe_product) AS products,
+            MAX(imported_at) AS imported_at
+        FROM software_inventory
+        """
+    ).fetchone()
+
+    cves_with_cpe = conn.execute(
+        "SELECT COUNT(DISTINCT cve_id) FROM nvd_cpe_matches"
+    ).fetchone()[0]
+
+    total_cves = conn.execute(
+        "SELECT COUNT(*) FROM vulnerabilities"
+    ).fetchone()[0]
+
+    matched = conn.execute(
+        "SELECT COUNT(*) FROM inventory_cve_summary"
+    ).fetchone()[0]
+
+    affected_devices = conn.execute(
+        """
+        SELECT COUNT(DISTINCT i.device_id)
+        FROM inventory_cve_matches m
+        JOIN software_inventory i
+            ON i.cpe_vendor = m.cpe_vendor
+            AND i.cpe_product = m.cpe_product
+            AND i.software_version = m.software_version
+        """
+    ).fetchone()[0]
+
+    conn.close()
+
+    return {
+        "inventory_rows": inventory["rows_count"],
+        "inventory_devices": inventory["devices"],
+        "inventory_products": inventory["products"],
+        "inventory_imported_at": inventory["imported_at"],
+        "cves_with_cpe": cves_with_cpe,
+        "total_cves": total_cves,
+        "matched_cves": matched,
+        "affected_devices": affected_devices
+    }
+
+
+def get_inventory_matched_cves(search=None, limit=200):
+    """
+    CVE touchant au moins une machine selon l'inventaire x NVD, les plus
+    récentes d'abord, avec en regard le nombre de machines selon Defender.
+    """
+
+    _ensure_defender_cve_summary()
+
+    where = ""
+    params = []
+
+    if search:
+        like = f"%{search.strip()}%"
+        where = """
+            WHERE s.cve_id LIKE ?
+               OR v.nvd_description LIKE ?
+               OR s.cve_id IN (
+                   SELECT cve_id FROM inventory_cve_matches
+                   WHERE cpe_vendor LIKE ? OR cpe_product LIKE ?
+               )
+        """
+        params = [like, like, like, like]
+
+    conn = get_connection()
+
+    rows = conn.execute(
+        f"""
+        SELECT
+            s.cve_id,
+            v.nvd_published,
+            COALESCE(v.cvss_v3_severity, v.cvss_v4_severity) AS severity,
+            COALESCE(v.cvss_v3_score, v.cvss_v4_score) AS cvss,
+            s.affected_devices,
+            s.affected_products,
+            COALESCE(d.affected_devices, 0) AS defender_devices,
+            v.source,
+            (
+                SELECT GROUP_CONCAT(DISTINCT m.cpe_vendor || ' ' || m.cpe_product)
+                FROM inventory_cve_matches m
+                WHERE m.cve_id = s.cve_id
+            ) AS products,
+            COALESCE(v.nvd_description, v.description) AS description
+        FROM inventory_cve_summary s
+        LEFT JOIN vulnerabilities v ON v.cve_id = s.cve_id
+        LEFT JOIN defender_cve_summary d ON d.cve_id = s.cve_id
+        {where}
+        ORDER BY v.nvd_published DESC, s.cve_id DESC
+        LIMIT ?
+        """,
+        params + [int(limit)]
+    ).fetchall()
+
+    conn.close()
+
+    return [dict(row) for row in rows]
+
+
+def get_inventory_devices_for_cve(cve_id):
+    """Machines touchées par une CVE selon l'inventaire x NVD."""
+
+    conn = get_connection()
+
+    rows = conn.execute(
+        """
+        SELECT DISTINCT
+            i.device_name,
+            i.os_platform,
+            i.os_version,
+            i.software_vendor,
+            i.software_name,
+            i.software_version,
+            m.rule,
+            i.end_of_support_status
+        FROM inventory_cve_matches m
+        JOIN software_inventory i
+            ON i.cpe_vendor = m.cpe_vendor
+            AND i.cpe_product = m.cpe_product
+            AND i.software_version = m.software_version
+        WHERE m.cve_id = ?
+        ORDER BY i.device_name
+        """,
+        (cve_id,)
+    ).fetchall()
+
+    conn.close()
+
+    return [dict(row) for row in rows]
+
+
+def get_inventory_device_count(cve_id):
+
+    conn = get_connection()
+
+    row = conn.execute(
+        "SELECT affected_devices FROM inventory_cve_summary WHERE cve_id = ?",
+        (cve_id,)
+    ).fetchone()
+
+    conn.close()
+
+    return row[0] if row else 0
+
+
 def get_nvd_total_count():
 
     conn = get_connection()
@@ -3708,6 +3947,31 @@ def get_nvd_total_count():
     conn.close()
 
     return row["n"] if row else 0
+
+
+def _replace_cpe_matches(conn, cve_id, cpe_matches):
+
+    conn.execute("DELETE FROM nvd_cpe_matches WHERE cve_id = ?", (cve_id,))
+
+    if cpe_matches:
+        conn.executemany(
+            """
+            INSERT INTO nvd_cpe_matches (
+                cve_id, part, vendor, product, version,
+                version_start_including, version_start_excluding,
+                version_end_including, version_end_excluding
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    cve_id, m["part"], m["vendor"], m["product"], m["version"],
+                    m["version_start_including"], m["version_start_excluding"],
+                    m["version_end_including"], m["version_end_excluding"]
+                )
+                for m in cpe_matches
+            ]
+        )
 
 
 def bulk_save_nvd_discoveries(discoveries):
@@ -3803,6 +4067,11 @@ def bulk_save_nvd_discoveries(discoveries):
             enrichment.get("nvd_enriched_at"),
             cve_id
         ))
+
+        # Produits vulnérables NVD (configurations CPE) : remplacés à
+        # chaque enregistrement, NVD peut les corriger après coup.
+        if "cpe_matches" in enrichment:
+            _replace_cpe_matches(conn, cve_id, enrichment["cpe_matches"])
 
         processed += 1
 

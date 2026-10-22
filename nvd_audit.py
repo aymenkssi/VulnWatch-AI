@@ -37,6 +37,7 @@ from collectors.nvd import (
     PAGE_DELAY_SECONDS
 )
 from services.jobs import report_progress
+from services.inventory_matcher import refresh_matches_for_cves
 
 
 AUDIT_DAYS = int(os.getenv("VULNWATCH_AUDIT_DAYS", "30"))
@@ -155,7 +156,10 @@ def main():
             bulk_save_nvd_discoveries(discoveries)
 
             recovered += len(new_ids)
-            recovered_on_parc.extend(get_cve_ids_present_in_defender(new_ids))
+
+            on_parc = set(get_cve_ids_present_in_defender(new_ids))
+            on_parc |= refresh_matches_for_cves(new_ids)
+            recovered_on_parc.extend(on_parc)
 
             print(f"  {row['day']} : {len(new_ids)} CVE rattrapée(s)")
 

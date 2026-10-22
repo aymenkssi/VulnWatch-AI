@@ -8,6 +8,14 @@ DEFENDER_API_URL = (
     "/api/machines/SoftwareVulnerabilitiesExport"
 )
 
+# Inventaire logiciel complet par machine (export par fichiers), pour le
+# calcul des équipements touchés selon NVD (sync_software_inventory.py).
+# Permission API requise : Software.Read.All.
+SOFTWARE_INVENTORY_EXPORT_URL = (
+    "https://api.security.microsoft.com"
+    "/api/machines/SoftwareInventoryExport"
+)
+
 
 AZ_PATHS = [
     r"C:\Program Files (x86)\Microsoft SDKs\Azure\CLI2\wbin\az.cmd",
@@ -78,7 +86,8 @@ def get_access_token():
 
 
 def request_export(
-    sas_valid_hours=6
+    sas_valid_hours=6,
+    url=DEFENDER_API_URL
 ):
 
     token = get_access_token()
@@ -92,7 +101,7 @@ def request_export(
     }
 
     response = requests.get(
-        DEFENDER_API_URL,
+        url,
         headers=headers,
         params=params,
         timeout=120

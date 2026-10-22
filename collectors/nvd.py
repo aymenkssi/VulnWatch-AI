@@ -2,6 +2,7 @@
 import io
 import gzip
 import json
+import re
 import zipfile
 import requests
 import time
@@ -288,7 +289,73 @@ def parse_nvd_cve(cve):
         )
 
 
+    # =====================================================
+    # PRODUITS VULNÉRABLES (configurations CPE)
+    # =====================================================
+    #
+    # Servent à calculer, à partir de l'inventaire logiciel des
+    # machines, les équipements touchés selon NVD (voir
+    # services/inventory_matcher.py).
+
+    result["cpe_matches"] = extract_cpe_matches(cve)
+
+
     return result
+
+
+def split_cpe(criteria):
+    """
+    "cpe:2.3:a:vendor:product:version:..." -> liste des champs, en
+    respectant les ":" échappés ("\\:") et en retirant les échappements.
+    """
+
+    parts = re.split(r"(?<!\\):", criteria or "")
+
+    return [part.replace("\\", "") for part in parts]
+
+
+def extract_cpe_matches(cve):
+    """
+    Produits marqués VULNÉRABLES dans les configurations NVD d'une CVE :
+    [{"part", "vendor", "product", "version", "version_start_including",
+    "version_start_excluding", "version_end_including",
+    "version_end_excluding"}]. Les entrées "non vulnérables" (plateforme
+    sur laquelle tourne le produit, ex. un OS) sont ignorées.
+    """
+
+    matches = []
+    seen = set()
+
+    for configuration in cve.get("configurations", []):
+        for node in configuration.get("nodes", []):
+            for match in node.get("cpeMatch", []):
+
+                if not match.get("vulnerable"):
+                    continue
+
+                parts = split_cpe(match.get("criteria"))
+
+                if len(parts) < 6:
+                    continue
+
+                entry = {
+                    "part": parts[2],
+                    "vendor": parts[3].lower(),
+                    "product": parts[4].lower(),
+                    "version": parts[5],
+                    "version_start_including": match.get("versionStartIncluding"),
+                    "version_start_excluding": match.get("versionStartExcluding"),
+                    "version_end_including": match.get("versionEndIncluding"),
+                    "version_end_excluding": match.get("versionEndExcluding")
+                }
+
+                key = tuple(entry.values())
+
+                if key not in seen:
+                    seen.add(key)
+                    matches.append(entry)
+
+    return matches
 
 
 def _headers():
@@ -558,7 +625,7 @@ def describe_nvd_record(cve):
             for match in node.get("cpeMatch", []):
 
                 # cpe:2.3:<part>:<vendor>:<product>:<version>:...
-                parts = (match.get("criteria") or "").split(":")
+                parts = split_cpe(match.get("criteria"))
 
                 if len(parts) < 6:
                     continue
