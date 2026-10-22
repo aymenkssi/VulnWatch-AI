@@ -1,4 +1,5 @@
 import sqlite3
+import re
 import json
 import os
 import hmac
@@ -3381,6 +3382,195 @@ def get_nvd_audit_report():
 def set_nvd_audit_report(report):
 
     set_app_config(NVD_AUDIT_REPORT_KEY, json.dumps(report))
+
+
+# =========================================================
+# ONGLET "CVE NVD" : RECHERCHE DANS TOUTE LA BASE
+# =========================================================
+
+NVD_SEARCH_SORTS = {
+    "published_desc": "v.nvd_published DESC, v.cve_id DESC",
+    "published_asc": "v.nvd_published IS NULL, v.nvd_published ASC, v.cve_id ASC",
+    "score_desc": (
+        "COALESCE(v.cvss_v3_score, v.cvss_v4_score) IS NULL, "
+        "COALESCE(v.cvss_v3_score, v.cvss_v4_score) DESC, "
+        "v.nvd_published DESC"
+    ),
+    "modified_desc": "v.nvd_last_modified DESC, v.cve_id DESC"
+}
+
+# Colonnes textuelles parcourues par la recherche libre.
+_NVD_SEARCH_COLUMNS = (
+    "v.cve_id",
+    "v.nvd_description",
+    "v.description",
+    "v.vulnerability_name",
+    "v.vendor",
+    "v.product",
+    "v.cwe"
+)
+
+
+def search_nvd_cves(
+    search=None,
+    published_from=None,
+    published_to=None,
+    severities=None,
+    min_score=None,
+    on_parc_only=False,
+    kev_only=False,
+    sort="published_desc",
+    limit=100,
+    offset=0
+):
+    """
+    Recherche dans TOUTE la table vulnerabilities (CVE NVD et CISA KEV),
+    filtrée et paginée côté base : plusieurs centaines de milliers de
+    CVE, impossible de tout envoyer au navigateur.
+
+    - search : identifiant exact ("CVE-2024-1234") ou mots-clés ; chaque
+      mot doit apparaître dans l'ID, la description, le nom CISA,
+      l'éditeur/produit CISA ou le CWE ;
+    - published_from / published_to : dates (incluses) de publication NVD ;
+    - severities : liste parmi CRITICAL, HIGH, MEDIUM, LOW, NONE
+      ("NONE" = pas encore de score) ;
+    - min_score : score CVSS minimal (3.1, sinon 4.0) ;
+    - on_parc_only : seulement les CVE détectées par Defender ;
+    - kev_only : seulement les CVE du catalogue CISA KEV.
+
+    Retourne (nombre total de résultats, liste de dicts de la page).
+    """
+
+    _ensure_defender_cve_summary()
+
+    where = []
+    params = []
+
+    search = (search or "").strip()
+
+    if search:
+
+        if re.fullmatch(r"(?i)CVE-\d{4}-\d{4,}", search):
+
+            where.append("v.cve_id = ?")
+            params.append(search.upper())
+
+        else:
+
+            for word in search.split():
+
+                like = f"%{word}%"
+                where.append(
+                    "("
+                    + " OR ".join(f"{col} LIKE ?" for col in _NVD_SEARCH_COLUMNS)
+                    + ")"
+                )
+                params.extend([like] * len(_NVD_SEARCH_COLUMNS))
+
+    if published_from:
+        where.append("v.nvd_published >= ?")
+        params.append(published_from.isoformat())
+
+    if published_to:
+        where.append("v.nvd_published < ?")
+        params.append((published_to + timedelta(days=1)).isoformat())
+
+    if severities:
+
+        severity_sql = "UPPER(COALESCE(v.cvss_v3_severity, v.cvss_v4_severity))"
+        conditions = []
+        named = [s for s in severities if s != "NONE"]
+
+        if named:
+            conditions.append(
+                f"{severity_sql} IN ({', '.join('?' for _ in named)})"
+            )
+            params.extend(named)
+
+        if "NONE" in severities:
+            conditions.append(
+                "(v.cvss_v3_severity IS NULL AND v.cvss_v4_severity IS NULL)"
+            )
+
+        where.append("(" + " OR ".join(conditions) + ")")
+
+    if min_score:
+        where.append("COALESCE(v.cvss_v3_score, v.cvss_v4_score) >= ?")
+        params.append(float(min_score))
+
+    if on_parc_only:
+        where.append("s.cve_id IS NOT NULL")
+
+    if kev_only:
+        where.append("v.source = 'CISA KEV'")
+
+    where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+
+    from_sql = """
+        FROM vulnerabilities v
+        LEFT JOIN defender_cve_summary s
+            ON s.cve_id = v.cve_id
+    """
+
+    conn = get_connection()
+
+    total = conn.execute(
+        f"SELECT COUNT(*) {from_sql} {where_sql}",
+        params
+    ).fetchone()[0]
+
+    rows = conn.execute(
+        f"""
+        SELECT
+            v.cve_id,
+            v.nvd_published,
+            v.nvd_last_modified,
+            COALESCE(v.cvss_v3_severity, v.cvss_v4_severity) AS severity,
+            v.cvss_v3_score,
+            v.cvss_v4_score,
+            v.cwe,
+            v.source,
+            COALESCE(s.affected_devices, 0) AS affected_devices,
+            COALESCE(v.nvd_description, v.description) AS description
+        {from_sql}
+        {where_sql}
+        ORDER BY {NVD_SEARCH_SORTS.get(sort, NVD_SEARCH_SORTS["published_desc"])}
+        LIMIT ? OFFSET ?
+        """,
+        params + [int(limit), int(offset)]
+    ).fetchall()
+
+    conn.close()
+
+    return total, [dict(row) for row in rows]
+
+
+def get_cve_details(cve_id):
+    """Toutes les colonnes d'une CVE + son exposition Defender."""
+
+    _ensure_defender_cve_summary()
+
+    conn = get_connection()
+
+    row = conn.execute(
+        """
+        SELECT
+            v.*,
+            COALESCE(s.affected_devices, 0) AS parc_devices,
+            COALESCE(s.affected_products, 0) AS parc_products,
+            s.first_seen AS parc_first_seen,
+            s.last_seen AS parc_last_seen
+        FROM vulnerabilities v
+        LEFT JOIN defender_cve_summary s
+            ON s.cve_id = v.cve_id
+        WHERE v.cve_id = ?
+        """,
+        (cve_id,)
+    ).fetchone()
+
+    conn.close()
+
+    return dict(row) if row else None
 
 
 def get_nvd_total_count():

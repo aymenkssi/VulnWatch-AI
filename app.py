@@ -50,6 +50,8 @@ from database import (
     get_watch_alert_history,
     get_nvd_api_key,
     get_nvd_audit_report,
+    search_nvd_cves,
+    get_cve_details,
     get_app_config,
     set_app_config,
     set_nvd_api_key,
@@ -65,6 +67,7 @@ from services.mailer import send_test_email, send_email, SmtpNotConfigured
 from services.ai_engine import generate_watch_alert_email
 from collectors.hexiosec import test_connection as hexiosec_test_connection
 from collectors.nvd import parse_nvd_feed_bytes
+import collectors.nvd as nvd_collector
 
 
 # =========================================================
@@ -1784,11 +1787,12 @@ nvd_critical = int(
 # TABS
 # =========================================================
 
-tab_dashboard, tab_servers, tab_kev, tab_investigation, tab_notifications, tab_attack_surface, tab_watch = st.tabs(
+tab_dashboard, tab_servers, tab_kev, tab_nvd, tab_investigation, tab_notifications, tab_attack_surface, tab_watch = st.tabs(
     [
         "Tableau de bord",
         "Serveurs",
         "CISA KEV",
+        "CVE NVD",
         "Investigation CVE",
         "Notifications",
         "Attack Surface",
@@ -2690,6 +2694,449 @@ with tab_kev:
             use_container_width=True,
             hide_index=True
         )
+
+
+# =========================================================
+# CVE NVD TAB (toute la base, recherche + fiche détaillée)
+# =========================================================
+
+NVD_SEVERITY_LABELS = {
+    "CRITICAL": "🔴 CRITICAL",
+    "HIGH": "🟠 HIGH",
+    "MEDIUM": "🟡 MEDIUM",
+    "LOW": "🔵 LOW",
+    "NONE": "⚪ Sans score"
+}
+
+NVD_SORT_LABELS = {
+    "published_desc": "Publication la plus récente",
+    "published_asc": "Publication la plus ancienne",
+    "score_desc": "Score CVSS décroissant",
+    "modified_desc": "Dernière modification NVD"
+}
+
+
+@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
+def load_nvd_search(
+    search, published_from, published_to, severities, min_score,
+    on_parc_only, kev_only, sort, limit, offset
+):
+    return search_nvd_cves(
+        search=search,
+        published_from=published_from,
+        published_to=published_to,
+        severities=list(severities),
+        min_score=min_score,
+        on_parc_only=on_parc_only,
+        kev_only=kev_only,
+        sort=sort,
+        limit=limit,
+        offset=offset
+    )
+
+
+@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
+def load_cve_details(cve_id):
+    return get_cve_details(cve_id)
+
+
+@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
+def load_devices_for_cve(cve_id):
+    return get_devices_for_cve(cve_id)
+
+
+# Fiche NVD en ligne : une heure de cache, NVD ne change pas si vite et
+# on ménage la limite de requêtes de l'API.
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_nvd_record(cve_id, api_key):
+
+    nvd_collector.NVD_API_KEY = api_key or None
+
+    record = nvd_collector.fetch_nvd_cve_record(cve_id)
+
+    return nvd_collector.describe_nvd_record(record) if record else None
+
+
+def format_nvd_date(value):
+
+    if not value:
+        return ""
+
+    return str(value)[:16].replace("T", " ")
+
+
+def render_nvd_cve_details(cve_id):
+
+    details = load_cve_details(cve_id)
+
+    if not details:
+        st.warning(f"{cve_id} introuvable dans la base.")
+        return
+
+    st.markdown(f"### {cve_id}")
+
+    st.markdown(
+        f"[Fiche NVD](https://nvd.nist.gov/vuln/detail/{cve_id}) · "
+        f"[CVE.org](https://www.cve.org/CVERecord?id={cve_id})"
+    )
+
+    severity = details.get("cvss_v3_severity") or details.get("cvss_v4_severity")
+
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric(
+        "Sévérité",
+        NVD_SEVERITY_LABELS.get(str(severity or "NONE").upper(), severity)
+    )
+    c2.metric(
+        "CVSS 3.1",
+        f"{details['cvss_v3_score']:.1f}"
+        if details.get("cvss_v3_score") is not None else "N/A"
+    )
+    c3.metric(
+        "CVSS 4.0",
+        f"{details['cvss_v4_score']:.1f}"
+        if details.get("cvss_v4_score") is not None else "N/A"
+    )
+    c4.metric("Équipements touchés", details.get("parc_devices") or 0)
+    c5.metric(
+        "Catalogue CISA KEV",
+        "Oui" if details.get("source") == "CISA KEV" else "Non"
+    )
+
+    d1, d2, d3 = st.columns(3)
+    d1.caption(f"**Publiée (NVD)** : {format_nvd_date(details.get('nvd_published')) or 'N/A'}")
+    d2.caption(f"**Dernière modification** : {format_nvd_date(details.get('nvd_last_modified')) or 'N/A'}")
+    d3.caption(f"**CWE** : {details.get('cwe') or 'N/A'}")
+
+    st.markdown("**Description**")
+    st.write(
+        details.get("nvd_description")
+        or details.get("description")
+        or "Pas de description."
+    )
+
+    vectors = []
+
+    if details.get("cvss_v3_vector"):
+        vectors.append(f"CVSS 3.1 : {details['cvss_v3_vector']}")
+
+    if details.get("cvss_v4_vector"):
+        vectors.append(f"CVSS 4.0 : {details['cvss_v4_vector']}")
+
+    if vectors:
+        st.code("\n".join(vectors), language="text")
+
+    if details.get("source") == "CISA KEV":
+
+        st.markdown("**CISA KEV**")
+
+        st.write(
+            f"{details.get('vulnerability_name') or ''} — "
+            f"{details.get('vendor') or ''} {details.get('product') or ''}"
+        )
+
+        k1, k2, k3, k4 = st.columns(4)
+        k1.caption(f"**Ajoutée au catalogue** : {details.get('date_added') or 'N/A'}")
+        k2.caption(f"**Échéance de correction** : {details.get('due_date') or 'N/A'}")
+        k3.caption(f"**Ransomware** : {details.get('known_ransomware') or 'N/A'}")
+        k4.caption(
+            f"**Priorité VulnWatch** : "
+            f"{badge_priority(details.get('priority'))} "
+            f"(score {details.get('risk_score') or 0})"
+        )
+
+    if details.get("ai_summary"):
+
+        with st.expander("Analyse IA (Ollama)"):
+
+            st.markdown(f"**Résumé** : {details.get('ai_summary')}")
+            st.markdown(f"**Impact** : {details.get('ai_impact') or ''}")
+            st.markdown(f"**Recommandation** : {details.get('ai_recommendation') or ''}")
+            st.caption(
+                f"Modèle {details.get('ai_model') or ''} — "
+                f"{format_nvd_date(details.get('ai_generated_at'))}"
+            )
+
+    if details.get("parc_devices"):
+
+        with st.expander(
+            f"Équipements touchés sur le parc ({details['parc_devices']})"
+        ):
+
+            devices = load_devices_for_cve(cve_id)
+
+            if devices:
+                st.dataframe(
+                    pd.DataFrame(devices).rename(columns={
+                        "device_name": "Équipement",
+                        "os_platform": "OS",
+                        "os_version": "Version OS",
+                        "software_vendor": "Éditeur",
+                        "software_name": "Logiciel",
+                        "software_version": "Version",
+                        "defender_severity": "Sévérité Defender",
+                        "exploitability_level": "Exploitabilité",
+                        "security_update_available": "Mise à jour",
+                        "recommended_security_update": "Mise à jour recommandée",
+                        "first_seen_timestamp": "Première détection",
+                        "last_seen_timestamp": "Dernière détection"
+                    }),
+                    use_container_width=True,
+                    hide_index=True
+                )
+
+    # Détail complet chargé à la demande depuis l'API NVD : références,
+    # produits concernés, toutes les métriques (non conservés en base).
+    if st.toggle(
+        "Afficher le détail complet depuis NVD (références, produits "
+        "concernés, toutes les métriques)",
+        key=f"nvd_full_{cve_id}"
+    ):
+
+        try:
+
+            with st.spinner("Chargement de la fiche NVD..."):
+                record = load_nvd_record(cve_id, get_nvd_api_key())
+
+        except Exception as error:
+
+            st.error(f"Fiche NVD indisponible — {error}")
+            return
+
+        if not record:
+            st.info("NVD ne connaît pas (ou plus) cette CVE.")
+            return
+
+        st.caption(
+            f"Statut NVD : **{record['status'] or 'N/A'}** · "
+            f"Source : {record['source_identifier'] or 'N/A'} · "
+            f"CWE : {', '.join(record['weaknesses']) or 'N/A'}"
+        )
+
+        if record["metrics"]:
+            st.markdown("**Métriques CVSS**")
+            st.dataframe(
+                pd.DataFrame(record["metrics"]).rename(columns={
+                    "version": "Version",
+                    "source": "Source",
+                    "type": "Type",
+                    "score": "Score",
+                    "severity": "Sévérité",
+                    "vector": "Vecteur"
+                }),
+                use_container_width=True,
+                hide_index=True
+            )
+
+        if record["products"]:
+            st.markdown(f"**Produits concernés ({len(record['products'])})**")
+            st.dataframe(
+                pd.DataFrame(record["products"]).rename(columns={
+                    "type": "Type",
+                    "vendor": "Éditeur",
+                    "product": "Produit",
+                    "version": "Version(s)",
+                    "vulnerable": "Vulnérable"
+                }),
+                use_container_width=True,
+                hide_index=True
+            )
+        else:
+            st.caption("Aucun produit (CPE) renseigné par NVD pour l'instant.")
+
+        if record["references"]:
+            st.markdown(f"**Références ({len(record['references'])})**")
+            st.dataframe(
+                pd.DataFrame(record["references"]).rename(columns={
+                    "url": "Lien",
+                    "source": "Source",
+                    "tags": "Type"
+                }),
+                column_config={"Lien": st.column_config.LinkColumn("Lien")},
+                use_container_width=True,
+                hide_index=True
+            )
+
+
+with tab_nvd:
+
+    st.subheader("CVE NVD — toute la base")
+
+    st.caption(
+        "Toutes les CVE connues de VulnWatch (flux NVD, historique, imports "
+        "de fichiers NVD et catalogue CISA KEV), avec recherche et filtres. "
+        "Sélectionnez une ligne pour afficher sa fiche détaillée."
+    )
+
+    f1, f2 = st.columns([3, 1])
+
+    with f1:
+        nvd_search = st.text_input(
+            "Rechercher",
+            placeholder="CVE-2026-12345, fortinet, remote code execution, CWE-79...",
+            key="nvd_tab_search"
+        )
+
+    with f2:
+        nvd_sort = st.selectbox(
+            "Trier par",
+            list(NVD_SORT_LABELS),
+            format_func=NVD_SORT_LABELS.get,
+            key="nvd_tab_sort"
+        )
+
+    g1, g2, g3, g4 = st.columns(4)
+
+    with g1:
+        nvd_from = st.date_input(
+            "Publiée depuis le", value=None, key="nvd_tab_from",
+            format="DD/MM/YYYY"
+        )
+
+    with g2:
+        nvd_to = st.date_input(
+            "Jusqu'au", value=None, key="nvd_tab_to",
+            format="DD/MM/YYYY"
+        )
+
+    with g3:
+        nvd_severities = st.multiselect(
+            "Sévérité",
+            list(NVD_SEVERITY_LABELS),
+            format_func=NVD_SEVERITY_LABELS.get,
+            key="nvd_tab_severities"
+        )
+
+    with g4:
+        nvd_min_score = st.number_input(
+            "Score CVSS minimal", min_value=0.0, max_value=10.0,
+            value=0.0, step=0.5, key="nvd_tab_min_score"
+        )
+
+    h1, h2, h3 = st.columns([1, 1, 1])
+
+    with h1:
+        nvd_on_parc = st.checkbox(
+            "Présentes sur le parc uniquement", key="nvd_tab_on_parc"
+        )
+
+    with h2:
+        nvd_kev_only = st.checkbox(
+            "Catalogue CISA KEV uniquement", key="nvd_tab_kev_only"
+        )
+
+    with h3:
+        nvd_page_size = st.selectbox(
+            "Lignes par page", [50, 100, 200], index=1,
+            key="nvd_tab_page_size"
+        )
+
+    # Retour à la page 1 dès qu'un filtre change.
+    nvd_filters = (
+        nvd_search, nvd_from, nvd_to, tuple(nvd_severities),
+        nvd_min_score, nvd_on_parc, nvd_kev_only, nvd_sort, nvd_page_size
+    )
+
+    if st.session_state.get("nvd_tab_filters") != nvd_filters:
+        st.session_state["nvd_tab_filters"] = nvd_filters
+        st.session_state["nvd_tab_page"] = 1
+
+    nvd_page = int(st.session_state.get("nvd_tab_page", 1))
+
+    nvd_total, nvd_rows = load_nvd_search(
+        nvd_search.strip(),
+        nvd_from,
+        nvd_to,
+        tuple(nvd_severities),
+        nvd_min_score or None,
+        nvd_on_parc,
+        nvd_kev_only,
+        nvd_sort,
+        nvd_page_size,
+        (nvd_page - 1) * nvd_page_size
+    )
+
+    nvd_pages = max(1, -(-nvd_total // nvd_page_size))
+
+    # Le nombre de pages a pu diminuer (synchro, données modifiées) :
+    # Streamlit refuse une valeur au-delà du maximum du champ "Page".
+    if nvd_page > nvd_pages:
+        st.session_state["nvd_tab_page"] = nvd_pages
+
+    p1, p2 = st.columns([3, 1])
+
+    with p1:
+        st.markdown(
+            f"**{nvd_total:,} CVE** trouvée(s) — page {nvd_page} / {nvd_pages:,}"
+            .replace(",", " ")
+        )
+
+    with p2:
+        st.number_input(
+            "Page", min_value=1, max_value=nvd_pages, step=1,
+            key="nvd_tab_page", label_visibility="collapsed"
+        )
+
+    if not nvd_rows:
+
+        st.info("Aucune CVE ne correspond à ces critères.")
+
+    else:
+
+        nvd_df = pd.DataFrame(nvd_rows)
+
+        nvd_df["severity"] = nvd_df["severity"].map(
+            lambda value: NVD_SEVERITY_LABELS.get(
+                str(value or "NONE").upper(), value
+            )
+        )
+        nvd_df["nvd_published"] = nvd_df["nvd_published"].map(format_nvd_date)
+        nvd_df["nvd_last_modified"] = nvd_df["nvd_last_modified"].map(format_nvd_date)
+        nvd_df["source"] = nvd_df["source"].eq("CISA KEV").map(
+            {True: "Oui", False: ""}
+        )
+        nvd_df["description"] = nvd_df["description"].fillna("").map(
+            lambda text: text if len(text) <= 180 else text[:177] + "..."
+        )
+
+        nvd_event = st.dataframe(
+            nvd_df[[
+                "cve_id", "nvd_published", "severity", "cvss_v3_score",
+                "cvss_v4_score", "cwe", "affected_devices", "source",
+                "nvd_last_modified", "description"
+            ]].rename(columns={
+                "cve_id": "CVE",
+                "nvd_published": "Publiée",
+                "severity": "Sévérité",
+                "cvss_v3_score": "CVSS 3.1",
+                "cvss_v4_score": "CVSS 4.0",
+                "cwe": "CWE",
+                "affected_devices": "Équipements",
+                "source": "CISA KEV",
+                "nvd_last_modified": "Modifiée",
+                "description": "Description"
+            }),
+            column_config={
+                "CVSS 3.1": st.column_config.NumberColumn(format="%.1f"),
+                "CVSS 4.0": st.column_config.NumberColumn(format="%.1f")
+            },
+            use_container_width=True,
+            hide_index=True,
+            on_select="rerun",
+            selection_mode="single-row",
+            key="nvd_tab_table"
+        )
+
+        selected_rows = nvd_event.selection.rows if nvd_event else []
+
+        if selected_rows:
+
+            st.divider()
+            render_nvd_cve_details(nvd_rows[selected_rows[0]]["cve_id"])
+
+        else:
+
+            st.caption("Cliquez sur une ligne pour afficher la fiche de la CVE.")
 
 
 # =========================================================
