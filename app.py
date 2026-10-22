@@ -49,6 +49,7 @@ from database import (
     record_watch_alert,
     get_watch_alert_history,
     get_nvd_api_key,
+    get_nvd_audit_report,
     get_app_config,
     set_app_config,
     set_nvd_api_key,
@@ -280,7 +281,8 @@ JOB_LABELS = {
     "ai_enrich.py": "Analyse IA (Ollama)",
     "notify.py": "Notifications e-mail",
     "sync_hexiosec.py": "Synchronisation Hexiosec ASM",
-    "sync_nvd_feed.py": "Synchronisation NVD"
+    "sync_nvd_feed.py": "Synchronisation NVD",
+    "nvd_audit.py": "Vérification de la base NVD"
 }
 
 
@@ -591,6 +593,7 @@ auto_notify_if_needed()
 # de serveur (auto_notify_if_needed ci-dessus) : rien n'y change.
 
 AUTO_NVD_FEED_INTERVAL_MINUTES = 24 * 60
+AUTO_NVD_FEED_ERROR_RETRY_MINUTES = 60
 
 
 def auto_sync_nvd_feed_if_needed():
@@ -613,10 +616,15 @@ def auto_sync_nvd_feed_if_needed():
                     tzinfo=timezone.utc
                 )
 
-            needs_run = (
-                (now - last_run)
-                >= timedelta(minutes=AUTO_NVD_FEED_INTERVAL_MINUTES)
+            # Après un échec, on retente au bout d'une heure au lieu
+            # d'attendre le passage quotidien suivant.
+            interval = (
+                AUTO_NVD_FEED_ERROR_RETRY_MINUTES
+                if state.get("status") == "ERROR"
+                else AUTO_NVD_FEED_INTERVAL_MINUTES
             )
+
+            needs_run = (now - last_run) >= timedelta(minutes=interval)
 
         except ValueError:
 
@@ -631,9 +639,11 @@ def auto_sync_nvd_feed_if_needed():
         if api_key:
             env["VULNWATCH_NVD_API_KEY"] = api_key
 
+        # Garde-fou anti-relance d'une heure (et non 24 h) : sinon il
+        # bloquerait la nouvelle tentative prévue une heure après un échec.
         launch_background_sync(
             "sync_nvd_feed.py",
-            timedelta(minutes=AUTO_NVD_FEED_INTERVAL_MINUTES),
+            timedelta(minutes=AUTO_NVD_FEED_ERROR_RETRY_MINUTES),
             env=env
         )
 
@@ -3899,6 +3909,138 @@ with tab_watch:
             else:
 
                 st.info("Champ vide : rien n'a été changé.")
+
+    # -----------------------------------------------------
+    # État de la base NVD (comparaison jour par jour + rattrapage)
+    # -----------------------------------------------------
+
+    st.markdown("#### État de la base NVD")
+
+    st.caption(
+        "Compare, jour par jour, le nombre de CVE publiées sur "
+        "nvd.nist.gov avec celles présentes dans VulnWatch (une requête "
+        "légère par jour, sans télécharger les CVE). « Rattraper » "
+        "retélécharge les jours incomplets, sans envoyer d'alerte "
+        "e-mail : les CVE rattrapées présentes sur le parc sont listées "
+        "ci-dessous."
+    )
+
+    if get_nvd_api_key():
+        st.caption("🔑 Clé API NVD configurée (50 requêtes / 30 s).")
+    else:
+        st.caption(
+            "⚠️ Aucune clé API NVD : la vérification est plus lente "
+            "(5 requêtes / 30 s). Renseignez-la dans « Clé API NVD » "
+            "ci-dessus."
+        )
+
+    audit_days = st.number_input(
+        "Période à vérifier (jours)",
+        min_value=1,
+        max_value=120,
+        value=30,
+        step=1,
+        key="nvd_audit_days"
+    )
+
+    audit_running = is_job_running("nvd_audit")
+
+    audit_col_check, audit_col_fix = st.columns(2)
+
+    with audit_col_check:
+
+        audit_check = st.button(
+            "Vérifier l'état",
+            use_container_width=True,
+            disabled=audit_running,
+            key="nvd_audit_check_button"
+        )
+
+    with audit_col_fix:
+
+        audit_fix = st.button(
+            "Rattraper les CVE manquantes",
+            use_container_width=True,
+            type="primary",
+            disabled=audit_running,
+            key="nvd_audit_fix_button"
+        )
+
+    if audit_check or audit_fix:
+
+        env = os.environ.copy()
+        env["VULNWATCH_AUDIT_DAYS"] = str(int(audit_days))
+
+        if audit_fix:
+            env["VULNWATCH_AUDIT_FIX"] = "1"
+
+        audit_key = get_nvd_api_key()
+
+        if audit_key:
+            env["VULNWATCH_NVD_API_KEY"] = audit_key
+
+        launch_job("nvd_audit.py", env=env)
+
+    render_job("nvd_audit")
+
+    audit_report = get_nvd_audit_report()
+
+    if audit_report and audit_report.get("rows"):
+
+        audit_rows = audit_report["rows"]
+
+        total_nvd = sum(row["nvd"] for row in audit_rows)
+        total_local = sum(row["local"] for row in audit_rows)
+        total_missing = sum(row["missing"] for row in audit_rows)
+        incomplete_days = sum(1 for row in audit_rows if row["missing"])
+
+        st.caption(
+            f"Dernière vérification : "
+            f"{format_sync_timestamp(audit_report.get('checked_at'))} "
+            f"— {audit_report.get('days')} derniers jours"
+        )
+
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("CVE publiées (NVD)", f"{total_nvd:,}")
+        m2.metric("CVE dans VulnWatch", f"{total_local:,}")
+        m3.metric("CVE manquantes", f"{total_missing:,}")
+        m4.metric("Jours incomplets", incomplete_days)
+
+        if audit_report.get("fixed"):
+
+            on_parc = audit_report.get("recovered_on_parc") or []
+
+            st.info(
+                f"Rattrapage : {audit_report.get('recovered', 0)} CVE "
+                f"ajoutée(s), dont {len(on_parc)} présente(s) sur le parc"
+                + (f" : {', '.join(on_parc[:20])}" if on_parc else "")
+                + (" ..." if len(on_parc) > 20 else "")
+            )
+
+        if total_missing == 0:
+            st.success("✅ La base est à jour avec NVD sur cette période.")
+
+        audit_df = pd.DataFrame(list(reversed(audit_rows)))
+        audit_df["state"] = audit_df["missing"].map(
+            lambda missing: "✅ Complet" if missing == 0
+            else f"⚠️ {missing} manquante(s)"
+        )
+
+        st.dataframe(
+            audit_df[["day", "nvd", "local", "missing", "state"]].rename(
+                columns={
+                    "day": "Date de publication (UTC)",
+                    "nvd": "NVD",
+                    "local": "VulnWatch",
+                    "missing": "Manquantes",
+                    "state": "État"
+                }
+            ),
+            use_container_width=True,
+            hide_index=True
+        )
+
+    st.divider()
 
     # -----------------------------------------------------
     # Téléchargement historique NVD (premier lancement)
