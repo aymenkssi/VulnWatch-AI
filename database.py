@@ -4351,6 +4351,71 @@ def get_product_nvd_cves(cpe_vendor, cpe_product):
     return [dict(row) for row in rows]
 
 
+# =========================================================
+# ALERTES DE VEILLE : DÉDOUBLONNAGE
+# =========================================================
+
+def _filter_cve_ids(sql, cve_ids, extra_params=()):
+    """Exécute `sql` (avec {placeholders}) par paquets, retourne un set."""
+
+    cve_ids = list(dict.fromkeys(cve_ids))
+    found = set()
+
+    if not cve_ids:
+        return found
+
+    conn = get_connection()
+
+    for start in range(0, len(cve_ids), 900):
+
+        chunk = cve_ids[start:start + 900]
+        placeholders = ", ".join("?" for _ in chunk)
+
+        found.update(
+            row[0] for row in conn.execute(
+                sql.format(placeholders=placeholders),
+                chunk + list(extra_params)
+            )
+        )
+
+    conn.close()
+
+    return found
+
+
+def get_alerted_cve_ids(cve_ids):
+    """CVE ayant déjà fait l'objet d'une alerte de veille."""
+
+    return _filter_cve_ids(
+        "SELECT DISTINCT cve_id FROM watch_alerts "
+        "WHERE cve_id IN ({placeholders})",
+        cve_ids
+    )
+
+
+def get_inventory_matched_cve_ids(cve_ids):
+    """CVE touchant au moins une machine selon l'inventaire x NVD."""
+
+    return _filter_cve_ids(
+        "SELECT cve_id FROM inventory_cve_summary "
+        "WHERE cve_id IN ({placeholders})",
+        cve_ids
+    )
+
+
+def get_cve_ids_published_since(cve_ids, days):
+    """CVE publiées par NVD depuis moins de `days` jours."""
+
+    since = (datetime.now(timezone.utc) - timedelta(days=days)).date().isoformat()
+
+    return _filter_cve_ids(
+        "SELECT cve_id FROM vulnerabilities "
+        "WHERE cve_id IN ({placeholders}) AND nvd_published >= ?",
+        cve_ids,
+        (since,)
+    )
+
+
 def get_nvd_total_count():
 
     conn = get_connection()

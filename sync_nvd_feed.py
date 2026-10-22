@@ -16,7 +16,10 @@ from database import (
     get_nvd_feed_cursor,
     set_nvd_feed_cursor,
     get_cve_details,
-    get_inventory_devices_for_cve
+    get_inventory_devices_for_cve,
+    get_alerted_cve_ids,
+    get_inventory_matched_cve_ids,
+    get_cve_ids_published_since
 )
 from services.inventory_matcher import refresh_matches_for_cves
 from collectors.nvd import fetch_recent_nvd_cves
@@ -34,6 +37,13 @@ DEFAULT_LOOKBACK_HOURS = 24
 # Petit chevauchement avec la fenêtre précédente pour ne jamais rater
 # une CVE publiée pile à la frontière entre deux exécutions.
 OVERLAP_MINUTES = 60
+
+# Une CVE MODIFIÉE par NVD qui devient applicable au parc (NVD vient de
+# déclarer ses produits vulnérables, souvent quelques heures ou jours
+# après la publication) déclenche aussi une alerte, si elle a été publiée
+# depuis moins de ce nombre de jours et n'a jamais été alertée. Au-delà,
+# pas d'alerte : NVD modifie chaque jour des milliers de CVE anciennes.
+MODIFIED_ALERT_MAX_AGE_DAYS = 30
 
 # L'API NVD 2.0 n'accepte pas une fenêtre de plus de 120 jours : une
 # période plus longue (synchro arrêtée plusieurs mois) est découpée en
@@ -98,6 +108,24 @@ def _split_windows(start, end):
     return windows
 
 
+def _group_by_device(rows):
+
+    devices = {}
+
+    for row in rows:
+
+        key = row.get("device_name") or row.get("device_id")
+
+        if key not in devices:
+            devices[key] = dict(row)
+        elif row.get("software_version"):
+            versions = devices[key]["software_version"].split(", ")
+            if row["software_version"] not in versions:
+                devices[key]["software_version"] += f", {row['software_version']}"
+
+    return list(devices.values())
+
+
 def _send_match_alert(cve_id, recipient_emails):
     """
     Envoie l'alerte de correspondance NVD <-> XDR à la liste de
@@ -116,7 +144,10 @@ def _send_match_alert(cve_id, recipient_emails):
 
         # Pas (encore) vue par Defender : machines trouvées par la
         # comparaison inventaire logiciel x produits vulnérables NVD.
-        devices = get_inventory_devices_for_cve(cve_id)
+        # Une ligne par version installée : on regroupe par machine pour
+        # que l'alerte compte des machines (une machine peut avoir
+        # plusieurs versions du même logiciel).
+        devices = _group_by_device(get_inventory_devices_for_cve(cve_id))
         details = get_cve_details(cve_id)
 
         if not devices or not details:
@@ -307,10 +338,11 @@ def main():
             # (utile quand Defender n'a pas encore intégré la CVE).
             inventory_matches = refresh_matches_for_cves(published_ids)
 
-            new_matches = sorted(
+            new_matches = (
                 set(get_cve_ids_present_in_defender(new_ids))
                 | (inventory_matches & set(new_ids))
             )
+            new_matches = sorted(new_matches - get_alerted_cve_ids(new_matches))
             matches_total += len(new_matches)
 
             print(
@@ -329,6 +361,7 @@ def main():
             # -------------------------------------------------
 
             modified = fetch_recent_nvd_cves(start, end, "modified")
+            modified_ids = [cve_id for cve_id, _ in modified]
 
             report_progress(
                 None,
@@ -337,10 +370,37 @@ def main():
                 force=True
             )
 
+            matched_before = get_inventory_matched_cve_ids(modified_ids)
+
             bulk_save_nvd_discoveries(modified)
 
-            # Produits vulnérables éventuellement corrigés par NVD.
-            refresh_matches_for_cves([cve_id for cve_id, _ in modified])
+            # Produits vulnérables ajoutés ou corrigés par NVD.
+            matched_after = refresh_matches_for_cves(modified_ids)
+
+            # Devenues applicables au parc avec cette modification (ex.
+            # produits déclarés par NVD après la publication) : alerte,
+            # si la CVE est récente et n'a jamais été alertée.
+            newly_matched = matched_after - matched_before
+
+            late_matches = (
+                get_cve_ids_published_since(
+                    newly_matched, MODIFIED_ALERT_MAX_AGE_DAYS
+                )
+                - get_alerted_cve_ids(newly_matched)
+            )
+
+            if late_matches:
+
+                print(
+                    f"    {len(late_matches)} CVE récente(s) devenue(s) "
+                    "applicable(s) au parc après modification NVD"
+                )
+
+                matches_total += len(late_matches)
+
+                sent, errors = _send_alerts(sorted(late_matches))
+                alerts_sent += sent
+                alert_errors.extend(errors)
 
             modified_total += len(modified)
 
