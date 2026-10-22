@@ -58,6 +58,15 @@ from database import (
     get_nvd_api_key,
     get_nvd_audit_report,
     get_inventory_status,
+    get_inventory_machines,
+    get_inventory_products,
+    get_machine_software,
+    get_machine_nvd_cves,
+    get_machine_defender_cves,
+    get_product_versions,
+    get_product_machines,
+    get_product_nvd_cves,
+    count_cves_without_cpe_check,
     get_inventory_matched_cves,
     get_inventory_devices_for_cve,
     get_inventory_device_count,
@@ -1926,12 +1935,13 @@ nvd_critical = int(
 # TABS
 # =========================================================
 
-tab_dashboard, tab_servers, tab_kev, tab_nvd, tab_investigation, tab_notifications, tab_attack_surface, tab_watch = st.tabs(
+tab_dashboard, tab_servers, tab_kev, tab_nvd, tab_inventory, tab_investigation, tab_notifications, tab_attack_surface, tab_watch = st.tabs(
     [
         "Tableau de bord",
         "Serveurs",
         "CISA KEV",
         "CVE NVD",
+        "Inventaire",
         "Investigation CVE",
         "Notifications",
         "Attack Surface",
@@ -2923,6 +2933,11 @@ def load_inventory_status():
     return get_inventory_status()
 
 
+@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
+def load_cpe_unchecked():
+    return count_cves_without_cpe_check()
+
+
 def format_nvd_date(value):
 
     if not value:
@@ -3331,6 +3346,376 @@ with tab_nvd:
         else:
 
             st.caption("Cliquez sur une ligne pour afficher la fiche de la CVE.")
+
+
+# =========================================================
+# INVENTAIRE TAB (logiciels par machine / par produit)
+# =========================================================
+
+@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
+def load_inventory_machines(search):
+    return get_inventory_machines(search or None)
+
+
+@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
+def load_inventory_products(search):
+    return get_inventory_products(search or None)
+
+
+@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
+def load_machine_details(device_id):
+    return (
+        get_machine_software(device_id),
+        get_machine_nvd_cves(device_id),
+        get_machine_defender_cves(device_id)
+    )
+
+
+@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
+def load_product_details(cpe_vendor, cpe_product):
+    return (
+        get_product_versions(cpe_vendor, cpe_product),
+        get_product_machines(cpe_vendor, cpe_product),
+        get_product_nvd_cves(cpe_vendor, cpe_product)
+    )
+
+
+def nvd_cves_frame(rows):
+    """Tableau de CVE (onglet Inventaire), colonnes en français."""
+
+    frame = pd.DataFrame(rows)
+
+    frame["severity"] = frame["severity"].map(
+        lambda value: NVD_SEVERITY_LABELS.get(str(value or "NONE").upper(), value)
+    )
+    frame["nvd_published"] = frame["nvd_published"].map(format_nvd_date)
+    frame["source"] = frame["source"].eq("CISA KEV").map({True: "Oui", False: ""})
+    frame["description"] = frame["description"].fillna("").map(
+        lambda text: text if len(text) <= 160 else text[:157] + "..."
+    )
+
+    return frame.rename(columns={
+        "cve_id": "CVE",
+        "nvd_published": "Publiée",
+        "severity": "Sévérité",
+        "cvss": "CVSS",
+        "source": "CISA KEV",
+        "software_name": "Logiciel",
+        "software_version": "Version installée",
+        "versions": "Versions installées touchées",
+        "rule": "Versions vulnérables (NVD)",
+        "description": "Description"
+    })
+
+
+CVSS_COLUMN = {"CVSS": st.column_config.NumberColumn(format="%.1f")}
+
+
+def render_machine_details(machine):
+
+    software, nvd_cves, defender_cves = load_machine_details(machine["device_id"])
+
+    st.markdown(f"### 🖥️ {machine['device_name'] or machine['device_id']}")
+    st.caption(f"Identifiant Defender : {machine['device_id']}")
+
+    a1, a2, a3, a4, a5 = st.columns(5)
+    a1.metric("Système", machine["os_platform"] or "N/A")
+    a2.metric("Version", machine["os_version"] or "N/A")
+    a3.metric("Logiciels", len(software))
+    a4.metric(
+        "CVE (NVD)",
+        len({row["cve_id"] for row in nvd_cves}),
+        help="Logiciels installés comparés aux produits vulnérables NVD."
+    )
+    a5.metric(
+        "CVE (Defender)",
+        len({row["cve_id"] for row in defender_cves}),
+        help="Dernier import Defender (sync_defender.py)."
+    )
+
+    if machine["os_architecture"]:
+        st.caption(f"Architecture : {machine['os_architecture']}")
+
+    tab_sw, tab_nvd_cves, tab_def_cves = st.tabs([
+        f"Logiciels installés ({len(software)})",
+        f"CVE selon NVD ({len({r['cve_id'] for r in nvd_cves})})",
+        f"CVE selon Defender ({len({r['cve_id'] for r in defender_cves})})"
+    ])
+
+    with tab_sw:
+
+        if software:
+            st.dataframe(
+                pd.DataFrame(software).rename(columns={
+                    "software_vendor": "Éditeur",
+                    "software_name": "Logiciel",
+                    "software_version": "Version",
+                    "cpe": "Identifiant CPE",
+                    "end_of_support_status": "Fin de support",
+                    "end_of_support_date": "Date de fin de support",
+                    "nvd_cves": "CVE (NVD)",
+                    "nvd_critical": "dont critiques",
+                    "max_cvss": "CVSS max"
+                }),
+                column_config={"CVSS max": st.column_config.NumberColumn(format="%.1f")},
+                use_container_width=True,
+                hide_index=True
+            )
+
+    with tab_nvd_cves:
+
+        if nvd_cves:
+            st.dataframe(
+                nvd_cves_frame(nvd_cves)[[
+                    "CVE", "Sévérité", "CVSS", "Logiciel", "Version installée",
+                    "Versions vulnérables (NVD)", "Publiée", "CISA KEV",
+                    "Description"
+                ]],
+                column_config=CVSS_COLUMN,
+                use_container_width=True,
+                hide_index=True
+            )
+        else:
+            st.info("Aucune CVE ne touche cette machine selon NVD.")
+
+    with tab_def_cves:
+
+        if defender_cves:
+            st.dataframe(
+                pd.DataFrame(defender_cves).rename(columns={
+                    "cve_id": "CVE",
+                    "software_name": "Logiciel",
+                    "software_version": "Version",
+                    "defender_severity": "Sévérité Defender",
+                    "cvss_score": "CVSS",
+                    "exploitability_level": "Exploitabilité",
+                    "recommended_security_update": "Mise à jour recommandée",
+                    "first_seen_timestamp": "Première détection",
+                    "kev": "CISA KEV"
+                }),
+                column_config=CVSS_COLUMN,
+                use_container_width=True,
+                hide_index=True
+            )
+        else:
+            st.info(
+                "Aucune CVE détectée par Defender sur cette machine "
+                "(ou machine absente du dernier import Defender)."
+            )
+
+
+def render_product_details(product):
+
+    versions, machines, nvd_cves = load_product_details(
+        product["cpe_vendor"], product["cpe_product"]
+    )
+
+    st.markdown(
+        f"### 📦 {product['software_vendor'] or product['cpe_vendor']} — "
+        f"{product['software_name'] or product['cpe_product']}"
+    )
+    st.caption(
+        f"Identifiant CPE : {product['cpe_vendor']}:{product['cpe_product']}"
+    )
+
+    b1, b2, b3, b4 = st.columns(4)
+    b1.metric("Versions installées", len(versions))
+    b2.metric("Machines", len({row["device_id"] for row in machines}))
+    b3.metric("CVE (NVD)", len(nvd_cves))
+    b4.metric(
+        "Machines en fin de support",
+        product["eos_installs"] or 0,
+        help="Machines dont la version installée n'est plus (ou bientôt "
+             "plus) maintenue par l'éditeur, selon Defender."
+    )
+
+    tab_versions, tab_machines, tab_cves = st.tabs([
+        f"Versions ({len(versions)})",
+        f"Machines ({len(machines)})",
+        f"CVE selon NVD ({len(nvd_cves)})"
+    ])
+
+    with tab_versions:
+
+        st.dataframe(
+            pd.DataFrame(versions).rename(columns={
+                "software_version": "Version",
+                "device_count": "Machines",
+                "end_of_support_status": "Fin de support",
+                "end_of_support_date": "Date de fin de support",
+                "nvd_cves": "CVE (NVD)",
+                "max_cvss": "CVSS max"
+            }),
+            column_config={"CVSS max": st.column_config.NumberColumn(format="%.1f")},
+            use_container_width=True,
+            hide_index=True
+        )
+
+    with tab_machines:
+
+        st.dataframe(
+            pd.DataFrame(machines).rename(columns={
+                "device_name": "Machine",
+                "device_id": "Identifiant",
+                "os_platform": "Système",
+                "os_version": "Version OS",
+                "software_version": "Version installée",
+                "end_of_support_status": "Fin de support"
+            }),
+            use_container_width=True,
+            hide_index=True
+        )
+
+    with tab_cves:
+
+        if nvd_cves:
+            st.dataframe(
+                nvd_cves_frame(nvd_cves)[[
+                    "CVE", "Sévérité", "CVSS", "Versions installées touchées",
+                    "Versions vulnérables (NVD)", "Publiée", "CISA KEV",
+                    "Description"
+                ]],
+                column_config=CVSS_COLUMN,
+                use_container_width=True,
+                hide_index=True
+            )
+        else:
+            st.info("Aucune CVE ne touche les versions installées selon NVD.")
+
+
+with tab_inventory:
+
+    st.subheader("Inventaire logiciel")
+
+    st.caption(
+        "Logiciels installés sur chaque machine (import Defender ou CSV, "
+        "onglet Veille) et CVE qui les touchent selon NVD. Sélectionnez une "
+        "ligne pour afficher la fiche complète."
+    )
+
+    inventory_overview = load_inventory_status()
+
+    if not inventory_overview["inventory_rows"]:
+
+        st.info(
+            "Aucun inventaire importé. Onglet Veille > « Équipements touchés "
+            "selon NVD » : « Importer l'inventaire depuis Defender » ou import CSV."
+        )
+
+    else:
+
+        o1, o2, o3, o4 = st.columns(4)
+        o1.metric("Machines", f"{inventory_overview['inventory_devices']:,}".replace(",", " "))
+        o2.metric("Produits distincts", f"{inventory_overview['inventory_products']:,}".replace(",", " "))
+        o3.metric("Logiciels installés", f"{inventory_overview['inventory_rows']:,}".replace(",", " "))
+        o4.metric(
+            "Machines touchées (NVD)",
+            f"{inventory_overview['affected_devices']:,}".replace(",", " ")
+        )
+
+        st.caption(
+            "Inventaire importé le "
+            f"{format_sync_timestamp(inventory_overview['inventory_imported_at'])}"
+        )
+
+        v1, v2 = st.columns([1, 3])
+
+        with v1:
+            inventory_view = st.radio(
+                "Afficher",
+                ["Par machine", "Par produit"],
+                horizontal=True,
+                key="inventory_view"
+            )
+
+        with v2:
+            inventory_tab_search = st.text_input(
+                "Rechercher",
+                placeholder=(
+                    "Nom de machine, OS..." if inventory_view == "Par machine"
+                    else "Éditeur ou produit (ex. microsoft, chrome, openssl)"
+                ),
+                key=f"inventory_tab_search_{inventory_view}"
+            )
+
+        if inventory_view == "Par machine":
+
+            machines = load_inventory_machines(inventory_tab_search.strip())
+
+            st.markdown(f"**{len(machines)} machine(s)**")
+
+            if machines:
+
+                machines_df = pd.DataFrame(machines)
+
+                machine_event = st.dataframe(
+                    machines_df[[
+                        "device_name", "os_platform", "os_version",
+                        "os_architecture", "software_count", "eos_count",
+                        "nvd_cves", "nvd_critical"
+                    ]].rename(columns={
+                        "device_name": "Machine",
+                        "os_platform": "Système",
+                        "os_version": "Version OS",
+                        "os_architecture": "Architecture",
+                        "software_count": "Logiciels",
+                        "eos_count": "En fin de support",
+                        "nvd_cves": "CVE (NVD)",
+                        "nvd_critical": "dont critiques"
+                    }),
+                    use_container_width=True,
+                    hide_index=True,
+                    on_select="rerun",
+                    selection_mode="single-row",
+                    key=f"inventory_machines_table_{inventory_tab_search}"
+                )
+
+                selection = machine_event.selection.rows if machine_event else []
+
+                if selection:
+                    st.divider()
+                    render_machine_details(machines[selection[0]])
+
+        else:
+
+            products = load_inventory_products(inventory_tab_search.strip())
+
+            st.markdown(f"**{len(products)} produit(s)**")
+
+            if products:
+
+                products_df = pd.DataFrame(products)
+                products_df["versions"] = products_df["versions"].fillna("").map(
+                    lambda text: text if len(text) <= 80 else text[:77] + "..."
+                )
+
+                product_event = st.dataframe(
+                    products_df[[
+                        "software_vendor", "software_name", "version_count",
+                        "versions", "device_count", "eos_installs",
+                        "nvd_cves", "nvd_critical"
+                    ]].rename(columns={
+                        "software_vendor": "Éditeur",
+                        "software_name": "Produit",
+                        "version_count": "Versions",
+                        "versions": "Versions installées",
+                        "device_count": "Machines",
+                        "eos_installs": "Machines avec version en fin de support",
+                        "nvd_cves": "CVE (NVD)",
+                        "nvd_critical": "dont critiques"
+                    }),
+                    use_container_width=True,
+                    hide_index=True,
+                    on_select="rerun",
+                    selection_mode="single-row",
+                    key=f"inventory_products_table_{inventory_tab_search}"
+                )
+
+                selection = product_event.selection.rows if product_event else []
+
+                if selection:
+                    st.divider()
+                    render_product_details(products[selection[0]])
 
 
 # =========================================================
@@ -4633,7 +5018,13 @@ with tab_watch:
         total_nvd = sum(row["nvd"] for row in audit_rows)
         total_local = sum(row["local"] for row in audit_rows)
         total_missing = sum(row["missing"] for row in audit_rows)
-        incomplete_days = sum(1 for row in audit_rows if row["missing"])
+        # Rapports antérieurs à l'ajout des colonnes produits : 0.
+        total_unchecked = sum(row.get("unchecked", 0) for row in audit_rows)
+        total_with_cpe = sum(row.get("with_cpe", 0) for row in audit_rows)
+        incomplete_days = sum(
+            1 for row in audit_rows
+            if row["missing"] or row.get("unchecked", 0)
+        )
 
         st.caption(
             f"Dernière vérification : "
@@ -4641,11 +5032,20 @@ with tab_watch:
             f"— {audit_report.get('days')} derniers jours"
         )
 
-        m1, m2, m3, m4 = st.columns(4)
+        m1, m2, m3, m4, m5 = st.columns(5)
         m1.metric("CVE publiées (NVD)", f"{total_nvd:,}")
         m2.metric("CVE dans VulnWatch", f"{total_local:,}")
         m3.metric("CVE manquantes", f"{total_missing:,}")
-        m4.metric("Jours incomplets", incomplete_days)
+        m4.metric(
+            "Produits NVD à compléter",
+            f"{total_unchecked:,}",
+            help="CVE présentes mais dont les produits vulnérables NVD "
+                 "n'ont jamais été récupérés (importées avant cette "
+                 "fonctionnalité). « Rattraper » les complète. "
+                 f"{total_with_cpe:,} CVE de la période ont leurs produits ; "
+                 "les autres ne sont pas encore analysées par NVD."
+        )
+        m5.metric("Jours incomplets", incomplete_days)
 
         if audit_report.get("fixed"):
 
@@ -4653,27 +5053,48 @@ with tab_watch:
 
             st.info(
                 f"Rattrapage : {audit_report.get('recovered', 0)} CVE "
-                f"ajoutée(s), dont {len(on_parc)} présente(s) sur le parc"
+                f"ajoutée(s), {audit_report.get('completed', 0)} complétée(s) "
+                f"avec leurs produits NVD, dont {len(on_parc)} nouvelle(s) "
+                f"présente(s) sur le parc"
                 + (f" : {', '.join(on_parc[:20])}" if on_parc else "")
                 + (" ..." if len(on_parc) > 20 else "")
             )
 
-        if total_missing == 0:
+        if total_missing == 0 and total_unchecked == 0:
             st.success("✅ La base est à jour avec NVD sur cette période.")
 
         audit_df = pd.DataFrame(list(reversed(audit_rows)))
-        audit_df["state"] = audit_df["missing"].map(
-            lambda missing: "✅ Complet" if missing == 0
-            else f"⚠️ {missing} manquante(s)"
-        )
+
+        for column in ("with_cpe", "unchecked"):
+            if column not in audit_df:
+                audit_df[column] = 0
+
+        def audit_state(row):
+
+            problems = []
+
+            if row["missing"]:
+                problems.append(f"⚠️ {row['missing']} manquante(s)")
+
+            if row["unchecked"]:
+                problems.append(f"🧩 {row['unchecked']} à compléter")
+
+            return " · ".join(problems) or "✅ Complet"
+
+        audit_df["state"] = audit_df.apply(audit_state, axis=1)
 
         st.dataframe(
-            audit_df[["day", "nvd", "local", "missing", "state"]].rename(
+            audit_df[[
+                "day", "nvd", "local", "missing", "with_cpe", "unchecked",
+                "state"
+            ]].rename(
                 columns={
                     "day": "Date de publication (UTC)",
                     "nvd": "NVD",
                     "local": "VulnWatch",
                     "missing": "Manquantes",
+                    "with_cpe": "Avec produits NVD",
+                    "unchecked": "Produits à compléter",
                     "state": "État"
                 }
             ),
@@ -4721,17 +5142,9 @@ with tab_watch:
         f"· calcul du {format_sync_timestamp(get_inventory_matched_at())}"
     )
 
-    if inventory_status["total_cves"] and (
-        inventory_status["cves_with_cpe"] < inventory_status["total_cves"] * 0.5
-    ):
-        st.warning(
-            "Peu de CVE ont leurs produits vulnérables en base : les CVE "
-            "importées avant cette fonctionnalité n'en ont pas. Réimportez "
-            "vos fichiers NVD (« Import manuel d'un fichier NVD » ci-dessus) "
-            "ou utilisez « Télécharger les produits NVD » ci-dessous."
-        )
+    cpe_unchecked, cpe_oldest = load_cpe_unchecked()
 
-    inv_col1, inv_col2, inv_col3 = st.columns(3)
+    inv_col1, inv_col2 = st.columns(2)
 
     with inv_col1:
 
@@ -4757,33 +5170,69 @@ with tab_watch:
         ):
             launch_job("nvd_match.py")
 
-    with inv_col3:
+    # Complément ponctuel de l'historique : les CVE importées avant
+    # l'enregistrement des produits NVD n'en ont pas. « Rattraper » (état
+    # de la base NVD) ne couvre que 120 jours ; au-delà, ce bouton (ou un
+    # réimport des fichiers NVD). Masqué une fois l'historique complété :
+    # la synchro quotidienne enregistre ensuite les produits elle-même.
+    if cpe_unchecked or is_job_running("nvd_cpe_sync"):
 
-        cpe_since = st.date_input(
-            "Produits NVD des CVE publiées depuis",
-            value=date(2018, 1, 1),
-            format="DD/MM/YYYY",
-            key="inventory_cpe_since"
+        st.warning(
+            f"{cpe_unchecked:,} CVE".replace(",", " ")
+            + (f" (publiées depuis le {str(cpe_oldest)[:10]})" if cpe_oldest else "")
+            + " n'ont pas encore leurs produits vulnérables NVD : elles ne "
+            "peuvent pas être reliées à l'inventaire. Le plus rapide : "
+            "réimporter vos fichiers NVD (« Import manuel d'un fichier NVD » "
+            "ci-dessus). Sinon, téléchargement depuis l'API NVD ci-dessous "
+            "(une seule fois, reprend là où il s'est arrêté)."
         )
 
-        if st.button(
-            "Télécharger les produits NVD",
-            use_container_width=True,
-            disabled=is_job_running("nvd_cpe_sync"),
-            key="inventory_cpe_button",
-            help="Télécharge depuis l'API NVD les fiches des CVE publiées "
-                 "depuis cette date pour enregistrer leurs produits "
-                 "vulnérables. Reprend là où il s'était arrêté."
-        ):
-            env = os.environ.copy()
-            env["VULNWATCH_CPE_SINCE"] = cpe_since.isoformat()
+        cpe_col1, cpe_col2 = st.columns([1, 2])
 
-            cpe_key = get_nvd_api_key()
+        with cpe_col1:
 
-            if cpe_key:
-                env["VULNWATCH_NVD_API_KEY"] = cpe_key
+            default_since = date(2018, 1, 1)
 
-            launch_job("nvd_cpe_sync.py", env=env)
+            try:
+                default_since = max(
+                    date.fromisoformat(str(cpe_oldest)[:10]), default_since
+                ) if cpe_oldest else default_since
+            except ValueError:
+                pass
+
+            cpe_since = st.date_input(
+                "CVE publiées depuis",
+                value=default_since,
+                format="DD/MM/YYYY",
+                key="inventory_cpe_since"
+            )
+
+        with cpe_col2:
+
+            st.write("")
+
+            if st.button(
+                "Télécharger les produits NVD",
+                use_container_width=True,
+                disabled=is_job_running("nvd_cpe_sync"),
+                key="inventory_cpe_button"
+            ):
+                env = os.environ.copy()
+                env["VULNWATCH_CPE_SINCE"] = cpe_since.isoformat()
+
+                cpe_key = get_nvd_api_key()
+
+                if cpe_key:
+                    env["VULNWATCH_NVD_API_KEY"] = cpe_key
+
+                launch_job("nvd_cpe_sync.py", env=env)
+
+    else:
+
+        st.caption(
+            "✅ Produits vulnérables NVD récupérés pour toutes les CVE "
+            "(la synchro quotidienne les tient à jour)."
+        )
 
     render_job("sync_software_inventory")
     render_job("nvd_match")

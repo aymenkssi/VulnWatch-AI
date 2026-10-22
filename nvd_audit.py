@@ -7,8 +7,13 @@ sans télécharger les CVE) avec le nombre de CVE de la base publiées ce
 jour-là. Le rapport est enregistré en base et affiché dans l'onglet
 Veille.
 
-Avec VULNWATCH_AUDIT_FIX=1, les jours incomplets sont ensuite
-retéléchargés (CVE publiées ce jour-là) et enregistrés, puis recomptés.
+Pour chaque jour, le rapport indique aussi combien de CVE ont leurs
+produits vulnérables NVD (CPE) et combien sont "à compléter" (importées
+avant l'enregistrement des produits).
+
+Avec VULNWATCH_AUDIT_FIX=1, les jours incomplets (CVE manquantes ou à
+compléter) sont retéléchargés (CVE publiées ce jour-là) et enregistrés
+avec leurs produits, puis recomptés.
 Le rattrapage n'envoie pas d'alerte e-mail (il peut ramener beaucoup de
 CVE d'un coup) : les CVE rattrapées présentes sur le parc sont listées
 dans le rapport et visibles dans l'onglet Veille.
@@ -77,6 +82,7 @@ def _count_nvd_by_day(days, step, total_steps):
 def _build_rows(days, nvd_counts):
 
     local_counts = count_cves_by_published_day(days[0], days[-1])
+    empty = {"total": 0, "with_cpe": 0, "unchecked": 0}
 
     rows = []
 
@@ -84,13 +90,15 @@ def _build_rows(days, nvd_counts):
 
         key = day.isoformat()
         nvd = nvd_counts[key]
-        local = local_counts.get(key, 0)
+        local = local_counts.get(key, empty)
 
         rows.append({
             "day": key,
             "nvd": nvd,
-            "local": local,
-            "missing": max(nvd - local, 0)
+            "local": local["total"],
+            "missing": max(nvd - local["total"], 0),
+            "with_cpe": local["with_cpe"],
+            "unchecked": local["unchecked"]
         })
 
     return rows
@@ -123,14 +131,16 @@ def main():
     nvd_counts, step = _count_nvd_by_day(days, step, total_steps)
 
     rows = _build_rows(days, nvd_counts)
-    gaps = [row for row in rows if row["missing"] > 0]
+    gaps = [row for row in rows if row["missing"] > 0 or row["unchecked"] > 0]
 
     print(
         f"{len(gaps)} jour(s) incomplet(s), "
-        f"{sum(row['missing'] for row in rows)} CVE manquante(s)"
+        f"{sum(row['missing'] for row in rows)} CVE manquante(s), "
+        f"{sum(row['unchecked'] for row in rows)} CVE à compléter (produits)"
     )
 
     recovered = 0
+    completed = 0
     recovered_on_parc = []
 
     if FIX and gaps:
@@ -140,7 +150,8 @@ def main():
             report_progress(
                 step,
                 total_steps,
-                f"Rattrapage du {row['day']} ({row['missing']} manquante(s))",
+                f"Rattrapage du {row['day']} ({row['missing']} manquante(s), "
+                f"{row['unchecked']} à compléter)",
                 force=True
             )
 
@@ -156,9 +167,14 @@ def main():
             bulk_save_nvd_discoveries(discoveries)
 
             recovered += len(new_ids)
+            completed += row["unchecked"]
+
+            # Produits désormais connus pour toutes les CVE du jour :
+            # équipements touchés selon NVD recalculés pour elles.
+            on_parc_inventory = refresh_matches_for_cves(ids)
 
             on_parc = set(get_cve_ids_present_in_defender(new_ids))
-            on_parc |= refresh_matches_for_cves(new_ids)
+            on_parc |= on_parc_inventory & set(new_ids)
             recovered_on_parc.extend(on_parc)
 
             print(f"  {row['day']} : {len(new_ids)} CVE rattrapée(s)")
@@ -177,6 +193,7 @@ def main():
         "days": AUDIT_DAYS,
         "fixed": FIX,
         "recovered": recovered,
+        "completed": completed,
         "recovered_on_parc": sorted(recovered_on_parc),
         "rows": rows
     }
@@ -189,8 +206,11 @@ def main():
     print(f"  CVE en base             : {sum(r['local'] for r in rows)}")
     print(f"  CVE manquantes          : {sum(r['missing'] for r in rows)}")
 
+    print(f"  CVE à compléter         : {sum(r['unchecked'] for r in rows)}")
+
     if FIX:
         print(f"  CVE rattrapées          : {recovered}")
+        print(f"  CVE complétées (produits): {completed}")
         print(f"  dont présentes sur le parc : {len(recovered_on_parc)}")
 
     print()
