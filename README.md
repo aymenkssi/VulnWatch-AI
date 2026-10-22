@@ -68,6 +68,7 @@ Variables d'environnement (fichier `.env` possible, non versionné) :
 |---|---|---|
 | `VULNWATCH_ADMIN_USER` | `admin` | Identifiant administrateur initial |
 | `VULNWATCH_ADMIN_PASSWORD` | généré | Mot de passe initial (affiché une seule fois s'il est généré) |
+| `VULNWATCH_SESSION_DAYS` | `30` | Durée de la connexion conservée dans le navigateur (jours), jusqu'à « Se déconnecter » |
 | `VULNWATCH_NVD_API_KEY` | — | Clé API NVD (aussi configurable dans l'interface) |
 | `VULNWATCH_NVD_DELAY` | `6` | Délai (s) entre deux appels NVD |
 | `VULNWATCH_MAX_CVES` | `10` | CVE enrichies par passage NVD |

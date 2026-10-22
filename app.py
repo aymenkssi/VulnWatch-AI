@@ -7,6 +7,7 @@ from datetime import date, datetime, timezone, timedelta
 import pandas as pd
 import plotly.express as px
 import streamlit as st
+import streamlit.components.v1 as components
 
 from services.jobs import (
     start_job,
@@ -24,6 +25,10 @@ from database import (
     get_pending_nvd_count,
     ensure_admin_seeded,
     verify_admin_credentials,
+    create_auth_session,
+    get_auth_session_user,
+    delete_auth_session,
+    AUTH_SESSION_DAYS,
     set_admin_credentials,
     get_notification_delays,
     set_notification_delay,
@@ -138,9 +143,68 @@ if _seeded_admin:
 # AUTHENTIFICATION
 # =========================================================
 
+# Connexion conservée après un rafraîchissement de la page : jeton de
+# session dans un cookie (voir create_auth_session dans database.py).
+SESSION_COOKIE = "vulnwatch_session"
+
+
+def _write_session_cookie(token, max_age_seconds):
+    """
+    Pose (ou efface, max_age_seconds=0) le cookie de session dans le
+    navigateur. Streamlit ne sait que LIRE les cookies
+    (st.context.cookies) : l'écriture passe par un petit script dans un
+    composant invisible, qui écrit sur la page parente (même origine).
+    """
+
+    components.html(
+        "<script>"
+        f"window.parent.document.cookie = '{SESSION_COOKIE}={token}; "
+        f"path=/; max-age={int(max_age_seconds)}; SameSite=Strict';"
+        "</script>",
+        height=0
+    )
+
+
+def logout():
+
+    delete_auth_session(st.session_state.get("session_token"))
+
+    for key in ("authenticated", "authenticated_username", "session_token"):
+        st.session_state.pop(key, None)
+
+    # Le cookie est effacé à l'affichage de la page de connexion.
+    st.session_state["clear_session_cookie"] = True
+
+
 def authenticate():
+
     if st.session_state.get("authenticated", False):
+
+        # Cookie à poser juste après la connexion (le st.rerun() qui suit
+        # le formulaire ne laisse pas le temps au navigateur de le faire).
+        pending_token = st.session_state.pop("pending_session_cookie", None)
+
+        if pending_token:
+            _write_session_cookie(pending_token, AUTH_SESSION_DAYS * 86400)
+
         return True
+
+    if st.session_state.pop("clear_session_cookie", False):
+
+        _write_session_cookie("", 0)
+
+    else:
+
+        # Page rafraîchie / nouvel onglet : on reprend la session du
+        # cookie si elle est toujours valide.
+        token = st.context.cookies.get(SESSION_COOKIE)
+        username = get_auth_session_user(token)
+
+        if username:
+            st.session_state["authenticated"] = True
+            st.session_state["authenticated_username"] = username
+            st.session_state["session_token"] = token
+            return True
 
     st.title("🛡️ VulnWatch AI")
     st.subheader("Connexion")
@@ -169,8 +233,11 @@ def authenticate():
     if submitted:
 
         if verify_admin_credentials(username, password):
+            token = create_auth_session(username)
             st.session_state["authenticated"] = True
             st.session_state["authenticated_username"] = username
+            st.session_state["session_token"] = token
+            st.session_state["pending_session_cookie"] = token
             st.session_state.pop("login_username", None)
             st.session_state.pop("login_password", None)
             st.rerun()
@@ -1514,7 +1581,7 @@ with st.sidebar:
     st.success(f"Connecté en tant que {current_username}")
 
     if st.button("Se déconnecter", use_container_width=True):
-        st.session_state["authenticated"] = False
+        logout()
         st.rerun()
 
     st.write("Plateforme de renseignement sécurité")
@@ -1588,7 +1655,8 @@ with st.sidebar:
                     "Merci de vous reconnecter."
                 )
 
-                st.session_state["authenticated"] = False
+                # set_admin_credentials() a supprimé toutes les sessions.
+                logout()
 
                 st.rerun()
 

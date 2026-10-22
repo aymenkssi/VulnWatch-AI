@@ -506,6 +506,20 @@ def initialize_database():
 
 
     # =====================================================
+    # AUTH SESSIONS (connexion conservée après rafraîchissement)
+    # =====================================================
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS auth_sessions (
+            token_hash TEXT PRIMARY KEY,
+            username TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL
+        )
+    """)
+
+
+    # =====================================================
     # INDEX
     # =====================================================
     #
@@ -1566,6 +1580,116 @@ def set_admin_credentials(
     set_app_config("admin_username", username)
     set_app_config("admin_password_salt", salt.hex())
     set_app_config("admin_password_hash", password_hash)
+
+    # Nouveaux identifiants : toutes les sessions ouvertes (autres
+    # navigateurs, postes) doivent se reconnecter.
+    delete_all_auth_sessions()
+
+
+# =========================================================
+# SESSIONS DE CONNEXION
+# =========================================================
+#
+# Streamlit perd st.session_state à chaque rafraîchissement de la page
+# (nouvelle session côté serveur) : sans ceci, il fallait se
+# reconnecter à chaque F5. À la connexion, un jeton aléatoire est
+# déposé dans un cookie du navigateur ; seule son empreinte SHA-256 est
+# stockée ici, avec une date d'expiration. "Se déconnecter" et un
+# changement d'identifiants suppriment la session.
+
+AUTH_SESSION_DAYS = int(os.getenv("VULNWATCH_SESSION_DAYS", "30"))
+
+
+def _token_hash(token):
+
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def create_auth_session(username):
+    """Crée une session et retourne le jeton à mettre dans le cookie."""
+
+    token = secrets.token_urlsafe(32)
+    now = datetime.now(timezone.utc)
+
+    conn = get_connection()
+
+    conn.execute(
+        "DELETE FROM auth_sessions WHERE expires_at < ?",
+        (now.isoformat(),)
+    )
+
+    conn.execute(
+        """
+        INSERT INTO auth_sessions (token_hash, username, created_at, expires_at)
+        VALUES (?, ?, ?, ?)
+        """,
+        (
+            _token_hash(token),
+            username,
+            now.isoformat(),
+            (now + timedelta(days=AUTH_SESSION_DAYS)).isoformat()
+        )
+    )
+
+    conn.commit()
+    conn.close()
+
+    return token
+
+
+def get_auth_session_user(token):
+    """
+    Nom d'utilisateur de la session si le jeton est valide (connu, non
+    expiré, et toujours celui du compte admin actuel), sinon None.
+    """
+
+    if not token:
+        return None
+
+    conn = get_connection()
+
+    row = conn.execute(
+        "SELECT username, expires_at FROM auth_sessions WHERE token_hash = ?",
+        (_token_hash(token),)
+    ).fetchone()
+
+    conn.close()
+
+    if not row:
+        return None
+
+    if row["expires_at"] < datetime.now(timezone.utc).isoformat():
+        delete_auth_session(token)
+        return None
+
+    creds = get_admin_credentials()
+
+    if creds is None or not hmac.compare_digest(row["username"], creds["username"]):
+        return None
+
+    return row["username"]
+
+
+def delete_auth_session(token):
+
+    if not token:
+        return
+
+    conn = get_connection()
+    conn.execute(
+        "DELETE FROM auth_sessions WHERE token_hash = ?",
+        (_token_hash(token),)
+    )
+    conn.commit()
+    conn.close()
+
+
+def delete_all_auth_sessions():
+
+    conn = get_connection()
+    conn.execute("DELETE FROM auth_sessions")
+    conn.commit()
+    conn.close()
 
 
 def verify_admin_credentials(
