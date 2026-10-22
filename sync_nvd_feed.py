@@ -14,8 +14,11 @@ from database import (
     is_smtp_configured,
     get_known_cve_ids,
     get_nvd_feed_cursor,
-    set_nvd_feed_cursor
+    set_nvd_feed_cursor,
+    get_cve_details,
+    get_inventory_devices_for_cve
 )
+from services.inventory_matcher import refresh_matches_for_cves
 from collectors.nvd import fetch_recent_nvd_cves
 from services.mailer import send_email
 from services.ai_engine import generate_watch_alert_email
@@ -105,10 +108,34 @@ def _send_match_alert(cve_id, recipient_emails):
 
     detection = get_detection_context_for_cve(cve_id)
 
-    if detection is None:
-        return False, [f"{cve_id} : aucune donnée d'exposition trouvée"]
+    if detection is not None:
 
-    devices = get_devices_for_cve(cve_id)
+        devices = get_devices_for_cve(cve_id)
+
+    else:
+
+        # Pas (encore) vue par Defender : machines trouvées par la
+        # comparaison inventaire logiciel x produits vulnérables NVD.
+        devices = get_inventory_devices_for_cve(cve_id)
+        details = get_cve_details(cve_id)
+
+        if not devices or not details:
+            return False, [f"{cve_id} : aucune donnée d'exposition trouvée"]
+
+        detection = {
+            "cve_id": cve_id,
+            "vulnerability_name": details.get("vulnerability_name"),
+            "cisa_source": details.get("source"),
+            "cisa_priority": details.get("priority"),
+            "nvd_cvss_v3_score": (
+                details.get("cvss_v3_score") or details.get("cvss_v4_score")
+            ),
+            "defender_severity": (
+                details.get("cvss_v3_severity") or details.get("cvss_v4_severity")
+            ),
+            "software_vendor": devices[0].get("software_vendor"),
+            "software_name": devices[0].get("software_name")
+        }
 
     email = generate_watch_alert_email(detection, devices)
 
@@ -275,12 +302,20 @@ def main():
                 force=True
             )
 
-            new_matches = get_cve_ids_present_in_defender(new_ids)
+            # Machines touchées : selon Defender, et selon la comparaison
+            # de l'inventaire logiciel avec les produits vulnérables NVD
+            # (utile quand Defender n'a pas encore intégré la CVE).
+            inventory_matches = refresh_matches_for_cves(published_ids)
+
+            new_matches = sorted(
+                set(get_cve_ids_present_in_defender(new_ids))
+                | (inventory_matches & set(new_ids))
+            )
             matches_total += len(new_matches)
 
             print(
-                f"    {len(new_matches)} nouvelle(s) correspondance(s) "
-                "dans l'inventaire XDR"
+                f"    {len(new_matches)} nouvelle(s) CVE touchant le parc "
+                "(Defender ou inventaire x NVD)"
             )
 
             sent, errors = _send_alerts(new_matches)
@@ -303,6 +338,9 @@ def main():
             )
 
             bulk_save_nvd_discoveries(modified)
+
+            # Produits vulnérables éventuellement corrigés par NVD.
+            refresh_matches_for_cves([cve_id for cve_id, _ in modified])
 
             modified_total += len(modified)
 
@@ -328,15 +366,15 @@ def main():
     print(f"  CVE NVD publiées          : {published_total}")
     print(f"  Nouvelles en base         : {new_total}")
     print(f"  CVE modifiées mises à jour: {modified_total}")
-    print(f"  Correspondances XDR       : {matches_total}")
+    print(f"  CVE touchant le parc      : {matches_total}")
     print(f"  Alertes envoyées          : {alerts_sent}")
     print(f"  Erreurs d'envoi           : {len(alert_errors)}")
     print()
 
     detail = (
         f"{published_total} CVE NVD ({new_total} nouvelles, "
-        f"{modified_total} modifiées) / {matches_total} correspondance(s) "
-        f"XDR / {alerts_sent} alerte(s) envoyée(s)"
+        f"{modified_total} modifiées) / {matches_total} touchant le parc / "
+        f"{alerts_sent} alerte(s) envoyée(s)"
         + (f" / {len(alert_errors)} erreur(s)" if alert_errors else "")
     )
 

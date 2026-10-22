@@ -9,6 +9,7 @@ import plotly.express as px
 import streamlit as st
 import streamlit.components.v1 as components
 
+from services.inventory_matcher import get_inventory_matched_at
 from services.jobs import (
     start_job,
     get_job,
@@ -55,6 +56,10 @@ from database import (
     get_watch_alert_history,
     get_nvd_api_key,
     get_nvd_audit_report,
+    get_inventory_status,
+    get_inventory_matched_cves,
+    get_inventory_devices_for_cve,
+    get_inventory_device_count,
     search_nvd_cves,
     get_cve_details,
     get_app_config,
@@ -71,7 +76,6 @@ from database import (
 from services.mailer import send_test_email, send_email, SmtpNotConfigured
 from services.ai_engine import generate_watch_alert_email
 from collectors.hexiosec import test_connection as hexiosec_test_connection
-from collectors.nvd import parse_nvd_feed_bytes
 import collectors.nvd as nvd_collector
 
 
@@ -352,7 +356,11 @@ JOB_LABELS = {
     "notify.py": "Notifications e-mail",
     "sync_hexiosec.py": "Synchronisation Hexiosec ASM",
     "sync_nvd_feed.py": "Synchronisation NVD",
-    "nvd_audit.py": "Vérification de la base NVD"
+    "nvd_audit.py": "Vérification de la base NVD",
+    "sync_software_inventory.py": "Import de l'inventaire logiciel",
+    "nvd_match.py": "Calcul des équipements touchés (NVD)",
+    "nvd_import_files.py": "Import de fichiers NVD",
+    "nvd_cpe_sync.py": "Téléchargement des produits vulnérables NVD"
 }
 
 
@@ -719,6 +727,46 @@ def auto_sync_nvd_feed_if_needed():
 
 
 auto_sync_nvd_feed_if_needed()
+
+
+# =========================================================
+# AUTOMATIC SOFTWARE INVENTORY (Defender, chaque jour)
+# =========================================================
+#
+# Réimporte chaque jour l'inventaire logiciel depuis Defender puis
+# recalcule les équipements touchés selon NVD — uniquement si le dernier
+# import réussi venait de l'API Defender (pas pour un inventaire chargé
+# par fichier CSV, qui serait sinon remplacé ou ferait échouer la
+# synchro chaque jour faute d'accès à l'API).
+
+AUTO_INVENTORY_INTERVAL_HOURS = 24
+
+
+def auto_sync_software_inventory_if_needed():
+
+    state = get_sync_state("software_inventory")
+
+    if not state or not str(state.get("detail") or "").startswith("Defender"):
+        return
+
+    try:
+        last_run = datetime.fromisoformat(state["last_run_at"])
+    except (TypeError, ValueError):
+        return
+
+    if last_run.tzinfo is None:
+        last_run = last_run.replace(tzinfo=timezone.utc)
+
+    if datetime.now(timezone.utc) - last_run >= timedelta(
+        hours=AUTO_INVENTORY_INTERVAL_HOURS
+    ):
+        launch_background_sync(
+            "sync_software_inventory.py",
+            timedelta(hours=AUTO_INVENTORY_INTERVAL_HOURS)
+        )
+
+
+auto_sync_software_inventory_if_needed()
 
 
 # =========================================================
@@ -2825,6 +2873,33 @@ def load_nvd_record(cve_id, api_key):
     return nvd_collector.describe_nvd_record(record) if record else None
 
 
+INVENTORY_DEVICE_COLUMNS = {
+    "device_name": "Équipement",
+    "os_platform": "OS",
+    "os_version": "Version OS",
+    "software_vendor": "Éditeur",
+    "software_name": "Logiciel",
+    "software_version": "Version installée",
+    "rule": "Versions vulnérables (NVD)",
+    "end_of_support_status": "Fin de support"
+}
+
+
+@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
+def load_inventory_devices_for_cve(cve_id):
+    return get_inventory_devices_for_cve(cve_id)
+
+
+@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
+def load_inventory_matched_cves(search):
+    return get_inventory_matched_cves(search=search or None, limit=500)
+
+
+@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
+def load_inventory_status():
+    return get_inventory_status()
+
+
 def format_nvd_date(value):
 
     if not value:
@@ -2850,7 +2925,9 @@ def render_nvd_cve_details(cve_id):
 
     severity = details.get("cvss_v3_severity") or details.get("cvss_v4_severity")
 
-    c1, c2, c3, c4, c5 = st.columns(5)
+    inventory_devices = get_inventory_device_count(cve_id)
+
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
     c1.metric(
         "Sévérité",
         NVD_SEVERITY_LABELS.get(str(severity or "NONE").upper(), severity)
@@ -2865,8 +2942,20 @@ def render_nvd_cve_details(cve_id):
         f"{details['cvss_v4_score']:.1f}"
         if details.get("cvss_v4_score") is not None else "N/A"
     )
-    c4.metric("Équipements touchés", details.get("parc_devices") or 0)
+    c4.metric(
+        "Équipements (Defender)",
+        details.get("parc_devices") or 0,
+        help="Machines où Microsoft Defender a détecté cette CVE "
+             "(catalogue Defender, dernier import Defender)."
+    )
     c5.metric(
+        "Équipements (NVD)",
+        inventory_devices,
+        help="Machines dont un logiciel installé correspond aux produits "
+             "et versions vulnérables déclarés par NVD (inventaire "
+             "logiciel x NVD, onglet Veille)."
+    )
+    c6.metric(
         "Catalogue CISA KEV",
         "Oui" if details.get("source") == "CISA KEV" else "Non"
     )
@@ -2925,10 +3014,24 @@ def render_nvd_cve_details(cve_id):
                 f"{format_nvd_date(details.get('ai_generated_at'))}"
             )
 
+    if inventory_devices:
+
+        with st.expander(
+            f"Équipements touchés selon NVD ({inventory_devices})"
+        ):
+
+            st.dataframe(
+                pd.DataFrame(load_inventory_devices_for_cve(cve_id)).rename(
+                    columns=INVENTORY_DEVICE_COLUMNS
+                ),
+                use_container_width=True,
+                hide_index=True
+            )
+
     if details.get("parc_devices"):
 
         with st.expander(
-            f"Équipements touchés sur le parc ({details['parc_devices']})"
+            f"Équipements touchés selon Defender ({details['parc_devices']})"
         ):
 
             devices = load_devices_for_cve(cve_id)
@@ -4558,6 +4661,230 @@ with tab_watch:
     st.divider()
 
     # -----------------------------------------------------
+    # Équipements touchés selon NVD (inventaire logiciel x CPE NVD)
+    # -----------------------------------------------------
+
+    st.markdown("#### Équipements touchés selon NVD (inventaire logiciel)")
+
+    st.caption(
+        "VulnWatch compare lui-même les logiciels installés sur chaque "
+        "machine aux produits et versions déclarés vulnérables par NVD "
+        "(référence : la base NVD), sans attendre que Defender ait intégré "
+        "la CVE. Calcul refait après chaque import d'inventaire, et pour "
+        "chaque nouvelle CVE à la synchro NVD (alerte de veille incluse)."
+    )
+
+    inventory_status = load_inventory_status()
+
+    i1, i2, i3, i4 = st.columns(4)
+    i1.metric("Machines inventoriées", f"{inventory_status['inventory_devices']:,}".replace(",", " "))
+    i2.metric("Logiciels installés", f"{inventory_status['inventory_rows']:,}".replace(",", " "))
+    i3.metric(
+        "CVE avec produits NVD",
+        f"{inventory_status['cves_with_cpe']:,}".replace(",", " "),
+        help="CVE pour lesquelles VulnWatch connaît les produits vulnérables "
+             "(configurations CPE NVD). Les autres ne peuvent pas être "
+             "reliées à l'inventaire."
+    )
+    i4.metric(
+        "CVE touchant le parc",
+        f"{inventory_status['matched_cves']:,}".replace(",", " "),
+        help=f"{inventory_status['affected_devices']} machine(s) concernée(s)."
+    )
+
+    st.caption(
+        f"Inventaire importé le "
+        f"{format_sync_timestamp(inventory_status['inventory_imported_at'])} "
+        f"· calcul du {format_sync_timestamp(get_inventory_matched_at())}"
+    )
+
+    if inventory_status["total_cves"] and (
+        inventory_status["cves_with_cpe"] < inventory_status["total_cves"] * 0.5
+    ):
+        st.warning(
+            "Peu de CVE ont leurs produits vulnérables en base : les CVE "
+            "importées avant cette fonctionnalité n'en ont pas. Réimportez "
+            "vos fichiers NVD (« Import manuel d'un fichier NVD » ci-dessus) "
+            "ou utilisez « Télécharger les produits NVD » ci-dessous."
+        )
+
+    inv_col1, inv_col2, inv_col3 = st.columns(3)
+
+    with inv_col1:
+
+        if st.button(
+            "Importer l'inventaire depuis Defender",
+            use_container_width=True,
+            type="primary",
+            disabled=is_job_running("sync_software_inventory"),
+            key="inventory_defender_button",
+            help="Export SoftwareInventoryExport de l'API Defender (Azure "
+                 "CLI connecté, permission Software.Read.All). Réimporté "
+                 "ensuite automatiquement chaque jour."
+        ):
+            launch_job("sync_software_inventory.py")
+
+    with inv_col2:
+
+        if st.button(
+            "Recalculer les équipements touchés",
+            use_container_width=True,
+            disabled=is_job_running("nvd_match"),
+            key="inventory_match_button"
+        ):
+            launch_job("nvd_match.py")
+
+    with inv_col3:
+
+        cpe_since = st.date_input(
+            "Produits NVD des CVE publiées depuis",
+            value=date(2018, 1, 1),
+            format="DD/MM/YYYY",
+            key="inventory_cpe_since"
+        )
+
+        if st.button(
+            "Télécharger les produits NVD",
+            use_container_width=True,
+            disabled=is_job_running("nvd_cpe_sync"),
+            key="inventory_cpe_button",
+            help="Télécharge depuis l'API NVD les fiches des CVE publiées "
+                 "depuis cette date pour enregistrer leurs produits "
+                 "vulnérables. Reprend là où il s'était arrêté."
+        ):
+            env = os.environ.copy()
+            env["VULNWATCH_CPE_SINCE"] = cpe_since.isoformat()
+
+            cpe_key = get_nvd_api_key()
+
+            if cpe_key:
+                env["VULNWATCH_NVD_API_KEY"] = cpe_key
+
+            launch_job("nvd_cpe_sync.py", env=env)
+
+    render_job("sync_software_inventory")
+    render_job("nvd_match")
+    render_job("nvd_cpe_sync")
+
+    with st.expander("Importer un inventaire CSV (export du portail Defender)"):
+
+        st.caption(
+            "Portail Microsoft Defender > Gestion des vulnérabilités > "
+            "Inventaire logiciel > Exporter (colonnes DeviceId, DeviceName, "
+            "OSPlatform, SoftwareVendor, SoftwareName, SoftwareVersion, "
+            "ProductCodeCpe...). Remplace l'inventaire actuel."
+        )
+
+        inventory_csv = st.file_uploader(
+            "Fichier CSV d'inventaire",
+            type=["csv"],
+            key="inventory_csv_upload"
+        )
+
+        if inventory_csv and st.button(
+            "Importer le CSV",
+            use_container_width=True,
+            disabled=is_job_running("sync_software_inventory"),
+            key="inventory_csv_button"
+        ):
+            upload_dir = Path("data/imports")
+            upload_dir.mkdir(parents=True, exist_ok=True)
+
+            csv_target = upload_dir / "software_inventory_upload.csv"
+            csv_target.write_bytes(inventory_csv.getvalue())
+
+            env = os.environ.copy()
+            env["VULNWATCH_INVENTORY_CSV"] = str(csv_target.resolve())
+
+            launch_job("sync_software_inventory.py", env=env)
+
+    inventory_search = st.text_input(
+        "Rechercher dans les CVE touchant le parc (selon NVD)",
+        placeholder="CVE, mot-clé, éditeur ou produit (ex. chrome, fortinet)",
+        key="inventory_search"
+    )
+
+    inventory_cves = load_inventory_matched_cves(inventory_search.strip())
+
+    if not inventory_cves:
+
+        st.info(
+            "Aucune CVE ne touche le parc selon NVD pour le moment "
+            "(inventaire non importé, produits NVD manquants, ou aucune "
+            "correspondance)."
+        )
+
+    else:
+
+        inventory_df = pd.DataFrame(inventory_cves)
+        inventory_df["severity"] = inventory_df["severity"].map(
+            lambda value: NVD_SEVERITY_LABELS.get(
+                str(value or "NONE").upper(), value
+            )
+        )
+        inventory_df["nvd_published"] = inventory_df["nvd_published"].map(
+            format_nvd_date
+        )
+        inventory_df["source"] = inventory_df["source"].eq("CISA KEV").map(
+            {True: "Oui", False: ""}
+        )
+
+        inventory_event = st.dataframe(
+            inventory_df[[
+                "cve_id", "nvd_published", "severity", "cvss",
+                "affected_devices", "defender_devices", "source", "products"
+            ]].rename(columns={
+                "cve_id": "CVE",
+                "nvd_published": "Publiée",
+                "severity": "Sévérité",
+                "cvss": "CVSS",
+                "affected_devices": "Machines (NVD)",
+                "defender_devices": "Machines (Defender)",
+                "source": "CISA KEV",
+                "products": "Produits concernés"
+            }),
+            column_config={
+                "CVSS": st.column_config.NumberColumn(format="%.1f")
+            },
+            use_container_width=True,
+            hide_index=True,
+            on_select="rerun",
+            selection_mode="single-row",
+            key="inventory_cves_table"
+        )
+
+        inventory_selected = (
+            inventory_event.selection.rows if inventory_event else []
+        )
+
+        if inventory_selected:
+
+            selected_inventory_cve = inventory_cves[inventory_selected[0]]["cve_id"]
+
+            st.markdown(
+                f"**{selected_inventory_cve}** — machines touchées selon NVD "
+                "(détail complet dans l'onglet CVE NVD)"
+            )
+
+            st.dataframe(
+                pd.DataFrame(
+                    load_inventory_devices_for_cve(selected_inventory_cve)
+                ).rename(columns=INVENTORY_DEVICE_COLUMNS),
+                use_container_width=True,
+                hide_index=True
+            )
+
+        else:
+
+            st.caption(
+                "Sélectionnez une ligne pour voir les machines et les "
+                "versions concernées. « Machines (Defender) » à 0 : "
+                "Defender n'a pas (encore) relié cette CVE au parc."
+            )
+
+    st.divider()
+
+    # -----------------------------------------------------
     # Téléchargement historique NVD (premier lancement)
     # -----------------------------------------------------
 
@@ -4741,51 +5068,32 @@ with tab_watch:
         if uploaded_nvd_files and st.button(
             "Importer",
             use_container_width=True,
-            key="nvd_manual_upload_button"
+            key="nvd_manual_upload_button",
+            disabled=is_job_running("nvd_import_files")
         ):
 
-            total_imported = 0
-            import_errors = []
+            # Import en arrière-plan (un flux annuel complet prend
+            # plusieurs minutes) : les fichiers sont déposés dans
+            # data/imports/nvd puis traités par nvd_import_files.py, qui
+            # enregistre aussi les produits vulnérables (CPE) et recalcule
+            # les équipements touchés selon NVD.
+            upload_dir = Path("data/imports/nvd")
+            upload_dir.mkdir(parents=True, exist_ok=True)
 
-            with st.spinner(
-                f"Import de {len(uploaded_nvd_files)} fichier(s) en "
-                "cours (peut prendre plusieurs minutes pour un flux "
-                "annuel complet)..."
-            ):
+            saved_paths = []
 
-                for uploaded_file in uploaded_nvd_files:
+            for uploaded_file in uploaded_nvd_files:
 
-                    try:
+                target = upload_dir / Path(uploaded_file.name).name
+                target.write_bytes(uploaded_file.getvalue())
+                saved_paths.append(str(target.resolve()))
 
-                        discoveries = parse_nvd_feed_bytes(
-                            uploaded_file.getvalue(),
-                            uploaded_file.name
-                        )
+            env = os.environ.copy()
+            env["VULNWATCH_NVD_FILES"] = os.pathsep.join(saved_paths)
 
-                        imported = bulk_save_nvd_discoveries(discoveries)
+            launch_job("nvd_import_files.py", env=env)
 
-                        total_imported += imported
-
-                    except Exception as error:
-
-                        import_errors.append(
-                            f"{uploaded_file.name} : {error}"
-                        )
-
-            if total_imported:
-
-                st.success(
-                    f"{total_imported} CVE importée(s)/mise(s) à jour "
-                    f"({get_nvd_total_count()} CVE NVD en base au total)."
-                )
-
-                st.cache_data.clear()
-
-            for err in import_errors:
-                st.error(err)
-
-            if total_imported and not import_errors:
-                st.rerun()
+        render_job("nvd_import_files")
 
     st.divider()
 

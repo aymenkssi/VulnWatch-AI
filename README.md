@@ -30,6 +30,10 @@ app.py               Interface Streamlit (tableau de bord, serveurs, KEV, CVE NV
 | `enrich.py` | Enrichit les CVE avec les données NVD |
 | `sync_nvd_feed.py` | Flux NVD quotidien (CVE publiées et modifiées, reprise depuis la dernière fenêtre réussie) ; alerte les destinataires de veille si une nouvelle CVE touche le parc |
 | `nvd_audit.py` | État de la base NVD : compare jour par jour avec nvd.nist.gov et rattrape les CVE manquantes (onglet Veille) |
+| `sync_software_inventory.py` | Importe l'inventaire logiciel de chaque machine (API Defender ou CSV) puis calcule les équipements touchés selon NVD |
+| `nvd_match.py` | Recalcule les équipements touchés selon NVD (inventaire logiciel × produits vulnérables CPE de NVD, `services/inventory_matcher.py`) |
+| `nvd_cpe_sync.py` | Télécharge depuis l'API NVD les produits vulnérables (CPE) des CVE déjà en base |
+| `nvd_import_files.py` | Importe des fichiers NVD (`.json.gz`) envoyés depuis l'onglet Veille |
 | `sync_nvd_backfill.py` | Téléchargement historique NVD par fenêtres de 119 jours (reprise sur curseur) |
 | `sync_defender.py` | Importe l'export de vulnérabilités Defender |
 | `build_exposure.py` | Construit la table d'exposition CISA × Defender |
