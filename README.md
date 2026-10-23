@@ -30,7 +30,8 @@ app.py               Interface Streamlit (tableau de bord, serveurs, KEV, CVE NV
 | `enrich.py` | Enrichit les CVE avec les données NVD |
 | `sync_nvd_feed.py` | Flux NVD quotidien (CVE publiées et modifiées, reprise depuis la dernière fenêtre réussie) ; alerte les destinataires de veille si une nouvelle CVE touche le parc |
 | `nvd_audit.py` | État de la base NVD : compare jour par jour avec nvd.nist.gov et rattrape les CVE manquantes (onglet Veille) |
-| `sync_software_inventory.py` | Importe l'inventaire logiciel de chaque machine (API Defender ou CSV) puis calcule les équipements touchés selon NVD |
+| `sync_software_inventory.py` | Importe l'inventaire logiciel de chaque machine (API Defender ou CSV) puis calcule les équipements touchés selon NVD ; en mode delta, ne retélécharge que les machines modifiées (`services/inventory_delta.py`) |
+| `scheduled_sync.py` | Lance les synchros dues sans navigateur (Planificateur de tâches Windows, `services/scheduler.py`) |
 | `nvd_match.py` | Recalcule les équipements touchés selon NVD (inventaire logiciel × produits vulnérables CPE de NVD, `services/inventory_matcher.py`) |
 | `nvd_cpe_sync.py` | Télécharge depuis l'API NVD les produits vulnérables (CPE) des CVE déjà en base |
 | `nvd_import_files.py` | Importe des fichiers NVD (`.json.gz`) envoyés depuis l'onglet Veille |
@@ -43,7 +44,8 @@ app.py               Interface Streamlit (tableau de bord, serveurs, KEV, CVE NV
 | `notify.py` | Notifications et relances e-mail aux propriétaires |
 
 L'application Streamlit lance automatiquement la plupart de ces scripts en
-arrière-plan lorsque les données sont périmées. Les boutons « Synchroniser … »
+arrière-plan lorsque les données sont périmées (`services/scheduler.py`), et
+`scheduled_sync.py` fait de même sans navigateur ouvert. Les boutons « Synchroniser … »
 les lancent aussi en arrière-plan (`services/jobs.py`) : l'interface reste
 utilisable et affiche une barre de progression. L'état et le journal de chaque
 synchro sont écrits dans `data/jobs/`.
@@ -118,6 +120,49 @@ administrateur :
 | WindowsDefenderATP | `Software.Read.All` | Export de l'inventaire logiciel (secours) |
 | WindowsDefenderATP | `User.Read.All` | Utilisateurs connectés aux machines |
 | Microsoft Graph | `User.Read.All` | Nom et e-mail des propriétaires |
+
+### Inventaire logiciel : delta et historique des changements
+
+Onglet Veille > « Équipements touchés selon NVD » :
+
+- **Vérifier les changements (delta)** : une requête Advanced Hunting légère
+  (une ligne par machine) donne l'empreinte SHA-256 de la liste des logiciels
+  de chaque machine. Seules les machines dont l'empreinte a changé depuis le
+  dernier import, et les nouvelles, sont retéléchargées ; les machines
+  disparues de Defender sont retirées ;
+- **Import complet depuis Defender** : tout l'inventaire est retéléchargé
+  (filet de sécurité) ;
+- fréquences réglables : delta toutes les 1 à 24 h (6 h par défaut), import
+  complet chaque jour à tous les 30 jours (7 par défaut). Automatique
+  uniquement si le dernier import venait de Defender (pas d'un CSV).
+
+Chaque changement (logiciel ajouté, supprimé, version modifiée, machine
+apparue ou retirée) est enregistré avec les CVE NVD qu'il introduit ou
+corrige : onglet Inventaire > « Changements ». Si un changement introduit une
+CVE critique, un e-mail récapitulatif part à la liste de diffusion de veille.
+Le premier import sert de référence (aucun changement enregistré).
+
+### Synchros sans navigateur (Planificateur de tâches Windows)
+
+Sans tâche planifiée, les synchros automatiques ne partent que lorsqu'une
+page de l'application est ouverte. `scheduled_sync.py` lance les synchros
+dues puis attend leur fin. En PowerShell administrateur :
+
+```powershell
+$action  = New-ScheduledTaskAction -Execute "C:\VulnWatch-AI\.venv\Scripts\python.exe" `
+           -Argument "scheduled_sync.py" -WorkingDirectory "C:\VulnWatch-AI"
+$trigger = New-ScheduledTaskTrigger -Once -At (Get-Date) `
+           -RepetitionInterval (New-TimeSpan -Minutes 15)
+$settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew `
+           -ExecutionTimeLimit (New-TimeSpan -Hours 12)
+Register-ScheduledTask -TaskName "VulnWatch AI - synchros" -Action $action `
+           -Trigger $trigger -Settings $settings -User "SYSTEM" -RunLevel Highest
+```
+
+Avec le compte SYSTEM, utilisez l'application Azure (la connexion Azure CLI
+d'un utilisateur n'est pas disponible pour ce compte). L'interface et la
+tâche planifiée peuvent tourner ensemble : une synchro déjà en cours n'est
+jamais relancée.
 
 ## Données
 

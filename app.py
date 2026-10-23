@@ -22,6 +22,15 @@ from services.inventory_matcher import (
     get_inventory_matched_at,
     refresh_matches_for_cves
 )
+from services.scheduler import (
+    run_due_syncs,
+    JOB_LABELS,
+    AUTO_SYNC_INTERVAL_HOURS,
+    AUTO_NVD_INTERVAL_MINUTES,
+    AUTO_NVD_BATCH_SIZE,
+    AUTO_NOTIFY_INTERVAL_MINUTES,
+    AUTO_NVD_FEED_INTERVAL_MINUTES
+)
 from services.jobs import (
     start_job,
     get_job,
@@ -101,7 +110,11 @@ from database import (
     reset_nvd_backfill,
     get_nvd_total_count,
     bulk_save_nvd_discoveries,
-    get_nvd_defender_exposure
+    get_nvd_defender_exposure,
+    get_inventory_schedule,
+    set_inventory_schedule,
+    get_inventory_changes,
+    CHANGE_TYPES
 )
 from services.mailer import send_test_email, send_email, SmtpNotConfigured
 from services.ai_engine import generate_watch_alert_email
@@ -414,10 +427,12 @@ if CURRENT_USER["must_change_password"]:
 
 
 # =========================================================
-# AUTOMATIC CISA SYNC (every 12h)
+# SYNCHROS AUTOMATIQUES
 # =========================================================
-
-AUTO_SYNC_INTERVAL_HOURS = 12
+#
+# La logique « quelle synchro est due ? » est dans services/scheduler.py,
+# partagée avec scheduled_sync.py (Planificateur de tâches Windows) :
+# les synchros tournent aussi sans navigateur ouvert.
 
 
 def format_sync_timestamp(iso_value):
@@ -439,56 +454,6 @@ def format_sync_timestamp(iso_value):
         return iso_value
 
 
-def launch_background_sync(script, min_interval, env=None):
-    """
-    Lance un script de synchro en sous-processus DÉTACHÉ (Popen) au
-    lieu de subprocess.run : l'interface s'affiche tout de suite au
-    lieu de rester figée (formulaire de connexion grisé) pendant que
-    CISA / NVD / Ollama / SMTP répondent — le flux NVD et les e-mails
-    générés par l'IA pouvaient prendre plusieurs minutes.
-
-    Streamlit relance tout le script à chaque interaction : on note
-    l'heure du lancement en base pour ne pas relancer le même script
-    tant qu'il tourne (ou, s'il a planté, avant min_interval).
-    Les tableaux se mettent à jour d'eux-mêmes (cache de 60 s).
-    """
-
-    key = f"autosync_launched_at:{script}"
-    now = datetime.now(timezone.utc)
-    launched_at = get_app_config(key)
-
-    if launched_at:
-
-        try:
-
-            last_launch = datetime.fromisoformat(launched_at)
-
-            if last_launch.tzinfo is None:
-                last_launch = last_launch.replace(tzinfo=timezone.utc)
-
-            if now - last_launch < min_interval:
-                return
-
-        except ValueError:
-
-            pass
-
-    if is_job_running(Path(script).stem):
-        return
-
-    set_app_config(key, now.isoformat())
-
-    # Même clé que le bouton manuel correspondant : la synchro auto
-    # apparaît avec sa barre de progression, et un clic pendant qu'elle
-    # tourne ne la lance pas une seconde fois.
-    start_job(
-        Path(script).stem,
-        script,
-        JOB_LABELS.get(script, script),
-        env=env
-    )
-
-
 # =========================================================
 # SYNCHROS EN ARRIÈRE-PLAN : BARRE DE PROGRESSION
 # =========================================================
@@ -506,20 +471,6 @@ def launch_background_sync(script, min_interval, env=None):
 # l'interface se termine (render_job), donc 10 min suffisent.
 CACHE_TTL_SECONDS = 600
 
-
-JOB_LABELS = {
-    "sync.py": "Synchronisation CISA KEV",
-    "enrich.py": "Enrichissement NVD",
-    "ai_enrich.py": "Analyse IA (Ollama)",
-    "notify.py": "Notifications e-mail",
-    "sync_hexiosec.py": "Synchronisation Hexiosec ASM",
-    "sync_nvd_feed.py": "Synchronisation NVD",
-    "nvd_audit.py": "Vérification de la base NVD",
-    "sync_software_inventory.py": "Import de l'inventaire logiciel",
-    "nvd_match.py": "Calcul des équipements touchés (NVD)",
-    "nvd_import_files.py": "Import de fichiers NVD",
-    "nvd_cpe_sync.py": "Téléchargement des produits vulnérables NVD"
-}
 
 
 def launch_job(script, env=None):
@@ -680,367 +631,7 @@ def render_job(key, warning_state_key=None, place=""):
         st.rerun()
 
 
-def auto_sync_cisa_if_needed():
-
-    state = get_sync_state("cisa_kev")
-
-    now = datetime.now(timezone.utc)
-    needs_sync = True
-
-    if state and state.get("last_run_at"):
-
-        try:
-
-            last_run = datetime.fromisoformat(
-                state["last_run_at"]
-            )
-
-            if last_run.tzinfo is None:
-                last_run = last_run.replace(
-                    tzinfo=timezone.utc
-                )
-
-            needs_sync = (
-                (now - last_run)
-                >= timedelta(hours=AUTO_SYNC_INTERVAL_HOURS)
-            )
-
-        except ValueError:
-
-            needs_sync = True
-
-    if needs_sync:
-
-        launch_background_sync(
-            "sync.py",
-            timedelta(hours=AUTO_SYNC_INTERVAL_HOURS)
-        )
-
-
-auto_sync_cisa_if_needed()
-
-
-# =========================================================
-# AUTOMATIC NVD ENRICHMENT (small batch on each load)
-# =========================================================
-#
-# L'API NVD publique est limitée en débit (délai de plusieurs
-# secondes entre chaque requête), donc on ne peut pas tout enrichir
-# d'un coup à chaque ouverture de l'appli. On grignote le retard par
-# petits lots, régulièrement, jusqu'à ce que "CVSS 3.1" / "Sévérité
-# NVD" soient renseignés pour toutes les CVE.
-
-AUTO_NVD_INTERVAL_MINUTES = 30
-AUTO_NVD_BATCH_SIZE = 5
-
-
-def auto_enrich_nvd_if_needed():
-
-    if get_pending_nvd_count() == 0:
-        return
-
-    state = get_sync_state("nvd_enrich")
-
-    now = datetime.now(timezone.utc)
-    needs_run = True
-
-    if state and state.get("last_run_at"):
-
-        try:
-
-            last_run = datetime.fromisoformat(
-                state["last_run_at"]
-            )
-
-            if last_run.tzinfo is None:
-                last_run = last_run.replace(
-                    tzinfo=timezone.utc
-                )
-
-            needs_run = (
-                (now - last_run)
-                >= timedelta(minutes=AUTO_NVD_INTERVAL_MINUTES)
-            )
-
-        except ValueError:
-
-            needs_run = True
-
-    if needs_run:
-
-        env = os.environ.copy()
-        env["VULNWATCH_MAX_CVES"] = str(AUTO_NVD_BATCH_SIZE)
-
-        nvd_api_key_for_enrich = get_nvd_api_key()
-
-        if nvd_api_key_for_enrich:
-            env["VULNWATCH_NVD_API_KEY"] = nvd_api_key_for_enrich
-
-        launch_background_sync(
-            "enrich.py",
-            timedelta(minutes=AUTO_NVD_INTERVAL_MINUTES),
-            env=env
-        )
-
-
-auto_enrich_nvd_if_needed()
-
-
-# =========================================================
-# AUTOMATIC EMAIL NOTIFICATIONS (nouvelles + relances)
-# =========================================================
-#
-# Vérifie régulièrement s'il y a de nouvelles CVE à notifier aux
-# propriétaires de serveur (notification activée) ou des relances
-# arrivées à échéance (CVE toujours présente après le délai configuré
-# selon sa criticité). Ne fait rien si le SMTP n'est pas configuré.
-
-AUTO_NOTIFY_INTERVAL_MINUTES = 60
-
-
-def auto_notify_if_needed():
-
-    if not is_smtp_configured():
-        return
-
-    state = get_sync_state("email_notify")
-
-    now = datetime.now(timezone.utc)
-    needs_run = True
-
-    if state and state.get("last_run_at"):
-
-        try:
-
-            last_run = datetime.fromisoformat(
-                state["last_run_at"]
-            )
-
-            if last_run.tzinfo is None:
-                last_run = last_run.replace(
-                    tzinfo=timezone.utc
-                )
-
-            needs_run = (
-                (now - last_run)
-                >= timedelta(minutes=AUTO_NOTIFY_INTERVAL_MINUTES)
-            )
-
-        except ValueError:
-
-            needs_run = True
-
-    if needs_run:
-
-        launch_background_sync(
-            "notify.py",
-            timedelta(minutes=AUTO_NOTIFY_INTERVAL_MINUTES)
-        )
-
-
-auto_notify_if_needed()
-
-
-# =========================================================
-# AUTOMATIC NVD DAILY FEED (source principale + croisement XDR)
-# =========================================================
-#
-# Chaque jour, récupère les CVE nouvellement publiées par NVD (toutes
-# sources confondues, pas seulement CISA KEV) et les croise avec
-# l'inventaire XDR (defender_vulnerabilities). Toute correspondance
-# déclenche automatiquement une alerte vers la liste de diffusion de
-# l'onglet "Veille" (voir sync_nvd_feed.py). CISA KEV continue d'être
-# synchronisée séparément et sert toujours à notifier les propriétaires
-# de serveur (auto_notify_if_needed ci-dessus) : rien n'y change.
-
-# Toutes les 2 h : NVD déclare souvent les produits vulnérables quelques
-# heures après la publication ; la synchro récupère aussi ces
-# modifications (et alerte si une CVE récente devient applicable au parc).
-AUTO_NVD_FEED_INTERVAL_MINUTES = 2 * 60
-AUTO_NVD_FEED_ERROR_RETRY_MINUTES = 60
-
-
-def auto_sync_nvd_feed_if_needed():
-
-    state = get_sync_state("nvd_daily_feed")
-
-    now = datetime.now(timezone.utc)
-    needs_run = True
-
-    if state and state.get("last_run_at"):
-
-        try:
-
-            last_run = datetime.fromisoformat(
-                state["last_run_at"]
-            )
-
-            if last_run.tzinfo is None:
-                last_run = last_run.replace(
-                    tzinfo=timezone.utc
-                )
-
-            # Après un échec, on retente au bout d'une heure au lieu
-            # d'attendre le passage quotidien suivant.
-            interval = (
-                AUTO_NVD_FEED_ERROR_RETRY_MINUTES
-                if state.get("status") == "ERROR"
-                else AUTO_NVD_FEED_INTERVAL_MINUTES
-            )
-
-            needs_run = (now - last_run) >= timedelta(minutes=interval)
-
-        except ValueError:
-
-            needs_run = True
-
-    if needs_run:
-
-        env = os.environ.copy()
-
-        api_key = get_nvd_api_key()
-
-        if api_key:
-            env["VULNWATCH_NVD_API_KEY"] = api_key
-
-        # Garde-fou anti-relance d'une heure (et non 24 h) : sinon il
-        # bloquerait la nouvelle tentative prévue une heure après un échec.
-        launch_background_sync(
-            "sync_nvd_feed.py",
-            timedelta(minutes=AUTO_NVD_FEED_ERROR_RETRY_MINUTES),
-            env=env
-        )
-
-
-auto_sync_nvd_feed_if_needed()
-
-
-# =========================================================
-# AUTOMATIC SOFTWARE INVENTORY (Defender, chaque jour)
-# =========================================================
-#
-# Réimporte chaque jour l'inventaire logiciel depuis Defender puis
-# recalcule les équipements touchés selon NVD — uniquement si le dernier
-# import réussi venait de l'API Defender (pas pour un inventaire chargé
-# par fichier CSV, qui serait sinon remplacé ou ferait échouer la
-# synchro chaque jour faute d'accès à l'API).
-
-AUTO_INVENTORY_INTERVAL_HOURS = 24
-
-
-def auto_sync_software_inventory_if_needed():
-
-    state = get_sync_state("software_inventory")
-
-    if not state or not str(state.get("detail") or "").startswith("Defender"):
-        return
-
-    try:
-        last_run = datetime.fromisoformat(state["last_run_at"])
-    except (TypeError, ValueError):
-        return
-
-    if last_run.tzinfo is None:
-        last_run = last_run.replace(tzinfo=timezone.utc)
-
-    if datetime.now(timezone.utc) - last_run >= timedelta(
-        hours=AUTO_INVENTORY_INTERVAL_HOURS
-    ):
-        launch_background_sync(
-            "sync_software_inventory.py",
-            timedelta(hours=AUTO_INVENTORY_INTERVAL_HOURS)
-        )
-
-
-auto_sync_software_inventory_if_needed()
-
-
-# =========================================================
-# NVD HISTORICAL BACKFILL (téléchargement initial depuis 2020)
-# =========================================================
-#
-# Au tout premier lancement de l'appli, en plus de la synchro
-# quotidienne (nouvelles publications uniquement), on rapatrie en
-# arrière-plan tout l'historique NVD depuis get_nvd_backfill_start()
-# (par défaut le 1er janvier 2020). Potentiellement des dizaines de
-# milliers de CVE : on lance ça en sous-processus DÉTACHÉ (Popen, pas
-# subprocess.run) pour ne jamais bloquer l'interface, avec reprise sur
-# redémarrage (curseur persistant en base, voir sync_nvd_backfill.py).
-# Un "heartbeat" (sync_state mis à jour après chaque fenêtre) permet
-# de distinguer une synchro toujours active d'une synchro plantée, et
-# de ne relancer un sous-processus que dans ce dernier cas.
-
-NVD_BACKFILL_STALE_MINUTES = 15
-NVD_BACKFILL_ERROR_RETRY_MINUTES = 30
-
-
-def auto_launch_nvd_backfill_if_needed():
-
-    if is_nvd_backfill_done():
-        return
-
-    state = get_sync_state("nvd_historical_backfill")
-
-    now = datetime.now(timezone.utc)
-    should_launch = True
-
-    if state and state.get("last_run_at"):
-
-        try:
-
-            last_run = datetime.fromisoformat(state["last_run_at"])
-
-            if last_run.tzinfo is None:
-                last_run = last_run.replace(tzinfo=timezone.utc)
-
-            age = now - last_run
-
-            if state.get("status") == "RUNNING":
-
-                # Un process actif met à jour ce champ après CHAQUE
-                # fenêtre (quelques secondes à quelques minutes) : si
-                # ça n'a pas bougé depuis un moment, il est probable
-                # que le process ait été interrompu (redémarrage de
-                # l'appli, par exemple).
-                should_launch = age >= timedelta(
-                    minutes=NVD_BACKFILL_STALE_MINUTES
-                )
-
-            elif state.get("status") == "ERROR":
-
-                should_launch = age >= timedelta(
-                    minutes=NVD_BACKFILL_ERROR_RETRY_MINUTES
-                )
-
-            else:
-
-                should_launch = False
-
-        except ValueError:
-
-            should_launch = True
-
-    if should_launch:
-
-        env = os.environ.copy()
-
-        api_key = get_nvd_api_key()
-
-        if api_key:
-            env["VULNWATCH_NVD_API_KEY"] = api_key
-
-        subprocess.Popen(
-            [
-                sys.executable,
-                "sync_nvd_backfill.py"
-            ],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            env=env
-        )
-
-
-auto_launch_nvd_backfill_if_needed()
+run_due_syncs()
 
 
 # =========================================================
@@ -3790,6 +3381,127 @@ with tab_nvd:
 # =========================================================
 
 @st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
+def load_inventory_changes(since, change_types, search, critical_only):
+    return get_inventory_changes(
+        since=since,
+        change_types=list(change_types),
+        search=search,
+        critical_only=critical_only
+    )
+
+
+def render_inventory_changes(search):
+    """Historique des changements d'inventaire détectés par les synchros Defender."""
+
+    st.caption(
+        "Changements détectés à chaque synchro d'inventaire Defender (delta "
+        "par empreinte ou import complet) : logiciels ajoutés, supprimés ou "
+        "mis à jour, machines apparues ou retirées, et CVE (selon NVD) "
+        "introduites ou corrigées par chaque changement."
+    )
+
+    c1, c2, c3 = st.columns([1, 2, 1])
+
+    with c1:
+        period = st.date_input(
+            "Période",
+            value=(date.today() - timedelta(days=7), date.today()),
+            format="DD/MM/YYYY",
+            key="inventory_changes_period"
+        )
+
+    with c2:
+        change_types = st.multiselect(
+            "Type de changement",
+            list(CHANGE_TYPES),
+            format_func=CHANGE_TYPES.get,
+            placeholder="Tous",
+            key="inventory_changes_types"
+        )
+
+    with c3:
+        st.write("")
+        critical_only = st.checkbox(
+            "CVE critiques introduites uniquement",
+            key="inventory_changes_critical"
+        )
+
+    if isinstance(period, (tuple, list)):
+        start_day = period[0] if period else None
+        end_day = period[1] if len(period) > 1 else None
+    else:
+        start_day, end_day = period, None
+
+    since = (
+        datetime.combine(start_day, datetime.min.time()).astimezone(timezone.utc)
+        if start_day else None
+    )
+
+    changes = load_inventory_changes(
+        since, tuple(change_types), search, critical_only
+    )
+
+    if end_day:
+        until = datetime.combine(
+            end_day + timedelta(days=1), datetime.min.time()
+        ).astimezone(timezone.utc).isoformat()
+        changes = [change for change in changes if change["detected_at"] < until]
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Changements", len(changes))
+    m2.metric("Machines concernées", len({change["device_id"] for change in changes}))
+    m3.metric(
+        "CVE introduites",
+        len({
+            cve for change in changes
+            for cve in (change["cves_introduced"] or "").split(", ") if cve
+        })
+    )
+    m4.metric(
+        "Changements avec CVE critique",
+        sum(1 for change in changes if change["critical_introduced"])
+    )
+
+    if not changes:
+        st.info(
+            "Aucun changement sur la période. Les changements sont détectés à "
+            "partir du deuxième import Defender (le premier sert de référence)."
+        )
+        return
+
+    changes_df = pd.DataFrame(changes)
+    changes_df["detected_at"] = changes_df["detected_at"].map(format_sync_timestamp)
+    changes_df["change_type"] = changes_df["change_type"].map(
+        lambda value: CHANGE_TYPES.get(value, value)
+    )
+    changes_df["device_name"] = changes_df["device_name"].fillna(changes_df["device_id"])
+
+    st.dataframe(
+        changes_df[[
+            "detected_at", "device_name", "change_type", "software_vendor",
+            "software_name", "old_version", "new_version", "cves_introduced",
+            "critical_introduced", "cves_fixed"
+        ]].rename(columns={
+            "detected_at": "Détecté le",
+            "device_name": "Machine",
+            "change_type": "Changement",
+            "software_vendor": "Éditeur",
+            "software_name": "Logiciel",
+            "old_version": "Ancienne version",
+            "new_version": "Nouvelle version",
+            "cves_introduced": "CVE introduites",
+            "critical_introduced": "dont critiques",
+            "cves_fixed": "CVE corrigées"
+        }),
+        use_container_width=True,
+        hide_index=True
+    )
+
+    if len(changes) >= 2000:
+        st.caption("2 000 changements les plus récents affichés : affinez la période ou la recherche.")
+
+
+@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
 def load_inventory_machines(search):
     return get_inventory_machines(search or None)
 
@@ -4059,7 +3771,7 @@ with tab_inventory:
 
         st.info(
             "Aucun inventaire importé. Onglet Veille > « Équipements touchés "
-            "selon NVD » : « Importer l'inventaire depuis Defender » ou import CSV."
+            "selon NVD » : « Import complet depuis Defender » ou import CSV."
         )
 
     else:
@@ -4083,7 +3795,7 @@ with tab_inventory:
         with v1:
             inventory_view = st.radio(
                 "Afficher",
-                ["Par machine", "Par produit"],
+                ["Par machine", "Par produit", "Changements"],
                 horizontal=True,
                 key="inventory_view"
             )
@@ -4091,14 +3803,19 @@ with tab_inventory:
         with v2:
             inventory_tab_search = st.text_input(
                 "Rechercher",
-                placeholder=(
-                    "Nom de machine, OS..." if inventory_view == "Par machine"
-                    else "Éditeur ou produit (ex. microsoft, chrome, openssl)"
-                ),
+                placeholder={
+                    "Par machine": "Nom de machine, OS...",
+                    "Par produit": "Éditeur ou produit (ex. microsoft, chrome, openssl)",
+                    "Changements": "Machine, logiciel ou CVE"
+                }[inventory_view],
                 key=f"inventory_tab_search_{inventory_view}"
             )
 
-        if inventory_view == "Par machine":
+        if inventory_view == "Changements":
+
+            render_inventory_changes(inventory_tab_search.strip())
+
+        elif inventory_view == "Par machine":
 
             machines = load_inventory_machines(inventory_tab_search.strip())
 
@@ -5610,26 +5327,46 @@ with tab_watch:
 
     cpe_unchecked, cpe_oldest = load_cpe_unchecked()
 
-    inv_col1, inv_col2 = st.columns(2)
+    inv_col1, inv_col2, inv_col3 = st.columns(3)
+
+    inventory_running = is_job_running("sync_software_inventory")
 
     with inv_col1:
 
         if st.button(
-            "Importer l'inventaire depuis Defender",
+            "Vérifier les changements (delta)",
             use_container_width=True,
             type="primary",
-            disabled=(is_job_running("sync_software_inventory")) or not IS_ADMIN,
+            disabled=inventory_running or not IS_ADMIN,
+            key="inventory_delta_button",
+            help="Une requête Advanced Hunting légère donne l'empreinte de "
+                 "l'inventaire de chaque machine : seules les machines "
+                 "modifiées (ou nouvelles) sont retéléchargées. Historique "
+                 "dans l'onglet Inventaire > Changements. Sans empreinte "
+                 "enregistrée, fait un import complet."
+        ):
+            delta_env = os.environ.copy()
+            delta_env["VULNWATCH_INVENTORY_MODE"] = "delta"
+            launch_job("sync_software_inventory.py", env=delta_env)
+
+    with inv_col2:
+
+        if st.button(
+            "Import complet depuis Defender",
+            use_container_width=True,
+            disabled=inventory_running or not IS_ADMIN,
             key="inventory_defender_button",
             help="Inventaire complet par l'API Advanced Hunting de Defender "
                  "(par lots de machines, sans la limite de 100 000 lignes ; "
                  "permission AdvancedQuery.Read.All), à défaut export "
                  "SoftwareInventoryExport (Software.Read.All). Application "
-                 "Azure (barre latérale) ou Azure CLI. Réimporté ensuite "
-                 "automatiquement chaque jour."
+                 "Azure (barre latérale) ou Azure CLI."
         ):
-            launch_job("sync_software_inventory.py")
+            full_env = os.environ.copy()
+            full_env["VULNWATCH_INVENTORY_MODE"] = "full"
+            launch_job("sync_software_inventory.py", env=full_env)
 
-    with inv_col2:
+    with inv_col3:
 
         if st.button(
             "Recalculer les équipements touchés",
@@ -5638,6 +5375,57 @@ with tab_watch:
             key="inventory_match_button"
         ):
             launch_job("nvd_match.py")
+
+    inventory_schedule = get_inventory_schedule()
+    inventory_state_now = get_sync_state("software_inventory") or {}
+
+    sched_col1, sched_col2, sched_col3 = st.columns([1, 1, 2])
+
+    delta_choices = [1, 2, 6, 12, 24]
+    full_choices = [1, 7, 14, 30]
+
+    with sched_col1:
+
+        delta_hours = st.selectbox(
+            "Vérification des changements",
+            delta_choices,
+            index=delta_choices.index(inventory_schedule["delta_hours"])
+            if inventory_schedule["delta_hours"] in delta_choices else 2,
+            format_func=lambda hours: f"toutes les {hours} h",
+            disabled=not IS_ADMIN,
+            key="inventory_delta_hours"
+        )
+
+    with sched_col2:
+
+        full_days = st.selectbox(
+            "Import complet",
+            full_choices,
+            index=full_choices.index(inventory_schedule["full_days"])
+            if inventory_schedule["full_days"] in full_choices else 1,
+            format_func=lambda days: "chaque jour" if days == 1 else f"tous les {days} jours",
+            disabled=not IS_ADMIN,
+            key="inventory_full_days"
+        )
+
+    if IS_ADMIN and (
+        delta_hours != inventory_schedule["delta_hours"]
+        or full_days != inventory_schedule["full_days"]
+    ):
+        set_inventory_schedule(delta_hours, full_days)
+        st.toast("Fréquence de l'inventaire enregistrée.")
+
+    with sched_col3:
+
+        st.caption(
+            f"Dernière synchro : "
+            f"{format_sync_timestamp(inventory_state_now.get('last_run_at'))} · "
+            f"dernier import complet : "
+            f"{format_sync_timestamp(inventory_schedule['last_full_at'])}. "
+            "Automatique uniquement si le dernier import venait de Defender "
+            "(pas d'un CSV), à l'ouverture de l'application ou par la tâche "
+            "planifiée scheduled_sync.py (voir README)."
+        )
 
     # Complément ponctuel de l'historique : les CVE importées avant
     # l'enregistrement des produits NVD n'en ont pas. « Rattraper » (état
