@@ -289,18 +289,34 @@ def hunting_inventory_for_devices(device_ids, token=None):
     return rows
 
 
-def iter_hunting_inventory(progress=None):
+def hunting_fingerprints(token=None):
     """
-    Inventaire logiciel complet de toutes les machines, lot par lot.
-    progress(lot, nombre de lots, machines, lignes) est appelé à chaque lot.
+    Une ligne par machine : DeviceId, Rows (nombre de logiciels) et
+    Fingerprint, empreinte SHA-256 de la liste triée
+    "éditeur:logiciel:version". Une seule requête légère (une ligne par
+    machine) : seules les machines dont l'empreinte a changé depuis le
+    dernier import sont ensuite retéléchargées.
     """
 
-    token = get_access_token()
-
-    counts = run_hunting_query(
-        "DeviceTvmSoftwareInventory | summarize Rows = count() by DeviceId",
+    return run_hunting_query(
+        "DeviceTvmSoftwareInventory "
+        "| summarize Items = make_set(strcat(SoftwareVendor, ':', SoftwareName, "
+        "':', SoftwareVersion)) by DeviceId "
+        "| extend Rows = array_length(Items), "
+        "Fingerprint = hash_sha256(strcat_array(array_sort_asc(Items), '|')) "
+        "| project DeviceId, Rows, Fingerprint",
         token
     )
+
+
+def iter_hunting_inventory_for(counts, token=None, progress=None):
+    """
+    Inventaire des machines de `counts` ([{"DeviceId", "Rows"}]), par lots
+    sous la limite de 100 000 lignes. progress(lot, nombre de lots,
+    machines, lignes) est appelé à chaque lot.
+    """
+
+    token = token or get_access_token()
 
     batches = []
     batch, batch_rows = [], 0
@@ -339,3 +355,16 @@ def iter_hunting_inventory(progress=None):
         print(f"    lot {index}/{len(batches)} : {len(device_ids)} machine(s), {len(rows)} ligne(s)")
 
         yield from rows
+
+
+def iter_hunting_inventory(progress=None):
+    """Inventaire logiciel complet de toutes les machines, lot par lot."""
+
+    token = get_access_token()
+
+    counts = run_hunting_query(
+        "DeviceTvmSoftwareInventory | summarize Rows = count() by DeviceId",
+        token
+    )
+
+    yield from iter_hunting_inventory_for(counts, token, progress)

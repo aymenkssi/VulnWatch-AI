@@ -585,6 +585,35 @@ def initialize_database():
         )
     """)
 
+    # Empreinte de l'inventaire de chaque machine (Advanced Hunting) :
+    # seules les machines dont l'empreinte change sont retéléchargées.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS inventory_fingerprints (
+            device_id TEXT PRIMARY KEY,
+            fingerprint TEXT NOT NULL,
+            software_rows INTEGER,
+            checked_at TEXT
+        )
+    """)
+
+    # Historique des changements d'inventaire (delta entre deux imports).
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS inventory_changes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            detected_at TEXT NOT NULL,
+            device_id TEXT NOT NULL,
+            device_name TEXT,
+            change_type TEXT NOT NULL,
+            software_vendor TEXT,
+            software_name TEXT,
+            old_version TEXT,
+            new_version TEXT,
+            cves_introduced TEXT,
+            cves_fixed TEXT,
+            critical_introduced INTEGER NOT NULL DEFAULT 0
+        )
+    """)
+
     conn.execute("""
         CREATE TABLE IF NOT EXISTS inventory_cve_summary (
             cve_id TEXT PRIMARY KEY,
@@ -669,7 +698,11 @@ def initialize_database():
         "CREATE INDEX IF NOT EXISTS idx_software_inventory_device "
         "ON software_inventory (device_id)",
         "CREATE INDEX IF NOT EXISTS idx_inventory_cve_matches_product "
-        "ON inventory_cve_matches (cpe_vendor, cpe_product, software_version)"
+        "ON inventory_cve_matches (cpe_vendor, cpe_product, software_version)",
+        "CREATE INDEX IF NOT EXISTS idx_inventory_changes_date "
+        "ON inventory_changes (detected_at)",
+        "CREATE INDEX IF NOT EXISTS idx_inventory_changes_device "
+        "ON inventory_changes (device_id)"
     ):
         conn.execute(index_sql)
 
@@ -4776,6 +4809,195 @@ def get_cve_ids_published_since(cve_ids, days):
         cve_ids,
         (since,)
     )
+
+
+# =========================================================
+# INVENTAIRE : DELTA, EMPREINTES, HISTORIQUE, FRÉQUENCE
+# =========================================================
+
+INVENTORY_DELTA_HOURS_KEY = "inventory_delta_hours"
+INVENTORY_FULL_DAYS_KEY = "inventory_full_days"
+INVENTORY_LAST_FULL_KEY = "inventory_last_full_at"
+
+# Source du dernier import complet réussi : "defender" ou "csv".
+INVENTORY_SOURCE_KEY = "inventory_source"
+
+CHANGE_TYPES = {
+    "added": "➕ Logiciel ajouté",
+    "removed": "➖ Logiciel supprimé",
+    "updated": "🔄 Version modifiée",
+    "device_added": "🖥️ Nouvelle machine",
+    "device_removed": "❌ Machine retirée"
+}
+
+
+def get_inventory_schedule():
+    """
+    {"delta_hours", "full_days", "last_full_at"} : vérification des
+    changements (empreintes) toutes les `delta_hours` heures, import
+    complet tous les `full_days` jours.
+    """
+
+    return {
+        "delta_hours": int(get_app_config(INVENTORY_DELTA_HOURS_KEY, "6")),
+        "full_days": int(get_app_config(INVENTORY_FULL_DAYS_KEY, "7")),
+        "last_full_at": get_app_config(INVENTORY_LAST_FULL_KEY)
+    }
+
+
+def set_inventory_schedule(delta_hours, full_days):
+
+    set_app_config(INVENTORY_DELTA_HOURS_KEY, str(int(delta_hours)))
+    set_app_config(INVENTORY_FULL_DAYS_KEY, str(int(full_days)))
+
+
+def mark_inventory_full_import():
+
+    set_app_config(INVENTORY_LAST_FULL_KEY, datetime.now(timezone.utc).isoformat())
+
+
+def get_inventory_fingerprints():
+
+    conn = get_connection()
+
+    rows = conn.execute(
+        "SELECT device_id, fingerprint FROM inventory_fingerprints"
+    ).fetchall()
+
+    conn.close()
+
+    return {row[0]: row[1] for row in rows}
+
+
+def save_inventory_fingerprints(fingerprints, replace_all=True):
+    """
+    fingerprints : [{"DeviceId", "Fingerprint", "Rows"}]. replace_all :
+    les machines absentes de la liste sont oubliées.
+    """
+
+    now = datetime.now(timezone.utc).isoformat()
+
+    conn = get_connection()
+    conn.execute("BEGIN")
+
+    if replace_all:
+        conn.execute("DELETE FROM inventory_fingerprints")
+
+    conn.executemany(
+        """
+        INSERT OR REPLACE INTO inventory_fingerprints (
+            device_id, fingerprint, software_rows, checked_at
+        )
+        VALUES (?, ?, ?, ?)
+        """,
+        [
+            (row["DeviceId"], row["Fingerprint"], int(row.get("Rows") or 0), now)
+            for row in fingerprints
+        ]
+    )
+    conn.commit()
+    conn.close()
+
+
+def forget_inventory_fingerprints(device_ids=None):
+    """Oublie les empreintes (toutes, ou de certaines machines) : ces
+    machines seront retéléchargées à la prochaine vérification."""
+
+    conn = get_connection()
+
+    if device_ids is None:
+        conn.execute("DELETE FROM inventory_fingerprints")
+    else:
+        conn.executemany(
+            "DELETE FROM inventory_fingerprints WHERE device_id = ?",
+            [(device_id,) for device_id in device_ids]
+        )
+
+    conn.commit()
+    conn.close()
+
+
+def record_inventory_changes(changes):
+
+    if not changes:
+        return
+
+    conn = get_connection()
+    conn.executemany(
+        """
+        INSERT INTO inventory_changes (
+            detected_at, device_id, device_name, change_type,
+            software_vendor, software_name, old_version, new_version,
+            cves_introduced, cves_fixed, critical_introduced
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        [
+            (
+                change["detected_at"], change["device_id"], change.get("device_name"),
+                change["change_type"], change.get("software_vendor"),
+                change.get("software_name"), change.get("old_version"),
+                change.get("new_version"),
+                ", ".join(change.get("cves_introduced") or []),
+                ", ".join(change.get("cves_fixed") or []),
+                int(change.get("critical_introduced") or 0)
+            )
+            for change in changes
+        ]
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_inventory_changes(
+    since=None,
+    change_types=None,
+    search=None,
+    critical_only=False,
+    limit=2000
+):
+    """Changements d'inventaire, les plus récents d'abord."""
+
+    where = []
+    params = []
+
+    if since:
+        where.append("detected_at >= ?")
+        params.append(since.isoformat())
+
+    if change_types:
+        where.append(f"change_type IN ({', '.join('?' for _ in change_types)})")
+        params.extend(change_types)
+
+    if search:
+        like = f"%{search.strip()}%"
+        where.append(
+            "(device_name LIKE ? OR device_id LIKE ? OR software_name LIKE ? "
+            "OR software_vendor LIKE ? OR cves_introduced LIKE ?)"
+        )
+        params.extend([like] * 5)
+
+    if critical_only:
+        where.append("critical_introduced > 0")
+
+    where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+
+    conn = get_connection()
+
+    rows = conn.execute(
+        f"""
+        SELECT *
+        FROM inventory_changes
+        {where_sql}
+        ORDER BY detected_at DESC, id DESC
+        LIMIT ?
+        """,
+        params + [int(limit)]
+    ).fetchall()
+
+    conn.close()
+
+    return [dict(row) for row in rows]
 
 
 def get_nvd_total_count():
