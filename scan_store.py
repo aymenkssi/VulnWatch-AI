@@ -15,6 +15,7 @@ pages figées sur ce projet.
 
 import json
 import re
+import uuid
 
 from database import (
     get_connection,
@@ -33,6 +34,43 @@ DEFAULT_CLICKUP_SPACE_ID = "60866384"
 SYNC_KEY = "clickup_migration"
 
 _TABLES_READY = False
+
+
+def _backfill_nessus_fields(conn):
+    """
+    Constats déjà migrés avant l'ajout des colonnes Nessus : les valeurs
+    sont relues dans le JSON ClickUp brut conservé (raw_json).
+    """
+
+    from collectors.clickup import resolve_custom_field, extract_nessus_fields
+
+    rows = conn.execute(
+        "SELECT task_id, raw_json FROM scan_findings WHERE raw_json IS NOT NULL"
+    ).fetchall()
+
+    for row in rows:
+
+        try:
+            raw = json.loads(row["raw_json"] or "{}")
+        except (ValueError, TypeError):
+            continue
+
+        by_id, by_name = {}, {}
+
+        for field in raw.get("custom_fields") or []:
+
+            value = resolve_custom_field(field)
+            by_id[field.get("id")] = value
+            by_name[field.get("name")] = value
+
+        nessus = extract_nessus_fields(by_id, by_name)
+
+        conn.execute(
+            "UPDATE scan_findings SET plugin_id = ?, cve = ?, cvss = ?, "
+            "last_scan = ? WHERE task_id = ?",
+            (nessus["plugin_id"], nessus["cve"], nessus["cvss"],
+             nessus["last_scan"], row["task_id"])
+        )
 
 
 # =========================================================
@@ -183,6 +221,23 @@ def ensure_scan_tables():
             "ALTER TABLE scan_findings ADD COLUMN assigned_user_id INTEGER"
         )
 
+    # Champs Nessus dédiés (Plugin ID, CVE, CVSS, date du dernier scan) :
+    # clé de rapprochement de l'import de scan, comme dans le script
+    # ImportVullns.ps1. local_modified_at : constat créé ou modifié par
+    # un import local ; la migration ClickUp ne l'écrase plus.
+    added_nessus = False
+
+    for column in ("plugin_id", "cve", "cvss", "last_scan", "local_modified_at"):
+
+        if column not in existing:
+
+            conn.execute(f"ALTER TABLE scan_findings ADD COLUMN {column} TEXT")
+
+            added_nessus = True
+
+    if added_nessus:
+        _backfill_nessus_fields(conn)
+
     if "assigned_manual" not in existing:
         conn.execute(
             "ALTER TABLE scan_findings "
@@ -192,6 +247,11 @@ def ensure_scan_tables():
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_scan_findings_assigned "
         "ON scan_findings(assigned_user_id)"
+    )
+
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_scan_findings_match "
+        "ON scan_findings(list_name, plugin_id)"
     )
 
     conn.commit()
@@ -266,7 +326,8 @@ _FINDING_COLUMNS = (
     "assignees_json", "tags_json", "creator", "custom_fields_json",
     "checklists_json", "raw_json", "date_created", "date_updated",
     "date_closed", "date_done", "due_date", "url", "parent_task_id",
-    "details_synced", "imported_at", "last_synced_at"
+    "details_synced", "imported_at", "last_synced_at",
+    "plugin_id", "cve", "cvss", "last_scan"
 )
 
 
@@ -309,7 +370,11 @@ def _finding_row(finding, now_iso, details_synced):
         finding.get("parent_task_id"),
         1 if details_synced else 0,
         now_iso,
-        now_iso
+        now_iso,
+        finding.get("plugin_id"),
+        finding.get("cve"),
+        finding.get("cvss"),
+        finding.get("last_scan")
     )
 
 
@@ -337,7 +402,10 @@ def save_scan_batch(items, now_iso):
     sql = (
         f"INSERT INTO scan_findings ({', '.join(_FINDING_COLUMNS)}) "
         f"VALUES ({placeholders}) "
-        f"ON CONFLICT(task_id) DO UPDATE SET {updates}"
+        f"ON CONFLICT(task_id) DO UPDATE SET {updates} "
+        # Constat modifié par un import de scan local : la version
+        # VulnWatch fait foi, la migration ClickUp n'y touche plus.
+        f"WHERE scan_findings.local_modified_at IS NULL"
     )
 
     conn = get_connection()
@@ -439,13 +507,23 @@ def get_synced_task_state():
     conn = get_connection()
 
     rows = conn.execute(
-        "SELECT task_id, date_updated FROM scan_findings "
-        "WHERE details_synced = 1"
+        "SELECT task_id, date_updated, local_modified_at FROM scan_findings "
+        "WHERE details_synced = 1 OR local_modified_at IS NOT NULL"
     ).fetchall()
 
     conn.close()
 
-    return {r["task_id"]: r["date_updated"] for r in rows}
+    # Constat modifié localement : valeur spéciale, la migration le
+    # saute quoi que dise ClickUp (sa version locale fait foi).
+    return {
+        r["task_id"]: (
+            LOCALLY_MODIFIED if r["local_modified_at"] else r["date_updated"]
+        )
+        for r in rows
+    }
+
+
+LOCALLY_MODIFIED = "__local__"
 
 
 # =========================================================
@@ -534,6 +612,7 @@ def get_scan_findings(
             f.status_type, f.treated, f.priority, f.risk, f.host, f.port,
             f.assignee_names, f.date_created, f.date_updated,
             f.date_closed, f.due_date, f.url,
+            f.plugin_id, f.cvss, f.last_scan, f.tags_json, f.source,
             f.assigned_user_id, u.utilisateur AS assigned_user,
             u.mail AS assigned_mail,
             (SELECT GROUP_CONCAT(c.cve_id, ', ')
@@ -930,3 +1009,250 @@ def set_scan_assignments(assignments):
     conn.close()
 
     return len(assignments)
+
+
+# =========================================================
+# IMPORT DE SCAN NESSUS (voir scan_import.py)
+# =========================================================
+
+def _normalize_status(status):
+
+    from scan_import import normalize_status
+
+    return normalize_status(status)
+
+
+def get_list_info(list_name):
+    """list_id / folder_name d'une liste déjà connue (None sinon)."""
+
+    ensure_scan_tables()
+
+    conn = get_connection()
+
+    row = conn.execute(
+        "SELECT list_id, folder_name, space_id FROM scan_findings "
+        "WHERE list_name = ? AND list_id IS NOT NULL LIMIT 1",
+        (list_name,)
+    ).fetchone()
+
+    conn.close()
+
+    return dict(row) if row else {
+        "list_id": None, "folder_name": None, "space_id": None
+    }
+
+
+def get_import_candidates(list_name):
+    """Constats de la liste, fermés compris (clé de rapprochement)."""
+
+    ensure_scan_tables()
+
+    conn = get_connection()
+
+    rows = conn.execute(
+        "SELECT task_id, title, plugin_id, port, cve, status "
+        "FROM scan_findings WHERE list_name = ?",
+        (list_name,)
+    ).fetchall()
+
+    conn.close()
+
+    return [dict(r) for r in rows]
+
+
+def get_status_catalog(list_name=None):
+    """
+    Statuts connus (orthographe stockée, type ClickUp, ordre) :
+    {statut normalisé: {"status", "status_type", "orderindex"}}.
+    Ceux de la liste choisie priment sur ceux des autres listes.
+    """
+
+    ensure_scan_tables()
+
+    conn = get_connection()
+
+    rows = conn.execute(
+        "SELECT status, status_type, raw_json, "
+        "       COALESCE(list_name = ?, 0) AS same_list "
+        "FROM scan_findings WHERE status IS NOT NULL "
+        "GROUP BY status, status_type, same_list",
+        (list_name,)
+    ).fetchall()
+
+    conn.close()
+
+    catalog = {}
+
+    for row in sorted(rows, key=lambda r: r["same_list"]):
+
+        try:
+            orderindex = (
+                json.loads(row["raw_json"] or "{}").get("status") or {}
+            ).get("orderindex")
+        except (ValueError, TypeError, AttributeError):
+            orderindex = None
+
+        catalog[_normalize_status(row["status"])] = {
+            "status": row["status"],
+            "status_type": row["status_type"] or "open",
+            "orderindex": orderindex
+        }
+
+    return catalog
+
+
+def default_new_status(catalog):
+    """
+    Statut d'un nouveau constat : dans ClickUp, le premier statut
+    (ouvert) de la liste. À défaut, RÉDUIRE.
+    """
+
+    opened = [
+        v for v in catalog.values()
+        if v["status_type"] == "open" and v["orderindex"] is not None
+    ]
+
+    if opened:
+        return min(opened, key=lambda v: int(v["orderindex"]))["status"]
+
+    return (catalog.get("reduire") or {}).get("status") or "reduire"
+
+
+def apply_scan_import(plan, list_name, scan_date, now, author,
+                      new_status):
+    """
+    Écrit le plan de scan_import.build_import_plan() en UNE transaction.
+    `scan_date` : date du scan (date), `now` : date d'import (datetime
+    avec fuseau), `author` : utilisateur VulnWatch (auteur du
+    commentaire), `new_status` : statut des nouveaux constats.
+    Retourne les compteurs effectivement appliqués.
+    """
+
+    ensure_scan_tables()
+
+    catalog = get_status_catalog(list_name)
+    info = get_list_info(list_name)
+
+    def status_of(normalized, fallback):
+
+        entry = catalog.get(normalized)
+
+        return (
+            (entry["status"], entry["status_type"]) if entry
+            else (fallback, "open")
+        )
+
+    reduire, reduire_type = status_of("reduire", "reduire")
+    new_status_type = (
+        catalog.get(_normalize_status(new_status)) or {}
+    ).get("status_type", "open")
+
+    now_iso = now.isoformat()
+    scan_iso = scan_date.isoformat()
+
+    # Même texte que le script : « Date d'import: <date et heure> ».
+    comment_text = f"Date d'import: {now.strftime('%d/%m/%Y %H:%M:%S')}"
+
+    applied = {}
+
+    conn = get_connection()
+
+    def add_comment(task_id):
+
+        conn.execute(
+            "INSERT INTO scan_finding_comments (comment_id, task_id, "
+            "author_name, text, date) VALUES (?, ?, ?, ?, ?)",
+            (f"VW-{uuid.uuid4().hex}", task_id, author, comment_text, now_iso)
+        )
+
+    for item in plan["actions"]:
+
+        action = item["action"]
+        row = item["row"]
+        task_id = item["task_id"]
+
+        if action in ("unchanged", "duplicate", "info"):
+            continue
+
+        if action == "new":
+
+            task_id = f"VW-{uuid.uuid4().hex[:16]}"
+
+            custom_fields = {
+                "Plugin ID": row["plugin_id"], "Risk": row["risk"],
+                "CVE": row["cve"], "CVSS": row["cvss"], "Port": row["port"],
+                "Last Scan": scan_iso, "HOST": row["host"]
+            }
+
+            conn.execute(
+                """
+                INSERT INTO scan_findings (
+                    task_id, source, space_id, list_id, list_name,
+                    folder_name, title, description, status, status_type,
+                    treated, risk, host, port, plugin_id, cve, cvss,
+                    last_scan, assignee_names, assignees_json, tags_json,
+                    creator, custom_fields_json, checklists_json, raw_json,
+                    date_created, date_updated, due_date, details_synced,
+                    imported_at, last_synced_at, local_modified_at
+                )
+                VALUES (?, 'Nessus CSV', ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?,
+                        ?, ?, ?, ?, ?, '', '[]', ?, ?, ?, '[]', NULL, ?, ?,
+                        ?, 0, ?, ?, ?)
+                """,
+                (
+                    task_id, info["space_id"], info["list_id"], list_name,
+                    info["folder_name"], row["srv"], row["description"],
+                    new_status, new_status_type, row["risk"], row["host"],
+                    row["port"], row["plugin_id"], row["cve"], row["cvss"],
+                    scan_iso,
+                    json.dumps([row["name"]] if row["name"] else [],
+                               ensure_ascii=False),
+                    author,
+                    json.dumps(custom_fields, ensure_ascii=False),
+                    now_iso, now_iso, row["due_date"], now_iso, now_iso,
+                    now_iso
+                )
+            )
+
+            if row["cve"]:
+                conn.execute(
+                    "INSERT OR IGNORE INTO scan_finding_cves (task_id, cve_id) "
+                    "VALUES (?, ?)",
+                    (task_id, row["cve"])
+                )
+
+        elif action == "reopen":
+
+            conn.execute(
+                "UPDATE scan_findings SET status = ?, status_type = ?, "
+                "treated = 0, date_closed = NULL, date_done = NULL, "
+                "due_date = ?, last_scan = ?, date_updated = ?, "
+                "local_modified_at = ? WHERE task_id = ?",
+                (reduire, reduire_type, row["due_date"], scan_iso, now_iso,
+                 now_iso, task_id)
+            )
+
+        elif action == "refresh":
+
+            conn.execute(
+                "UPDATE scan_findings SET due_date = ?, last_scan = ?, "
+                "date_updated = ?, local_modified_at = ? WHERE task_id = ?",
+                (row["due_date"], scan_iso, now_iso, now_iso, task_id)
+            )
+
+        elif action == "accepted":
+
+            conn.execute(
+                "UPDATE scan_findings SET due_date = NULL, last_scan = ?, "
+                "date_updated = ?, local_modified_at = ? WHERE task_id = ?",
+                (scan_iso, now_iso, now_iso, task_id)
+            )
+
+        add_comment(task_id)
+
+        applied[action] = applied.get(action, 0) + 1
+
+    conn.commit()
+    conn.close()
+
+    return applied

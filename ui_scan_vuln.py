@@ -18,8 +18,9 @@ détail (commentaires, pièces jointes, champs ClickUp bruts, croisement
 CVE avec NVD / CISA KEV / Defender), export CSV.
 """
 
+import json
 import os
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -42,7 +43,18 @@ from scan_store import (
     get_scan_users,
     save_scan_users,
     set_scan_assignments,
-    seed_scan_users_from_findings
+    seed_scan_users_from_findings,
+    get_import_candidates,
+    get_status_catalog,
+    default_new_status,
+    apply_scan_import
+)
+from scan_import import (
+    ACTION_LABELS,
+    ScanImportError,
+    read_nessus_csv,
+    read_host_table,
+    build_import_plan
 )
 
 # Lancée via services/jobs.py comme les autres synchros : barre de
@@ -73,6 +85,15 @@ def _status_label(status):
     )
 
     return f"{STATUS_ICONS.get(key, '⚪')} {status}"
+
+
+def _tags(tags_json):
+    """Étiquettes ClickUp : le script y plaçait le nom de la vulnérabilité."""
+
+    try:
+        return ", ".join(json.loads(tags_json or "[]"))
+    except (ValueError, TypeError):
+        return ""
 
 
 def _day(value):
@@ -269,12 +290,238 @@ def _render_users(is_admin):
             st.rerun()
 
 
-def render_scan_vulnerabilites(is_admin=False, render_job=None):
+def _render_nessus_import(is_admin, current_user):
+    """
+    Import d'un export CSV Nessus, avec les mêmes règles que le script
+    ImportVullns.ps1 (voir scan_import.py) : analyse d'abord, écriture
+    après confirmation.
+    """
+
+    result = st.session_state.pop("nessus_import_result", None)
+
+    with st.expander(
+        "Importer un scan Nessus (CSV)", expanded=result is not None
+    ):
+
+        if result:
+            st.success(result)
+
+        if not is_admin:
+            st.caption("🔒 Import réservé aux administrateurs.")
+            return
+
+        st.caption(
+            "Mêmes règles que le script ImportVullns.ps1 : rapprochement "
+            "avec les constats de la liste (fermés compris) par hôte, "
+            "Plugin ID, port et CVE. Existant TRAITÉ / ATTÉNUÉ → repasse en "
+            "RÉDUIRE ; RÉDUIRE → échéance recalculée ; ACCEPTÉ → sans "
+            "échéance ; autre statut → inchangé. Sinon : nouveau constat. "
+            "Échéance depuis l'import : Critical 7 j, High 14 j, Medium "
+            "21 j, Low 42 j. Commentaire « Date d'import » et date du "
+            "dernier scan sur chaque constat traité."
+        )
+
+        lists = get_scan_filter_options()["lists"]
+        new_list_label = "➕ Nouvelle liste…"
+
+        c1, c2 = st.columns(2)
+
+        choice = c1.selectbox(
+            "Liste (périmètre)", lists + [new_list_label],
+            key="nessus_list"
+        )
+
+        if choice == new_list_label:
+            list_name = c1.text_input(
+                "Nom de la nouvelle liste", key="nessus_new_list"
+            ).strip()
+        else:
+            list_name = choice
+
+        scan_date = c2.date_input(
+            "Date du scan", value=date.today(), format="DD/MM/YYYY",
+            key="nessus_scan_date"
+        )
+
+        f1, f2 = st.columns(2)
+
+        nessus_file = f1.file_uploader(
+            "Fichier des vulnérabilités (export CSV Nessus)",
+            type=["csv"], key="nessus_file"
+        )
+
+        hosts_file = f2.file_uploader(
+            "Correspondance IP → nom d'hôte (CSV, colonnes IP,HOST)",
+            type=["csv"], key="nessus_hosts",
+            help=(
+                "Facultatif. Sans correspondance : nom court du FQDN "
+                "(srv01.domaine.local → srv01), adresse IP gardée entière."
+            )
+        )
+
+        o1, o2 = st.columns(2)
+
+        skip_info = o1.checkbox(
+            "Ignorer les lignes informatives (Risk = None)",
+            value=True, key="nessus_skip_info"
+        )
+
+        catalog = get_status_catalog(list_name) if list_name else {}
+        statuses = sorted({v["status"] for v in catalog.values()})
+        default_status = default_new_status(catalog)
+
+        if default_status not in statuses:
+            statuses.insert(0, default_status)
+
+        new_status = o2.selectbox(
+            "Statut des nouveaux constats", statuses,
+            index=statuses.index(default_status),
+            key=f"nessus_new_status_{list_name}",
+            help="Par défaut : premier statut ouvert de la liste (comme ClickUp)."
+        )
+
+        params = {
+            "list": list_name,
+            "scan_date": scan_date,
+            "skip_info": skip_info,
+            "new_status": new_status,
+            "file": (
+                (nessus_file.name, nessus_file.size) if nessus_file else None
+            ),
+            "hosts": (hosts_file.name, hosts_file.size) if hosts_file else None
+        }
+
+        if st.button(
+            "Analyser le fichier",
+            key="nessus_analyse",
+            disabled=not (nessus_file and list_name)
+        ):
+
+            try:
+
+                frame = read_nessus_csv(nessus_file)
+                host_table = read_host_table(hosts_file)
+                now = datetime.now().astimezone()
+
+                plan = build_import_plan(
+                    frame, host_table, get_import_candidates(list_name),
+                    now, skip_info
+                )
+
+            except ScanImportError as error:
+
+                st.session_state.pop("nessus_plan", None)
+                st.error(str(error))
+
+            else:
+
+                st.session_state["nessus_plan"] = {
+                    "plan": plan, "params": params, "now": now,
+                    "rows": len(frame), "hosts": len(host_table)
+                }
+
+        pending = st.session_state.get("nessus_plan")
+
+        if not pending:
+            return
+
+        stale = pending["params"] != params
+
+        counts = pending["plan"]["counts"]
+
+        st.markdown(
+            f"**Analyse :** {pending['rows']:,} ligne(s) dans le CSV, "
+            f"{pending['hosts']} correspondance(s) IP → hôte, liste "
+            f"« {pending['params']['list']} »."
+        )
+
+        st.dataframe(
+            pd.DataFrame([
+                {"Action": ACTION_LABELS[key], "Lignes": n}
+                for key, n in counts.items() if n
+            ]),
+            use_container_width=True, hide_index=True
+        )
+
+        # Pas d'expander ici : Streamlit refuse les expanders imbriqués.
+        if st.checkbox("Afficher le détail ligne par ligne", key="nessus_detail"):
+
+            st.dataframe(
+                pd.DataFrame([
+                    {
+                        "Action": ACTION_LABELS[a["action"]],
+                        "Host (Nessus)": a["row"]["srv"],
+                        "Hôte": a["row"]["host"],
+                        "Plugin ID": a["row"]["plugin_id"],
+                        "Vulnérabilité": a["row"]["name"],
+                        "Port": a["row"]["port"],
+                        "CVE": a["row"]["cve"],
+                        "Risque": a["row"]["risk"],
+                        "Statut actuel": a["status_before"],
+                        "Échéance": _day(a["row"]["due_date"])
+                        if a["action"] in ("new", "reopen", "refresh") else ""
+                    }
+                    for a in pending["plan"]["actions"]
+                ]),
+                use_container_width=True, hide_index=True
+            )
+
+        to_write = sum(
+            counts[k] for k in ("new", "reopen", "refresh", "accepted")
+        )
+
+        if stale:
+            st.warning(
+                "Les paramètres ou les fichiers ont changé depuis l'analyse : "
+                "relancez « Analyser le fichier »."
+            )
+
+        b1, b2 = st.columns(2)
+
+        if b1.button(
+            f"Confirmer l'import ({to_write} constat(s))",
+            key="nessus_apply",
+            type="primary",
+            disabled=stale or to_write == 0,
+            use_container_width=True
+        ):
+
+            applied = apply_scan_import(
+                pending["plan"], pending["params"]["list"],
+                pending["params"]["scan_date"], pending["now"],
+                current_user or "VulnWatch", pending["params"]["new_status"]
+            )
+
+            st.session_state.pop("nessus_plan", None)
+
+            st.session_state["nessus_import_result"] = (
+                "Import terminé : "
+                f"{applied.get('new', 0)} nouveau(x), "
+                f"{applied.get('reopen', 0)} réouvert(s), "
+                f"{applied.get('refresh', 0)} échéance(s) recalculée(s), "
+                f"{applied.get('accepted', 0)} accepté(s) mis à jour."
+            )
+
+            st.rerun()
+
+        if b2.button(
+            "Annuler", key="nessus_cancel", use_container_width=True
+        ):
+
+            st.session_state.pop("nessus_plan", None)
+
+            st.rerun()
+
+
+def render_scan_vulnerabilites(is_admin=False, render_job=None,
+                               current_user=None):
     """
     is_admin : IS_ADMIN de app.py. Par défaut False : sans information
     sur le rôle, on reste en lecture seule.
     render_job : app.render_job, pour afficher la progression de la
     migration sous le bouton (facultatif).
+    current_user : identifiant VulnWatch, auteur des commentaires
+    « Date d'import » de l'import Nessus.
     """
 
     st.subheader("Scan vulnérabilité")
@@ -486,6 +733,8 @@ def render_scan_vulnerabilites(is_admin=False, render_job=None):
         # Premier remplissage avec les assignés ClickUp déjà migrés.
         seed_scan_users_from_findings()
 
+    _render_nessus_import(is_admin, current_user)
+
     _render_users(is_admin)
 
     # -----------------------------------------------------
@@ -582,6 +831,8 @@ def render_scan_vulnerabilites(is_admin=False, render_job=None):
 
     display = pd.DataFrame({
         "Constat": df["title"],
+        "Vulnérabilité": df["tags_json"].map(_tags),
+        "Plugin ID": df["plugin_id"],
         "Hôte": df["host"],
         "Port": df["port"],
         "Statut": df["status"].map(_status_label),
@@ -589,6 +840,8 @@ def render_scan_vulnerabilites(is_admin=False, render_job=None):
         "Liste": df["list_name"],
         "Assigné": df["assigned_user"].where(df["assigned_user"].notna(), None),
         "CVE": df["cves"],
+        "CVSS": df["cvss"],
+        "Dernier scan": df["last_scan"].map(_day),
         "Créé": df["date_created"].map(_day),
         "Mis à jour": df["date_updated"].map(_day),
         "Fermé": df["date_closed"].map(_day),
@@ -719,6 +972,12 @@ def render_scan_vulnerabilites(is_admin=False, render_job=None):
         f"**Assigné(s) dans ClickUp :** {detail.get('assignee_names') or '—'}  \n"
         f"**Créé :** {_day(detail.get('date_created'))} — "
         f"**Fermé :** {_day(detail.get('date_closed')) or '—'}  \n"
+        f"**Vulnérabilité :** {_tags(detail.get('tags_json')) or '—'} — "
+        f"**Plugin ID :** {detail.get('plugin_id') or '—'} — "
+        f"**CVSS :** {detail.get('cvss') or '—'}  \n"
+        f"**Dernier scan :** {_day(detail.get('last_scan')) or '—'} — "
+        f"**Échéance :** {_day(detail.get('due_date')) or '—'}  \n"
+        f"**Source :** {detail.get('source') or '—'} — "
         f"**Lien ClickUp d'origine :** {detail.get('url') or '—'}"
     )
 

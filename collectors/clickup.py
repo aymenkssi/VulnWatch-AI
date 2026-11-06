@@ -39,6 +39,29 @@ COMMENT_PAGE_SIZE = 25   # taille de page de GET /task/{id}/comment
 
 CVE_PATTERN = re.compile(r"CVE-\d{4}-\d{4,7}", re.IGNORECASE)
 
+# Champs personnalisés de l'espace « DSI Infra SecOps », tels que les
+# alimentait le script d'import Nessus -> ClickUp (ImportVullns.ps1).
+# Reconnus d'abord par leur id, puis par leur nom (repli).
+NESSUS_FIELD_IDS = {
+    "plugin_id": "8f1c3c48-61d4-4fe9-ac7e-d16d0856d385",
+    "risk": "dbfb3038-39f2-4f7c-8c0c-ef5548613e09",
+    "cve": "51abdb0c-f121-4ac5-8322-e6f62b3d9bc3",
+    "cvss": "ea4bcefc-a0a0-40b3-8055-b62ac3f79778",
+    "port": "ca547ef8-1f98-410a-9ac5-f89b25b201cb",
+    "last_scan": "1ed2b0b3-f7f2-45e1-aaed-abece0e4e079",
+    "host": "3ef2de58-dfca-4332-b4f4-6146e55e8420"
+}
+
+NESSUS_FIELD_PATTERNS = {
+    "plugin_id": [r"\bplugin"],
+    "risk": [r"\brisk", r"\brisque", r"\bseverity", r"\bs[ée]v[ée]rit", r"\bcriticit"],
+    "cve": [r"^\s*cve\s*$"],
+    "cvss": [r"\bcvss"],
+    "port": [r"\bport\b"],
+    "last_scan": [r"last\s*scan", r"dernier\s*scan"],
+    "host": [r"\bhost", r"\bh[oô]te"]
+}
+
 
 class ClickUpError(Exception):
     pass
@@ -461,6 +484,30 @@ def _field_by_name(custom_fields, patterns):
     return None
 
 
+def extract_nessus_fields(values_by_id, values_by_name):
+    """
+    Champs Nessus d'une tâche : Plugin ID, risque, CVE, CVSS, port,
+    dernier scan, hôte. `values_by_id` / `values_by_name` : valeurs déjà
+    résolues (resolve_custom_field) par id et par nom de champ.
+    """
+
+    fields = {}
+
+    for key, field_id in NESSUS_FIELD_IDS.items():
+
+        value = values_by_id.get(field_id)
+
+        if value in (None, ""):
+            value = _field_by_name(values_by_name, NESSUS_FIELD_PATTERNS[key])
+
+        fields[key] = str(value).strip() if value not in (None, "") else None
+
+    if fields["cve"]:
+        fields["cve"] = fields["cve"].upper()
+
+    return fields
+
+
 def extract_cves(*texts):
 
     found = []
@@ -488,10 +535,16 @@ def normalize_task(task, space_id=None, list_name=None, folder_name=None):
     """
 
     custom_fields = {}
+    by_id = {}
 
     for field in task.get("custom_fields") or []:
 
-        custom_fields[field.get("name")] = resolve_custom_field(field)
+        value = resolve_custom_field(field)
+
+        custom_fields[field.get("name")] = value
+        by_id[field.get("id")] = value
+
+    nessus = extract_nessus_fields(by_id, custom_fields)
 
     status = task.get("status") or {}
     priority = task.get("priority") or {}
@@ -514,12 +567,9 @@ def normalize_task(task, space_id=None, list_name=None, folder_name=None):
         for a in task.get("assignees") or []
     ]
 
-    host = _field_by_name(custom_fields, [r"\bhost", r"\bh[oô]te"])
-    port = _field_by_name(custom_fields, [r"\bport\b"])
-    risk = _field_by_name(
-        custom_fields,
-        [r"\brisk", r"\brisque", r"\bseverity", r"\bs[ée]v[ée]rit", r"\bcriticit"]
-    )
+    host = nessus["host"]
+    port = nessus["port"]
+    risk = nessus["risk"]
 
     parent = task.get("parent")
 
@@ -538,6 +588,10 @@ def normalize_task(task, space_id=None, list_name=None, folder_name=None):
         "host": host,
         "port": port,
         "risk": risk,
+        "plugin_id": nessus["plugin_id"],
+        "cve": nessus["cve"],
+        "cvss": nessus["cvss"],
+        "last_scan": nessus["last_scan"],
         "assignees": assignees,
         "tags": [t.get("name") for t in task.get("tags") or []],
         "creator": creator.get("username"),
