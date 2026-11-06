@@ -14,6 +14,7 @@ pages figées sur ce projet.
 """
 
 import json
+import re
 
 from database import (
     get_connection,
@@ -151,6 +152,47 @@ def ensure_scan_tables():
         "CREATE INDEX IF NOT EXISTS idx_scan_attach_task ON scan_finding_attachments(task_id)"
     ):
         conn.execute(index_sql)
+
+    # Référentiel des personnes à qui l'on assigne un constat (liste
+    # déroulante « Assigné »). Rempli une première fois avec les assignés
+    # ClickUp migrés, puis complété à la main dans l'interface.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS scan_users (
+
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            utilisateur TEXT NOT NULL UNIQUE COLLATE NOCASE,
+            mail TEXT,
+
+            -- Nom de l'assigné dans ClickUp : garde le lien quand
+            -- l'utilisateur est renommé (« jdupont » -> « Jean DUPONT »).
+            clickup_name TEXT COLLATE NOCASE
+
+        )
+    """)
+
+    # Assignation locale (VulnWatch), distincte de l'assignation ClickUp
+    # d'origine (assignee_names / assignees_json, que la migration
+    # réécrit). assigned_manual = 1 : modifiée dans l'interface, le
+    # remplissage automatique n'y touche plus.
+    existing = {
+        r["name"] for r in conn.execute("PRAGMA table_info(scan_findings)")
+    }
+
+    if "assigned_user_id" not in existing:
+        conn.execute(
+            "ALTER TABLE scan_findings ADD COLUMN assigned_user_id INTEGER"
+        )
+
+    if "assigned_manual" not in existing:
+        conn.execute(
+            "ALTER TABLE scan_findings "
+            "ADD COLUMN assigned_manual INTEGER DEFAULT 0"
+        )
+
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_scan_findings_assigned "
+        "ON scan_findings(assigned_user_id)"
+    )
 
     conn.commit()
     conn.close()
@@ -492,9 +534,12 @@ def get_scan_findings(
             f.status_type, f.treated, f.priority, f.risk, f.host, f.port,
             f.assignee_names, f.date_created, f.date_updated,
             f.date_closed, f.due_date, f.url,
+            f.assigned_user_id, u.utilisateur AS assigned_user,
+            u.mail AS assigned_mail,
             (SELECT GROUP_CONCAT(c.cve_id, ', ')
                FROM scan_finding_cves c WHERE c.task_id = f.task_id) AS cves
         FROM scan_findings f
+        LEFT JOIN scan_users u ON u.id = f.assigned_user_id
         WHERE 1 = 1
     """
 
@@ -517,11 +562,12 @@ def get_scan_findings(
 
         query += (
             " AND (f.title LIKE ? OR f.host LIKE ? OR f.assignee_names LIKE ?"
+            " OR u.utilisateur LIKE ? OR u.mail LIKE ?"
             " OR f.description LIKE ? OR f.task_id IN ("
             "   SELECT task_id FROM scan_finding_cves WHERE cve_id LIKE ?))"
         )
 
-        params.extend([like, like, like, like, like])
+        params.extend([like] * 7)
 
     query += " ORDER BY f.date_updated DESC LIMIT ?"
     params.append(int(limit))
@@ -540,7 +586,11 @@ def get_scan_finding_detail(task_id):
     conn = get_connection()
 
     row = conn.execute(
-        "SELECT * FROM scan_findings WHERE task_id = ?", (task_id,)
+        "SELECT f.*, u.utilisateur AS assigned_user, u.mail AS assigned_mail "
+        "FROM scan_findings f "
+        "LEFT JOIN scan_users u ON u.id = f.assigned_user_id "
+        "WHERE f.task_id = ?",
+        (task_id,)
     ).fetchone()
 
     if row is None:
@@ -637,3 +687,246 @@ def get_scan_cve_context(cve_ids):
     conn.close()
 
     return context
+
+
+# =========================================================
+# UTILISATEURS ET ASSIGNATION
+# =========================================================
+
+MAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
+def _clickup_assignee_names(assignees_json):
+    """Noms des assignés ClickUp d'un constat, dans l'ordre d'origine."""
+
+    try:
+        assignees = json.loads(assignees_json or "[]")
+    except (ValueError, TypeError):
+        return []
+
+    names = []
+
+    for assignee in assignees:
+
+        name = (assignee.get("username") or "").strip()
+
+        if name and name.lower() not in (n.lower() for n in names):
+            names.append(name)
+
+    return names
+
+
+def seed_scan_users_from_findings():
+    """
+    Remplissage à partir des données migrées, rejouable sans risque :
+      - ajoute chaque assigné ClickUp absent du référentiel (champ
+        « utilisateur » seul, le mail est complété à la main) ;
+      - assigne au premier assigné ClickUp les constats encore sans
+        assignation et jamais modifiés à la main.
+    Ne modifie ni les mails saisis, ni une assignation manuelle.
+    Retourne (utilisateurs ajoutés, constats assignés).
+    """
+
+    ensure_scan_tables()
+
+    conn = get_connection()
+
+    rows = conn.execute(
+        "SELECT task_id, assignees_json, assigned_user_id, assigned_manual "
+        "FROM scan_findings"
+    ).fetchall()
+
+    def clickup_map():
+
+        mapping = {}
+
+        for r in conn.execute(
+            "SELECT id, utilisateur, clickup_name FROM scan_users"
+        ):
+
+            mapping.setdefault(r["utilisateur"].lower(), r["id"])
+
+            if r["clickup_name"]:
+                # Le nom ClickUp d'origine prime sur un homonyme.
+                mapping[r["clickup_name"].lower()] = r["id"]
+
+        return mapping
+
+    ids = clickup_map()
+    added = 0
+
+    for row in rows:
+
+        for name in _clickup_assignee_names(row["assignees_json"]):
+
+            if name.lower() in ids:
+                continue
+
+            conn.execute(
+                "INSERT INTO scan_users (utilisateur, clickup_name) "
+                "VALUES (?, ?)",
+                (name, name)
+            )
+
+            ids = clickup_map()
+            added += 1
+
+    assigned = 0
+
+    for row in rows:
+
+        if row["assigned_user_id"] is not None or row["assigned_manual"]:
+            continue
+
+        names = _clickup_assignee_names(row["assignees_json"])
+
+        if not names:
+            continue
+
+        conn.execute(
+            "UPDATE scan_findings SET assigned_user_id = ? WHERE task_id = ?",
+            (ids[names[0].lower()], row["task_id"])
+        )
+
+        assigned += 1
+
+    conn.commit()
+    conn.close()
+
+    return added, assigned
+
+
+def get_scan_users():
+
+    ensure_scan_tables()
+
+    conn = get_connection()
+
+    rows = conn.execute(
+        """
+        SELECT u.id, u.utilisateur, u.mail,
+               (SELECT COUNT(*) FROM scan_findings f
+                 WHERE f.assigned_user_id = u.id) AS constats
+        FROM scan_users u
+        ORDER BY u.utilisateur COLLATE NOCASE
+        """
+    ).fetchall()
+
+    conn.close()
+
+    return [dict(r) for r in rows]
+
+
+def save_scan_users(rows):
+    """
+    Remplace le référentiel par `rows` (liste de dicts id / utilisateur /
+    mail, id None pour un nouvel utilisateur), en une transaction.
+    Un utilisateur retiré de la liste est supprimé et ses constats
+    deviennent non assignés. Lève ValueError si la saisie est invalide
+    (rien n'est alors écrit).
+    """
+
+    ensure_scan_tables()
+
+    cleaned = []
+    seen = set()
+
+    for row in rows:
+
+        name = (row.get("utilisateur") or "").strip()
+        mail = (row.get("mail") or "").strip() or None
+
+        if not name and not mail:
+            # Ligne vide ajoutée puis abandonnée dans l'éditeur.
+            continue
+
+        if not name:
+            raise ValueError(f"Utilisateur manquant pour le mail {mail}.")
+
+        if name.lower() in seen:
+            raise ValueError(f"Utilisateur en double : {name}.")
+
+        if mail and not MAIL_PATTERN.match(mail):
+            raise ValueError(f"Adresse mail invalide pour {name} : {mail}.")
+
+        seen.add(name.lower())
+
+        user_id = row.get("id")
+        user_id = int(user_id) if user_id not in (None, "") else None
+
+        cleaned.append((user_id, name, mail))
+
+    conn = get_connection()
+
+    kept = {user_id for user_id, _, _ in cleaned if user_id is not None}
+
+    existing = {
+        r["id"] for r in conn.execute("SELECT id FROM scan_users")
+    }
+
+    removed = existing - kept
+
+    for user_id in removed:
+
+        conn.execute(
+            "UPDATE scan_findings SET assigned_user_id = NULL, "
+            "assigned_manual = 1 WHERE assigned_user_id = ?",
+            (user_id,)
+        )
+
+        conn.execute("DELETE FROM scan_users WHERE id = ?", (user_id,))
+
+    # Renommages d'abord sous un nom temporaire : permet d'échanger deux
+    # noms sans heurter la contrainte UNIQUE.
+    for user_id, name, mail in cleaned:
+
+        if user_id is not None:
+            conn.execute(
+                "UPDATE scan_users SET utilisateur = ? WHERE id = ?",
+                (f"__tmp_{user_id}", user_id)
+            )
+
+    for user_id, name, mail in cleaned:
+
+        if user_id is None:
+            conn.execute(
+                "INSERT INTO scan_users (utilisateur, mail) VALUES (?, ?)",
+                (name, mail)
+            )
+        else:
+            conn.execute(
+                "UPDATE scan_users SET utilisateur = ?, mail = ? WHERE id = ?",
+                (name, mail, user_id)
+            )
+
+    conn.commit()
+    conn.close()
+
+    return len(removed)
+
+
+def set_scan_assignments(assignments):
+    """
+    `assignments` : {task_id: user_id ou None}. Enregistré en une
+    transaction ; marque l'assignation comme manuelle.
+    """
+
+    if not assignments:
+        return 0
+
+    ensure_scan_tables()
+
+    conn = get_connection()
+
+    for task_id, user_id in assignments.items():
+
+        conn.execute(
+            "UPDATE scan_findings SET assigned_user_id = ?, "
+            "assigned_manual = 1 WHERE task_id = ?",
+            (user_id, task_id)
+        )
+
+    conn.commit()
+    conn.close()
+
+    return len(assignments)

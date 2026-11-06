@@ -43,7 +43,8 @@ from scan_store import (
     mark_list_done,
     get_synced_task_state,
     save_scan_batch,
-    set_attachment_download
+    set_attachment_download,
+    seed_scan_users_from_findings
 )
 from services.jobs import report_progress
 from collectors.clickup import (
@@ -273,6 +274,11 @@ def main():
 
         sys.exit(1)
 
+    # Liste déroulante « Assigné » : ajoute les nouveaux assignés ClickUp
+    # au référentiel et assigne les nouveaux constats (sans toucher aux
+    # assignations faites à la main).
+    users_added, findings_assigned = seed_scan_users_from_findings()
+
     report_progress(len(lists), len(lists), "Migration terminée", force=True)
 
     print()
@@ -282,6 +288,8 @@ def main():
     print(f"  Commentaires        : {totals['comments']}")
     print(f"  Fichiers téléchargés: {totals['files']}")
     print(f"  Appels API ClickUp  : {client.calls}")
+    print(f"  Utilisateurs ajoutés: {users_added}")
+    print(f"  Constats assignés   : {findings_assigned}")
     print()
 
     set_sync_state(
