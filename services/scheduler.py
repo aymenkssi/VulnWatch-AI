@@ -40,7 +40,8 @@ JOB_LABELS = {
     "nvd_match.py": "Calcul des équipements touchés (NVD)",
     "nvd_import_files.py": "Import de fichiers NVD",
     "nvd_cpe_sync.py": "Téléchargement des produits vulnérables NVD",
-    "sync_nvd_backfill.py": "Téléchargement historique NVD"
+    "sync_nvd_backfill.py": "Téléchargement historique NVD",
+    "sync_clickup.py": "Migration ClickUp"
 }
 
 # CISA KEV : toutes les 12 h.

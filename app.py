@@ -4996,7 +4996,7 @@ with tab_attack_surface:
 # de diffusion dédiée (pas les propriétaires de serveur).
 
 with tab_scan:
-    render_scan_vulnerabilites()
+    render_scan_vulnerabilites(is_admin=IS_ADMIN, render_job=render_job)
 
 
 with tab_watch:

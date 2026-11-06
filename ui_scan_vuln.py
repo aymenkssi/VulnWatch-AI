@@ -6,7 +6,11 @@ Rubrique "Scan vulnérabilité" de VulnWatch-AI.
     from ui_scan_vuln import render_scan_vulnerabilites
     ...
     with tab_scan:
-        render_scan_vulnerabilites()
+        render_scan_vulnerabilites(is_admin=IS_ADMIN, render_job=render_job)
+
+Rôle Lecteur : consultation, filtres et exports uniquement ; la
+configuration du token et la migration sont réservées aux
+administrateurs (même règle que les autres onglets).
 
 Contenu : migration depuis ClickUp (token, test de connexion, lancement
 en arrière-plan avec suivi), indicateurs, filtres, tableau des constats,
@@ -15,15 +19,14 @@ CVE avec NVD / CISA KEV / Defender), export CSV.
 """
 
 import os
-import subprocess
-import sys
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
 import streamlit as st
 
 from database import get_sync_state
+from services.jobs import start_job, is_job_running
 from scan_store import (
     SYNC_KEY,
     get_clickup_token,
@@ -38,10 +41,13 @@ from scan_store import (
     get_scan_cve_context
 )
 
-# Même principe que le téléchargement historique NVD : un sous-processus
-# actif met à jour son statut régulièrement ; sans nouvelle depuis ce
-# délai, on le considère mort et on autorise un nouveau lancement.
-MIGRATION_STALE_MINUTES = 15
+# Lancée via services/jobs.py comme les autres synchros : barre de
+# progression, journal dans data/jobs/, bouton « Arrêter » et pas de
+# double lancement. Clé = nom du script sans extension (convention de
+# app.launch_job).
+MIGRATION_SCRIPT = "sync_clickup.py"
+MIGRATION_JOB_KEY = "sync_clickup"
+MIGRATION_LABEL = "Migration ClickUp"
 
 STATUS_ICONS = {
     "TRAITE": "✅",
@@ -89,28 +95,6 @@ def _format_ts(iso_value):
         return iso_value
 
 
-def _migration_running(state):
-
-    if not state or state.get("status") != "RUNNING":
-        return False
-
-    try:
-
-        last = datetime.fromisoformat(state["last_run_at"])
-
-        if last.tzinfo is None:
-            last = last.replace(tzinfo=timezone.utc)
-
-        return (
-            datetime.now(timezone.utc) - last
-            < timedelta(minutes=MIGRATION_STALE_MINUTES)
-        )
-
-    except (ValueError, KeyError, TypeError):
-
-        return False
-
-
 def _launch_migration(with_comments, with_attachments, with_download,
                       include_archived):
 
@@ -123,12 +107,9 @@ def _launch_migration(with_comments, with_attachments, with_download,
     env["VULNWATCH_CLICKUP_DOWNLOAD"] = "1" if with_download else "0"
     env["VULNWATCH_CLICKUP_ARCHIVED"] = "1" if include_archived else "0"
 
-    # Popen (pas run) : processus détaché, l'interface n'attend pas.
-    subprocess.Popen(
-        [sys.executable, "sync_clickup.py"],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        env=env
+    # start_job ne fait rien si la migration tourne déjà.
+    return start_job(
+        MIGRATION_JOB_KEY, MIGRATION_SCRIPT, MIGRATION_LABEL, env=env
     )
 
 
@@ -162,7 +143,13 @@ def _test_connection(with_comments, need_detail):
     }
 
 
-def render_scan_vulnerabilites():
+def render_scan_vulnerabilites(is_admin=False, render_job=None):
+    """
+    is_admin : IS_ADMIN de app.py. Par défaut False : sans information
+    sur le rôle, on reste en lecture seule.
+    render_job : app.render_job, pour afficher la progression de la
+    migration sous le bouton (facultatif).
+    """
 
     st.subheader("Scan vulnérabilité")
 
@@ -172,7 +159,7 @@ def render_scan_vulnerabilites():
     )
 
     state = get_sync_state(SYNC_KEY)
-    running = _migration_running(state)
+    running = is_job_running(MIGRATION_JOB_KEY)
 
     summary = get_scan_summary()
 
@@ -194,6 +181,11 @@ def render_scan_vulnerabilites():
 
         token_present = bool(get_clickup_token())
 
+        if not is_admin:
+            st.caption(
+                "🔒 Configuration et migration réservées aux administrateurs."
+            )
+
         c1, c2 = st.columns(2)
 
         new_token = c1.text_input(
@@ -201,6 +193,7 @@ def render_scan_vulnerabilites():
             type="password",
             value="",
             key="clickup_token_field",
+            disabled=not is_admin,
             help=(
                 "Laisser vide pour conserver le token déjà enregistré. "
                 "Le champ se vide après enregistrement."
@@ -211,6 +204,7 @@ def render_scan_vulnerabilites():
             "ID de l'espace ClickUp",
             value=get_clickup_space_id(),
             key="clickup_space_field",
+            disabled=not is_admin,
             help=(
                 "Dans l'URL ClickUp : .../<équipe>/v/s/<ID de l'espace>/..."
             )
@@ -220,7 +214,11 @@ def render_scan_vulnerabilites():
             "Token actuel : " + ("configuré" if token_present else "non configuré")
         )
 
-        if st.button("Enregistrer la configuration", key="clickup_save_cfg"):
+        if st.button(
+            "Enregistrer la configuration",
+            key="clickup_save_cfg",
+            disabled=not is_admin
+        ):
 
             set_clickup_token(new_token.strip())
             set_clickup_space_id(new_space.strip())
@@ -234,20 +232,24 @@ def render_scan_vulnerabilites():
         o1, o2, o3, o4 = st.columns(4)
 
         with_comments = o1.checkbox(
-            "Commentaires", value=True, key="clickup_opt_comments"
+            "Commentaires", value=True, key="clickup_opt_comments",
+            disabled=not is_admin
         )
         with_attachments = o2.checkbox(
-            "Pièces jointes (liste)", value=True, key="clickup_opt_attach"
+            "Pièces jointes (liste)", value=True, key="clickup_opt_attach",
+            disabled=not is_admin
         )
         with_download = o3.checkbox(
             "Télécharger les fichiers", value=False, key="clickup_opt_download",
+            disabled=not is_admin,
             help=(
                 "Les fichiers hébergés par ClickUp disparaîtront avec "
                 "l'instance : à cocher si des rapports Nessus y sont joints."
             )
         )
         include_archived = o4.checkbox(
-            "Inclure l'archivé", value=False, key="clickup_opt_archived"
+            "Inclure l'archivé", value=False, key="clickup_opt_archived",
+            disabled=not is_admin
         )
 
         need_detail = with_attachments or with_download
@@ -255,7 +257,7 @@ def render_scan_vulnerabilites():
         if st.button(
             "Tester la connexion et estimer la durée",
             key="clickup_test_btn",
-            disabled=not token_present
+            disabled=(not is_admin) or (not token_present)
         ):
 
             try:
@@ -288,15 +290,26 @@ def render_scan_vulnerabilites():
 
         if state:
 
-            icon = (
-                "🟠" if state.get("status") == "RUNNING"
-                else "🟢" if state.get("status") == "OK"
-                else "🔴"
-            )
+            status = state.get("status")
+
+            if status == "RUNNING" and not running:
+                # Processus arrêté (bouton « Arrêter », redémarrage...)
+                # sans avoir pu écrire son statut final.
+                icon = "⚪"
+                detail = (
+                    f"{state.get('detail') or ''} — interrompue, "
+                    "relancer pour reprendre."
+                )
+            else:
+                icon = (
+                    "🟠" if status == "RUNNING"
+                    else "🟢" if status == "OK"
+                    else "🔴"
+                )
+                detail = state.get("detail") or ""
 
             st.info(
-                f"{icon} {_format_ts(state.get('last_run_at'))} — "
-                f"{state.get('detail') or ''}"
+                f"{icon} {_format_ts(state.get('last_run_at'))} — {detail}"
             )
 
         b1, b2 = st.columns(2)
@@ -304,29 +317,27 @@ def render_scan_vulnerabilites():
         if b1.button(
             "Lancer / reprendre la migration",
             key="clickup_launch_btn",
-            disabled=(not token_present) or running,
+            disabled=(not is_admin) or (not token_present) or running,
             type="primary",
             use_container_width=True
         ):
 
-            _launch_migration(
+            # Pas de st.rerun() : render_job() juste en dessous affiche
+            # la progression (même logique que app.launch_job).
+            if _launch_migration(
                 with_comments, with_attachments, with_download,
                 include_archived
-            )
+            ):
+                running = True
 
-            st.success(
-                "Migration lancée en arrière-plan. Rafraîchissez la page "
-                "pour suivre la progression ; vous pouvez la fermer, la "
-                "reprise est automatique."
-            )
-
-        if running:
+        elif running:
             b1.caption("Une migration est déjà en cours.")
 
         if b2.button(
             "Reparcourir toutes les listes",
             key="clickup_reset_btn",
             use_container_width=True,
+            disabled=(not is_admin) or running,
             help=(
                 "Oublie les listes terminées (aucun constat n'est "
                 "supprimé). Les tâches inchangées ne sont pas "
@@ -337,6 +348,9 @@ def render_scan_vulnerabilites():
             reset_clickup_migration()
 
             st.success("Marqueurs de reprise réinitialisés.")
+
+        if render_job is not None:
+            render_job(MIGRATION_JOB_KEY, place="_scan")
 
     # -----------------------------------------------------
     # Indicateurs
