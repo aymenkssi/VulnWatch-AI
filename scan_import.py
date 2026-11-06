@@ -25,10 +25,17 @@ ClickUp est décommissionnée) :
 Échéance à partir de la date d'import : Critical 7 j, High 14 j,
 Medium 21 j, Low 42 j.
 
-Hôte : colonne HOST du fichier de correspondance (IP,HOST) ; à défaut,
-nom court du FQDN (srv01.domaine.local -> srv01).
+Hôte (colonne « Host » de Nessus -> champ hôte) :
+  - recherche dans la base de correspondances machine -> hôte
+    (scan_host_map, remplie depuis le fichier de correspondance IP;HOST
+    du script puis complétée dans l'interface) ;
+  - sinon, nom de machine : partie avant le premier point
+    (LIEFCS61.alliumfr.Corp.priv -> LIEFCS61, LIEFCS61 -> LIEFCS61) ;
+  - sinon, adresse IP sans correspondance : gardée telle quelle et
+    signalée dans l'aperçu, pour compléter la base.
 
 Différences volontaires avec le script :
+  - correspondances en base au lieu d'un fichier à chaque import ;
   - une adresse IP absente de la correspondance est gardée entière (le
     script n'en gardait que le premier octet : "10.1.2.3" -> "10") ;
   - deux lignes identiques dans le même CSV ne créent qu'un constat ;
@@ -77,7 +84,8 @@ class ScanImportError(ValueError):
 # LECTURE DES FICHIERS
 # =========================================================
 
-def _read_csv(data):
+def _read_csv(data, sep=","):
+    """sep=None : séparateur détecté (« ; » d'Excel FR ou « , »)."""
 
     if hasattr(data, "getvalue"):
         data = data.getvalue()
@@ -87,8 +95,9 @@ def _read_csv(data):
         try:
 
             frame = pd.read_csv(
-                io.BytesIO(data), sep=",", dtype=str,
-                keep_default_na=False, encoding=encoding
+                io.BytesIO(data), sep=sep, dtype=str,
+                keep_default_na=False, encoding=encoding,
+                engine="python" if sep is None else "c"
             )
 
             frame.columns = [str(c).strip() for c in frame.columns]
@@ -122,30 +131,48 @@ def read_nessus_csv(data):
 
 
 def read_host_table(data):
-    """Fichier de correspondance à 2 colonnes IP,HOST -> {ip: host}."""
+    """
+    Fichier de correspondance du script, 2 colonnes IP;HOST (ou IP,HOST).
+    La colonne IP peut aussi contenir un nom de machine (FQDN).
 
-    if data is None:
-        return {}
+    Retourne (paires, conflits) : paires [(machine, hôte)] dédupliquées,
+    la DERNIÈRE ligne d'une machine l'emportant (le fichier est complété
+    au fil de l'eau) ; conflits [(machine, ancien hôte, hôte retenu)]
+    quand une même machine a deux hôtes différents. Lignes sans hôte
+    ignorées.
+    """
 
-    frame = _read_csv(data)
+    frame = _read_csv(data, sep=None)
 
     columns = {c.lower(): c for c in frame.columns}
 
     if "ip" not in columns or "host" not in columns:
         raise ScanImportError(
-            "Le fichier de correspondance doit avoir les colonnes IP et HOST."
+            "Le fichier de correspondance doit avoir les colonnes IP et HOST "
+            "(séparées par « ; » ou « , »). Colonnes trouvées : "
+            + ", ".join(frame.columns)
         )
 
-    table = {}
+    pairs = {}
+    conflicts = []
 
-    for ip, host in zip(frame[columns["ip"]], frame[columns["host"]]):
+    for machine, host in zip(frame[columns["ip"]], frame[columns["host"]]):
 
-        ip, host = str(ip).strip(), str(host).strip()
+        machine, host = str(machine).strip(), str(host).strip()
 
-        if ip and host:
-            table[ip.lower()] = host
+        if not machine or not host:
+            continue
 
-    return table
+        key = machine.lower()
+
+        if key in pairs and pairs[key][1] != host:
+
+            if pairs[key][1].lower() != host.lower():
+                conflicts.append((machine, pairs[key][1], host))
+
+        pairs[key] = (machine, host)
+
+    return list(pairs.values()), conflicts
 
 
 # =========================================================
@@ -160,20 +187,33 @@ def normalize_status(status):
     return "".join(c for c in text if not unicodedata.combining(c))
 
 
-def resolve_hostname(srv, host_table):
-
-    found = host_table.get(srv.lower())
-
-    if found:
-        return found
+def is_ip_address(value):
 
     try:
-        ipaddress.ip_address(srv)
-        return srv
+        ipaddress.ip_address(str(value).strip())
+        return True
     except ValueError:
-        pass
+        return False
 
-    return srv.split(".")[0] or srv
+
+def resolve_hostname(srv, host_map):
+    """
+    `host_map` : {machine en minuscules: hôte} (scan_store.get_host_map).
+    Retourne (hôte, trouvé_en_base).
+    """
+
+    srv = str(srv).strip()
+
+    found = host_map.get(srv.lower())
+
+    if found:
+        return found, True
+
+    if is_ip_address(srv):
+        return srv, False
+
+    # x.alliumfr.Corp.priv (ou tout FQDN) -> x ; x -> x
+    return srv.split(".")[0] or srv, False
 
 
 def due_date_for(risk, now):
@@ -198,7 +238,7 @@ def _key(value):
     return str(value or "").strip().lower()
 
 
-def build_import_plan(frame, host_table, existing, now, skip_info=True):
+def build_import_plan(frame, host_map, existing, now, skip_info=True):
     """
     Calcule, sans rien écrire, l'action de chaque ligne du CSV.
 
@@ -206,7 +246,10 @@ def build_import_plan(frame, host_table, existing, now, skip_info=True):
     get_import_candidates), dicts task_id / title / plugin_id / port /
     cve / status. `now` : date d'import (datetime avec fuseau).
 
-    Retourne {"actions": [...], "counts": {action: n}}. Chaque action :
+    `host_map` : correspondances machine -> hôte (scan_store.get_host_map).
+
+    Retourne {"actions": [...], "counts": {action: n}, "unmapped_ips":
+    [...]}. Chaque action :
     {"action", "task_id" (constat existant, sinon None), "row" (valeurs
     à écrire), "status_before"}.
     """
@@ -226,6 +269,7 @@ def build_import_plan(frame, host_table, existing, now, skip_info=True):
 
     actions = []
     created = set()
+    unmapped_ips = []
 
     for _, line in frame.iterrows():
 
@@ -238,9 +282,14 @@ def build_import_plan(frame, host_table, existing, now, skip_info=True):
         if not srv or not plugin_id:
             continue
 
+        host, mapped = resolve_hostname(srv, host_map)
+
+        if not mapped and is_ip_address(srv) and srv not in unmapped_ips:
+            unmapped_ips.append(srv)
+
         row = {
             "srv": srv,
-            "host": resolve_hostname(srv, host_table),
+            "host": host,
             "plugin_id": plugin_id,
             "cve": cve or None,
             "port": port,
@@ -301,4 +350,8 @@ def build_import_plan(frame, host_table, existing, now, skip_info=True):
     for action in actions:
         counts[action["action"]] += 1
 
-    return {"actions": actions, "counts": counts}
+    return {
+        "actions": actions,
+        "counts": counts,
+        "unmapped_ips": unmapped_ips
+    }

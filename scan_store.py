@@ -208,6 +208,18 @@ def ensure_scan_tables():
         )
     """)
 
+    # Correspondances machine détectée par Nessus (IP ou nom) -> hôte,
+    # qui remplacent le fichier IP;HOST du script ImportVullns.ps1.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS scan_host_map (
+
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            machine TEXT NOT NULL UNIQUE COLLATE NOCASE,
+            hote TEXT NOT NULL
+
+        )
+    """)
+
     # Assignation locale (VulnWatch), distincte de l'assignation ClickUp
     # d'origine (assignee_names / assignees_json, que la migration
     # réécrit). assigned_manual = 1 : modifiée dans l'interface, le
@@ -1256,3 +1268,156 @@ def apply_scan_import(plan, list_name, scan_date, now, author,
     conn.close()
 
     return applied
+
+
+# =========================================================
+# CORRESPONDANCES MACHINE -> HÔTE (import de scan)
+# =========================================================
+
+def get_host_map_rows():
+
+    ensure_scan_tables()
+
+    conn = get_connection()
+
+    rows = conn.execute(
+        "SELECT id, machine, hote FROM scan_host_map "
+        "ORDER BY hote COLLATE NOCASE, machine COLLATE NOCASE"
+    ).fetchall()
+
+    conn.close()
+
+    return [dict(r) for r in rows]
+
+
+def get_host_map():
+    """{machine en minuscules: hôte}, pour scan_import.resolve_hostname."""
+
+    return {r["machine"].lower(): r["hote"] for r in get_host_map_rows()}
+
+
+def save_host_map(rows):
+    """
+    Remplace les correspondances par `rows` (dicts id / machine / hote,
+    id None pour une nouvelle ligne), en une transaction. Lève
+    ValueError si la saisie est invalide (rien n'est alors écrit).
+    """
+
+    ensure_scan_tables()
+
+    cleaned = []
+    seen = set()
+
+    for row in rows:
+
+        machine = (row.get("machine") or "").strip()
+        hote = (row.get("hote") or "").strip()
+
+        if not machine and not hote:
+            continue
+
+        if not machine or not hote:
+            raise ValueError(
+                f"Machine et hôte obligatoires : « {machine or hote} »."
+            )
+
+        if machine.lower() in seen:
+            raise ValueError(f"Machine en double : {machine}.")
+
+        seen.add(machine.lower())
+
+        row_id = row.get("id")
+        row_id = int(row_id) if row_id not in (None, "") else None
+
+        cleaned.append((row_id, machine, hote))
+
+    conn = get_connection()
+
+    kept = {row_id for row_id, _, _ in cleaned if row_id is not None}
+
+    removed = [
+        r["id"] for r in conn.execute("SELECT id FROM scan_host_map")
+        if r["id"] not in kept
+    ]
+
+    for row_id in removed:
+        conn.execute("DELETE FROM scan_host_map WHERE id = ?", (row_id,))
+
+    # Nom temporaire d'abord : permet d'échanger deux machines sans
+    # heurter la contrainte UNIQUE.
+    for row_id, machine, hote in cleaned:
+
+        if row_id is not None:
+            conn.execute(
+                "UPDATE scan_host_map SET machine = ? WHERE id = ?",
+                (f"__tmp_{row_id}", row_id)
+            )
+
+    for row_id, machine, hote in cleaned:
+
+        if row_id is None:
+            conn.execute(
+                "INSERT INTO scan_host_map (machine, hote) VALUES (?, ?)",
+                (machine, hote)
+            )
+        else:
+            conn.execute(
+                "UPDATE scan_host_map SET machine = ?, hote = ? WHERE id = ?",
+                (machine, hote, row_id)
+            )
+
+    conn.commit()
+    conn.close()
+
+    return len(removed)
+
+
+def import_host_map(pairs, overwrite=False):
+    """
+    Ajoute les paires (machine, hôte) du fichier de correspondance.
+    overwrite=False : une machine déjà en base garde son hôte (les
+    corrections faites dans l'interface sont préservées).
+    Retourne {"added", "updated", "kept"}.
+    """
+
+    ensure_scan_tables()
+
+    conn = get_connection()
+
+    existing = {
+        r["machine"].lower(): r["hote"]
+        for r in conn.execute("SELECT machine, hote FROM scan_host_map")
+    }
+
+    stats = {"added": 0, "updated": 0, "kept": 0}
+
+    for machine, hote in pairs:
+
+        current = existing.get(machine.lower())
+
+        if current is None:
+
+            conn.execute(
+                "INSERT INTO scan_host_map (machine, hote) VALUES (?, ?)",
+                (machine, hote)
+            )
+            existing[machine.lower()] = hote
+            stats["added"] += 1
+
+        elif current != hote and overwrite:
+
+            conn.execute(
+                "UPDATE scan_host_map SET hote = ? WHERE machine = ?",
+                (hote, machine)
+            )
+            existing[machine.lower()] = hote
+            stats["updated"] += 1
+
+        else:
+
+            stats["kept"] += 1
+
+    conn.commit()
+    conn.close()
+
+    return stats
