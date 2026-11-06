@@ -120,6 +120,7 @@ from services.mailer import send_test_email, send_email, SmtpNotConfigured
 from services.ai_engine import generate_watch_alert_email
 from collectors.hexiosec import test_connection as hexiosec_test_connection
 import collectors.nvd as nvd_collector
+from ui_scan_vuln import render_scan_vulnerabilites
 
 
 # =========================================================
@@ -1936,7 +1937,7 @@ nvd_critical = int(
 # TABS
 # =========================================================
 
-tab_dashboard, tab_servers, tab_kev, tab_nvd, tab_inventory, tab_investigation, tab_notifications, tab_attack_surface, tab_watch = st.tabs(
+tab_dashboard, tab_servers, tab_kev, tab_nvd, tab_inventory, tab_investigation, tab_notifications, tab_attack_surface, tab_watch, tab_scan = st.tabs(
     [
         "Tableau de bord",
         "Serveurs",
@@ -1946,7 +1947,8 @@ tab_dashboard, tab_servers, tab_kev, tab_nvd, tab_inventory, tab_investigation, 
         "Investigation CVE",
         "Notifications",
         "Attack Surface",
-        "Veille"
+        "Veille",
+        "Scan vulnérabilité"
     ]
 )
 
@@ -4992,6 +4994,10 @@ with tab_attack_surface:
 # détectée dans l'environnement, y compris une CVE toute fraîche pas
 # encore référencée CISA KEV. L'alerte par e-mail part vers une liste
 # de diffusion dédiée (pas les propriétaires de serveur).
+
+with tab_scan:
+    render_scan_vulnerabilites()
+
 
 with tab_watch:
 
