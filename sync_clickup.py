@@ -45,6 +45,7 @@ from scan_store import (
     save_scan_batch,
     set_attachment_download
 )
+from services.jobs import report_progress
 from collectors.clickup import (
     ClickUpClient,
     ClickUpError,
@@ -145,12 +146,25 @@ def main():
                 f"(~{lst.get('task_count') or '?'} tâches)..."
             )
 
+            report_progress(
+                list_index - 1, len(lists),
+                f"Liste « {label} »", force=True
+            )
+
             batch = []
             list_tasks = 0
 
             for raw in client.iter_list_tasks(lst["id"], include_archived):
 
                 list_tasks += 1
+
+                # Limité à une écriture toutes les 0,5 s par jobs.py.
+                report_progress(
+                    list_index - 1, len(lists),
+                    f"Liste « {label} » : {list_tasks} tâches parcourues "
+                    f"({totals['tasks']} migrées, {totals['skipped']} déjà "
+                    f"à jour, {client.calls} appels API)"
+                )
 
                 task_id = str(raw["id"])
                 updated_iso = ms_to_iso(raw.get("date_updated"))
@@ -258,6 +272,8 @@ def main():
         )
 
         sys.exit(1)
+
+    report_progress(len(lists), len(lists), "Migration terminée", force=True)
 
     print()
     print("Migration terminée.")
