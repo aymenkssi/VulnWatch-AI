@@ -38,7 +38,11 @@ from scan_store import (
     get_scan_filter_options,
     get_scan_findings,
     get_scan_finding_detail,
-    get_scan_cve_context
+    get_scan_cve_context,
+    get_scan_users,
+    save_scan_users,
+    set_scan_assignments,
+    seed_scan_users_from_findings
 )
 
 # Lancée via services/jobs.py comme les autres synchros : barre de
@@ -141,6 +145,128 @@ def _test_connection(with_comments, need_detail):
         "total_tasks": total_tasks,
         "estimate_min": estimate_min
     }
+
+
+def _render_users(is_admin):
+    """
+    Référentiel de la liste déroulante « Assigné » : utilisateur (nom et
+    prénom) + mail. Rempli une première fois avec les assignés ClickUp
+    migrés ; mails et nouveaux utilisateurs saisis ici.
+    """
+
+    users = get_scan_users()
+    missing_mail = sum(1 for u in users if not u["mail"])
+
+    title = f"Utilisateurs — liste « Assigné » ({len(users)})"
+
+    if missing_mail:
+        title += f" · {missing_mail} sans mail"
+
+    with st.expander(title, expanded=False):
+
+        table = pd.DataFrame(
+            users, columns=["id", "utilisateur", "mail", "constats"]
+        )
+
+        if not is_admin:
+
+            st.dataframe(
+                table.drop(columns=["id"]).rename(columns={
+                    "utilisateur": "Utilisateur", "mail": "Mail",
+                    "constats": "Constats assignés"
+                }),
+                use_container_width=True, hide_index=True
+            )
+
+            return
+
+        st.caption(
+            "Utilisateur : nom et prénom. Ajoutez une ligne avec « + » en "
+            "bas du tableau ; supprimez-en une en la cochant puis 🗑. Un "
+            "utilisateur supprimé laisse ses constats non assignés."
+        )
+
+        edited = st.data_editor(
+            table,
+            key="scan_users_editor",
+            num_rows="dynamic",
+            use_container_width=True,
+            hide_index=True,
+            column_order=["utilisateur", "mail", "constats"],
+            disabled=["constats"],
+            column_config={
+                "utilisateur": st.column_config.TextColumn(
+                    "Utilisateur (nom et prénom)", required=True,
+                    max_chars=120
+                ),
+                "mail": st.column_config.TextColumn(
+                    "Mail", max_chars=254,
+                    validate=r"^$|^[^@\s]+@[^@\s]+\.[^@\s]+$"
+                ),
+                "constats": st.column_config.NumberColumn(
+                    "Constats assignés"
+                )
+            }
+        )
+
+        c1, c2 = st.columns(2)
+
+        if c1.button(
+            "Enregistrer les utilisateurs",
+            key="scan_users_save",
+            type="primary",
+            use_container_width=True
+        ):
+
+            rows = [
+                {
+                    "id": None if pd.isna(r["id"]) else int(r["id"]),
+                    "utilisateur": r["utilisateur"] if isinstance(r["utilisateur"], str) else "",
+                    "mail": r["mail"] if isinstance(r["mail"], str) else ""
+                }
+                for r in edited.to_dict("records")
+            ]
+
+            try:
+
+                removed = save_scan_users(rows)
+
+            except ValueError as error:
+
+                st.error(str(error))
+
+            else:
+
+                st.session_state.pop("scan_users_editor", None)
+
+                st.success(
+                    "Utilisateurs enregistrés"
+                    + (f" ({removed} supprimé(s))." if removed else ".")
+                )
+
+                st.rerun()
+
+        if c2.button(
+            "Importer les assignés ClickUp",
+            key="scan_users_seed",
+            use_container_width=True,
+            help=(
+                "Ajoute les assignés ClickUp absents de la liste et assigne "
+                "les constats sans assignation. Ne modifie ni les mails, ni "
+                "les assignations faites à la main."
+            )
+        ):
+
+            added, assigned = seed_scan_users_from_findings()
+
+            st.session_state.pop("scan_users_editor", None)
+
+            st.success(
+                f"{added} utilisateur(s) ajouté(s), "
+                f"{assigned} constat(s) assigné(s)."
+            )
+
+            st.rerun()
 
 
 def render_scan_vulnerabilites(is_admin=False, render_job=None):
@@ -353,6 +479,16 @@ def render_scan_vulnerabilites(is_admin=False, render_job=None):
             render_job(MIGRATION_JOB_KEY, place="_scan")
 
     # -----------------------------------------------------
+    # Utilisateurs (liste déroulante « Assigné »)
+    # -----------------------------------------------------
+
+    if summary["total"] > 0 and not get_scan_users():
+        # Premier remplissage avec les assignés ClickUp déjà migrés.
+        seed_scan_users_from_findings()
+
+    _render_users(is_admin)
+
+    # -----------------------------------------------------
     # Indicateurs
     # -----------------------------------------------------
 
@@ -451,7 +587,7 @@ def render_scan_vulnerabilites(is_admin=False, render_job=None):
         "Statut": df["status"].map(_status_label),
         "Risque": df["risk"],
         "Liste": df["list_name"],
-        "Assigné": df["assignee_names"],
+        "Assigné": df["assigned_user"].where(df["assigned_user"].notna(), None),
         "CVE": df["cves"],
         "Créé": df["date_created"].map(_day),
         "Mis à jour": df["date_updated"].map(_day),
@@ -461,11 +597,84 @@ def render_scan_vulnerabilites(is_admin=False, render_job=None):
 
     st.caption(f"{len(display):,} constat(s)")
 
-    st.dataframe(display, use_container_width=True, hide_index=True)
+    users = get_scan_users()
+    user_ids = {u["utilisateur"]: u["id"] for u in users}
+
+    if is_admin:
+
+        st.caption(
+            "Colonne « Assigné » modifiable : choisissez un utilisateur "
+            "dans la liste (gérée dans « Utilisateurs » ci-dessus), puis "
+            "« Enregistrer les assignations »."
+        )
+
+        # La clé change avec les filtres : l'éditeur repart des données
+        # affichées au lieu de réappliquer des modifications à d'autres
+        # lignes.
+        editor_key = "scan_assign_editor_" + str(abs(hash((
+            tuple(sel_lists), tuple(sel_status), search.strip(), only_open,
+            tuple(df["task_id"])
+        ))))
+
+        edited = st.data_editor(
+            display,
+            key=editor_key,
+            use_container_width=True,
+            hide_index=True,
+            disabled=[c for c in display.columns if c != "Assigné"],
+            column_config={
+                "Assigné": st.column_config.SelectboxColumn(
+                    "Assigné",
+                    options=list(user_ids.keys()),
+                    required=False,
+                    help="Vide = non assigné"
+                )
+            }
+        )
+
+        changes = {}
+
+        for position, (before, after) in enumerate(
+            zip(display["Assigné"], edited["Assigné"])
+        ):
+
+            before = before if isinstance(before, str) and before else None
+            after = after if isinstance(after, str) and after else None
+
+            if before != after:
+                changes[df["task_id"].iloc[position]] = (
+                    user_ids.get(after) if after else None
+                )
+
+        if st.button(
+            f"Enregistrer les assignations ({len(changes)})",
+            key="scan_assign_save",
+            disabled=not changes,
+            type="primary"
+        ):
+
+            set_scan_assignments(changes)
+
+            st.session_state.pop(editor_key, None)
+
+            st.success(f"{len(changes)} assignation(s) enregistrée(s).")
+
+            st.rerun()
+
+    else:
+
+        st.dataframe(display, use_container_width=True, hide_index=True)
+
+    export = display.copy()
+    export.insert(
+        export.columns.get_loc("Assigné") + 1,
+        "Mail assigné",
+        df["assigned_mail"]
+    )
 
     st.download_button(
         "Exporter la sélection (CSV)",
-        display.to_csv(index=False).encode("utf-8-sig"),
+        export.to_csv(index=False).encode("utf-8-sig"),
         file_name="scan_vulnerabilites.csv",
         mime="text/csv",
         key="scan_export_csv"
@@ -505,7 +714,9 @@ def render_scan_vulnerabilites(is_admin=False, render_job=None):
 
     st.write(
         f"**Liste :** {detail.get('list_name') or '—'}  \n"
-        f"**Assigné :** {detail.get('assignee_names') or '—'}  \n"
+        f"**Assigné :** {detail.get('assigned_user') or '—'}"
+        f"{' (' + detail['assigned_mail'] + ')' if detail.get('assigned_mail') else ''}  \n"
+        f"**Assigné(s) dans ClickUp :** {detail.get('assignee_names') or '—'}  \n"
         f"**Créé :** {_day(detail.get('date_created'))} — "
         f"**Fermé :** {_day(detail.get('date_closed')) or '—'}  \n"
         f"**Lien ClickUp d'origine :** {detail.get('url') or '—'}"
