@@ -44,7 +44,8 @@ from scan_store import (
     get_synced_task_state,
     save_scan_batch,
     set_attachment_download,
-    seed_scan_users_from_findings
+    seed_scan_users_from_findings,
+    LOCALLY_MODIFIED
 )
 from services.jobs import report_progress
 from collectors.clickup import (
@@ -172,7 +173,9 @@ def main():
 
                 already = synced.get(task_id)
 
-                if already is not None and already == updated_iso:
+                if already is not None and already in (
+                    updated_iso, LOCALLY_MODIFIED
+                ):
 
                     # Détail + commentaires déjà récupérés et tâche
                     # inchangée : on ne refait pas ces appels.
