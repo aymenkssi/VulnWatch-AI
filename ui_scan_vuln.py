@@ -47,7 +47,11 @@ from scan_store import (
     get_import_candidates,
     get_status_catalog,
     default_new_status,
-    apply_scan_import
+    apply_scan_import,
+    get_host_map,
+    get_host_map_rows,
+    save_host_map,
+    import_host_map
 )
 from scan_import import (
     ACTION_LABELS,
@@ -343,20 +347,19 @@ def _render_nessus_import(is_admin, current_user):
             key="nessus_scan_date"
         )
 
-        f1, f2 = st.columns(2)
-
-        nessus_file = f1.file_uploader(
+        nessus_file = st.file_uploader(
             "Fichier des vulnérabilités (export CSV Nessus)",
             type=["csv"], key="nessus_file"
         )
 
-        hosts_file = f2.file_uploader(
-            "Correspondance IP → nom d'hôte (CSV, colonnes IP,HOST)",
-            type=["csv"], key="nessus_hosts",
-            help=(
-                "Facultatif. Sans correspondance : nom court du FQDN "
-                "(srv01.domaine.local → srv01), adresse IP gardée entière."
-            )
+        host_map = get_host_map()
+
+        st.caption(
+            f"Hôte : {len(host_map)} correspondance(s) machine → hôte en base "
+            "(section « Correspondances machine → hôte »). Sans "
+            "correspondance : nom avant le premier point "
+            "(x.alliumfr.Corp.priv → x) ; adresse IP gardée telle quelle "
+            "et signalée."
         )
 
         o1, o2 = st.columns(2)
@@ -388,7 +391,8 @@ def _render_nessus_import(is_admin, current_user):
             "file": (
                 (nessus_file.name, nessus_file.size) if nessus_file else None
             ),
-            "hosts": (hosts_file.name, hosts_file.size) if hosts_file else None
+            # Correspondances modifiées après l'analyse -> à refaire.
+            "hosts": hash(frozenset(host_map.items()))
         }
 
         if st.button(
@@ -400,11 +404,10 @@ def _render_nessus_import(is_admin, current_user):
             try:
 
                 frame = read_nessus_csv(nessus_file)
-                host_table = read_host_table(hosts_file)
                 now = datetime.now().astimezone()
 
                 plan = build_import_plan(
-                    frame, host_table, get_import_candidates(list_name),
+                    frame, host_map, get_import_candidates(list_name),
                     now, skip_info
                 )
 
@@ -417,7 +420,7 @@ def _render_nessus_import(is_admin, current_user):
 
                 st.session_state["nessus_plan"] = {
                     "plan": plan, "params": params, "now": now,
-                    "rows": len(frame), "hosts": len(host_table)
+                    "rows": len(frame), "hosts": len(host_map)
                 }
 
         pending = st.session_state.get("nessus_plan")
@@ -431,9 +434,20 @@ def _render_nessus_import(is_admin, current_user):
 
         st.markdown(
             f"**Analyse :** {pending['rows']:,} ligne(s) dans le CSV, "
-            f"{pending['hosts']} correspondance(s) IP → hôte, liste "
+            f"{pending['hosts']} correspondance(s) machine → hôte, liste "
             f"« {pending['params']['list']} »."
         )
+
+        unmapped = pending["plan"].get("unmapped_ips") or []
+
+        if unmapped:
+            st.warning(
+                f"{len(unmapped)} adresse(s) IP sans correspondance (hôte = "
+                "l'adresse IP) : " + ", ".join(unmapped[:30])
+                + (" ..." if len(unmapped) > 30 else "")
+                + ". Ajoutez-les dans « Correspondances machine → hôte » "
+                "puis relancez l'analyse."
+            )
 
         st.dataframe(
             pd.DataFrame([
@@ -511,6 +525,146 @@ def _render_nessus_import(is_admin, current_user):
             st.session_state.pop("nessus_plan", None)
 
             st.rerun()
+
+
+def _render_host_map(is_admin):
+    """
+    Correspondances machine détectée par Nessus (adresse IP ou nom) ->
+    hôte. Remplace le fichier IP;HOST du script : premier remplissage
+    depuis ce fichier, puis complété ici.
+    """
+
+    rows = get_host_map_rows()
+
+    result = st.session_state.pop("host_map_result", None)
+
+    with st.expander(
+        f"Correspondances machine → hôte ({len(rows)})",
+        expanded=result is not None
+    ):
+
+        if result:
+            st.success(result)
+
+        table = pd.DataFrame(rows, columns=["id", "machine", "hote"])
+
+        if not is_admin:
+
+            st.dataframe(
+                table.drop(columns=["id"]).rename(columns={
+                    "machine": "Machine (IP ou nom)", "hote": "Hôte"
+                }),
+                use_container_width=True, hide_index=True
+            )
+
+            return
+
+        st.caption(
+            "Machine : adresse IP (ou nom) telle que Nessus la détecte. "
+            "Utilisée à l'import de scan pour remplir le champ hôte. « + » en "
+            "bas du tableau pour ajouter, 🗑 pour supprimer."
+        )
+
+        edited = st.data_editor(
+            table,
+            key="host_map_editor",
+            num_rows="dynamic",
+            use_container_width=True,
+            hide_index=True,
+            column_order=["machine", "hote"],
+            column_config={
+                "machine": st.column_config.TextColumn(
+                    "Machine (IP ou nom)", required=True, max_chars=255
+                ),
+                "hote": st.column_config.TextColumn(
+                    "Hôte", required=True, max_chars=255
+                )
+            }
+        )
+
+        if st.button(
+            "Enregistrer les correspondances",
+            key="host_map_save",
+            type="primary"
+        ):
+
+            try:
+
+                removed = save_host_map([
+                    {
+                        "id": None if pd.isna(r["id"]) else int(r["id"]),
+                        "machine": r["machine"] if isinstance(r["machine"], str) else "",
+                        "hote": r["hote"] if isinstance(r["hote"], str) else ""
+                    }
+                    for r in edited.to_dict("records")
+                ])
+
+            except ValueError as error:
+
+                st.error(str(error))
+
+            else:
+
+                st.session_state.pop("host_map_editor", None)
+                st.session_state["host_map_result"] = (
+                    "Correspondances enregistrées"
+                    + (f" ({removed} supprimée(s))." if removed else ".")
+                )
+                st.rerun()
+
+        st.markdown("**Importer un fichier de correspondance**")
+
+        f1, f2 = st.columns([3, 2])
+
+        upload = f1.file_uploader(
+            "Fichier IP;HOST (« ; » ou « , »)",
+            type=["csv", "txt"], key="host_map_file"
+        )
+
+        overwrite = f2.checkbox(
+            "Remplacer l'hôte des machines déjà en base",
+            value=False, key="host_map_overwrite",
+            help=(
+                "Décoché : seules les nouvelles machines sont ajoutées, les "
+                "corrections faites ici sont conservées."
+            )
+        )
+
+        if f2.button(
+            "Importer le fichier", key="host_map_import",
+            disabled=upload is None, use_container_width=True
+        ):
+
+            try:
+
+                pairs, conflicts = read_host_table(upload)
+
+            except ScanImportError as error:
+
+                st.error(str(error))
+
+            else:
+
+                stats = import_host_map(pairs, overwrite=overwrite)
+
+                message = (
+                    f"{len(pairs)} machine(s) dans le fichier : "
+                    f"{stats['added']} ajoutée(s), {stats['updated']} "
+                    f"mise(s) à jour, {stats['kept']} déjà en base."
+                )
+
+                if conflicts:
+                    message += (
+                        f" {len(conflicts)} machine(s) avec deux hôtes dans le "
+                        "fichier, dernière ligne retenue : "
+                        + "; ".join(
+                            f"{m} : {old} → {new}" for m, old, new in conflicts
+                        )
+                    )
+
+                st.session_state.pop("host_map_editor", None)
+                st.session_state["host_map_result"] = message
+                st.rerun()
 
 
 def render_scan_vulnerabilites(is_admin=False, render_job=None,
@@ -734,6 +888,8 @@ def render_scan_vulnerabilites(is_admin=False, render_job=None,
         seed_scan_users_from_findings()
 
     _render_nessus_import(is_admin, current_user)
+
+    _render_host_map(is_admin)
 
     _render_users(is_admin)
 
