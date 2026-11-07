@@ -37,6 +37,7 @@ from scan_store import (
     reset_clickup_migration,
     get_scan_summary,
     get_scan_filter_options,
+    UNASSIGNED,
     get_scan_findings,
     get_scan_finding_detail,
     get_scan_cve_context,
@@ -953,17 +954,51 @@ def render_scan_vulnerabilites(is_admin=False, render_job=None,
 
     options = get_scan_filter_options()
 
-    f1, f2, f3 = st.columns([2, 2, 3])
+    assignee_options = options["assignees"] + (
+        [UNASSIGNED] if options["has_unassigned"] else []
+    )
 
+    # Une valeur choisie qui n'existe plus (utilisateur supprimé, constat
+    # réassigné...) est retirée du filtre avant affichage.
+    for key, values in (
+        ("scan_f_lists", options["lists"]),
+        ("scan_f_status", options["statuses"]),
+        ("scan_f_hosts", options["hosts"]),
+        ("scan_f_cves", options["cves"]),
+        ("scan_f_assignees", assignee_options)
+    ):
+
+        if key in st.session_state:
+
+            allowed = set(values)
+            st.session_state[key] = [
+                v for v in st.session_state[key] if v in allowed
+            ]
+
+    f1, f2, f3, f4, f5 = st.columns(5)
+
+    # Listes pré-chargées depuis la base ; on peut taper dans chaque
+    # liste pour filtrer les valeurs proposées.
     sel_lists = f1.multiselect(
-        "Liste", options["lists"], key="scan_f_lists"
+        "Liste", options["lists"], key="scan_f_lists",
+        placeholder="Toutes"
     )
     sel_status = f2.multiselect(
-        "Statut", options["statuses"], key="scan_f_status"
+        "Statut", options["statuses"], key="scan_f_status",
+        placeholder="Tous"
     )
-    search = f3.text_input(
-        "Rechercher (constat, hôte, CVE, assigné, description)",
-        key="scan_f_search"
+    sel_hosts = f3.multiselect(
+        "Hôte", options["hosts"], key="scan_f_hosts",
+        placeholder="Tous"
+    )
+    sel_cves = f4.multiselect(
+        "CVE", options["cves"], key="scan_f_cves",
+        placeholder="Toutes"
+    )
+    sel_assignees = f5.multiselect(
+        "Assigné", assignee_options,
+        key="scan_f_assignees",
+        placeholder="Tous"
     )
 
     only_open = st.checkbox(
@@ -973,7 +1008,9 @@ def render_scan_vulnerabilites(is_admin=False, render_job=None,
     findings = get_scan_findings(
         lists=sel_lists or None,
         statuses=sel_status or None,
-        search=search.strip() or None,
+        hosts=sel_hosts or None,
+        cves=sel_cves or None,
+        assignees=sel_assignees or None,
         only_untreated=only_open
     )
 
@@ -1021,7 +1058,8 @@ def render_scan_vulnerabilites(is_admin=False, render_job=None,
         # affichées au lieu de réappliquer des modifications à d'autres
         # lignes.
         editor_key = "scan_assign_editor_" + str(abs(hash((
-            tuple(sel_lists), tuple(sel_status), search.strip(), only_open,
+            tuple(sel_lists), tuple(sel_status), tuple(sel_hosts),
+            tuple(sel_cves), tuple(sel_assignees), only_open,
             tuple(df["task_id"])
         ))))
 

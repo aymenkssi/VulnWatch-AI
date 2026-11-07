@@ -606,15 +606,58 @@ def get_scan_filter_options():
         ).fetchall()
     ]
 
+    hosts = [
+        r["host"] for r in conn.execute(
+            "SELECT DISTINCT host FROM scan_findings "
+            "WHERE host IS NOT NULL AND host <> '' "
+            "ORDER BY host COLLATE NOCASE"
+        ).fetchall()
+    ]
+
+    cves = [
+        r["cve_id"] for r in conn.execute(
+            "SELECT DISTINCT cve_id FROM scan_finding_cves ORDER BY cve_id DESC"
+        ).fetchall()
+    ]
+
+    # Seulement les utilisateurs qui ont au moins un constat.
+    assignees = [
+        r["utilisateur"] for r in conn.execute(
+            "SELECT DISTINCT u.utilisateur FROM scan_users u "
+            "JOIN scan_findings f ON f.assigned_user_id = u.id "
+            "ORDER BY u.utilisateur COLLATE NOCASE"
+        ).fetchall()
+    ]
+
+    has_unassigned = conn.execute(
+        "SELECT 1 FROM scan_findings WHERE assigned_user_id IS NULL LIMIT 1"
+    ).fetchone() is not None
+
     conn.close()
 
-    return {"lists": lists, "statuses": statuses}
+    return {
+        "lists": lists,
+        "statuses": statuses,
+        "hosts": hosts,
+        "cves": cves,
+        "assignees": assignees,
+        "has_unassigned": has_unassigned
+    }
+
+
+# Valeur du filtre « Assigné » pour les constats sans assignation.
+UNASSIGNED = "(non assigné)"
 
 
 def get_scan_findings(
     lists=None, statuses=None, search=None, only_untreated=False,
-    limit=5000
+    limit=5000, hosts=None, cves=None, assignees=None
 ):
+    """
+    Filtres cumulés (ET entre filtres, OU dans un même filtre) :
+    listes, statuts, hôtes, CVE et assignés (UNASSIGNED = sans
+    assignation).
+    """
 
     ensure_scan_tables()
 
@@ -646,6 +689,33 @@ def get_scan_findings(
 
     if only_untreated:
         query += " AND f.treated = 0"
+
+    if hosts:
+        query += f" AND f.host IN ({', '.join('?' for _ in hosts)})"
+        params.extend(hosts)
+
+    if cves:
+        query += (
+            " AND f.task_id IN (SELECT task_id FROM scan_finding_cves "
+            f"WHERE cve_id IN ({', '.join('?' for _ in cves)}))"
+        )
+        params.extend(cves)
+
+    if assignees:
+
+        names = [a for a in assignees if a != UNASSIGNED]
+        clauses = []
+
+        if names:
+            clauses.append(
+                f"u.utilisateur IN ({', '.join('?' for _ in names)})"
+            )
+            params.extend(names)
+
+        if UNASSIGNED in assignees:
+            clauses.append("f.assigned_user_id IS NULL")
+
+        query += " AND (" + " OR ".join(clauses) + ")"
 
     if search:
 
