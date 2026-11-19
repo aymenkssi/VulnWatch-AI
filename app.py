@@ -1,4 +1,5 @@
-﻿import subprocess
+﻿import inspect
+import subprocess
 import sys
 import os
 from pathlib import Path
@@ -8,6 +9,12 @@ import pandas as pd
 import plotly.express as px
 import streamlit as st
 import streamlit.components.v1 as components
+
+from services.log_filters import install_log_filters
+
+# Traces WinError 10054 sans conséquence (navigateur qui ferme sa
+# connexion) : voir services/log_filters.py.
+install_log_filters()
 
 from services.azure_auth import (
     get_azure_app_config,
@@ -200,17 +207,45 @@ def _write_session_cookie(token, max_age_seconds):
     """
     Pose (ou efface, max_age_seconds=0) le cookie de session dans le
     navigateur. Streamlit ne sait que LIRE les cookies
-    (st.context.cookies) : l'écriture passe par un petit script dans un
-    composant invisible, qui écrit sur la page parente (même origine).
+    (st.context.cookies) : l'écriture passe par un petit script.
+
+    - Streamlit >= 1.54 : st.html(unsafe_allow_javascript=True), le
+      script s'exécute dans la page elle-même ;
+    - versions antérieures : composant invisible (components.html, retiré
+      des versions récentes de Streamlit) qui écrit sur la page parente.
+
+    Attribut Secure ajouté quand la page est servie en HTTPS : le jeton
+    n'est alors jamais envoyé en clair.
     """
 
-    components.html(
-        "<script>"
-        f"window.parent.document.cookie = '{SESSION_COOKIE}={token}; "
-        f"path=/; max-age={int(max_age_seconds)}; SameSite=Strict';"
-        "</script>",
-        height=0
+    cookie_js = (
+        f"'{SESSION_COOKIE}={token}; path=/; max-age={int(max_age_seconds)}; "
+        "SameSite=Strict' + (location.protocol === 'https:' ? '; Secure' : '')"
     )
+
+    if _HTML_RUNS_JAVASCRIPT:
+
+        st.html(
+            f"<script>document.cookie = {cookie_js};</script>",
+            unsafe_allow_javascript=True
+        )
+
+    else:
+
+        components.html(
+            "<script>window.parent.document.cookie = "
+            f"{cookie_js.replace('location.protocol', 'window.parent.location.protocol')};"
+            "</script>",
+            height=0
+        )
+
+
+try:
+    _HTML_RUNS_JAVASCRIPT = "unsafe_allow_javascript" in inspect.signature(
+        st.html
+    ).parameters
+except (AttributeError, TypeError, ValueError):
+    _HTML_RUNS_JAVASCRIPT = False
 
 
 def logout():
@@ -287,7 +322,7 @@ def authenticate():
         )
 
         submitted = st.form_submit_button(
-            "Se connecter", use_container_width=True, type="primary"
+            "Se connecter", width="stretch", type="primary"
         )
 
     if submitted:
@@ -359,7 +394,7 @@ def password_change_form(username, key_prefix, require_current=True):
     if not st.button(
         "Changer le mot de passe",
         type="primary",
-        use_container_width=True,
+        width="stretch",
         key=f"{key_prefix}_submit"
     ):
         return False
@@ -1415,11 +1450,11 @@ with st.sidebar:
             "synchronisations réservés aux administrateurs."
         )
 
-    if st.button("🔄 Rafraîchir les données", use_container_width=True):
+    if st.button("🔄 Rafraîchir les données", width="stretch"):
         st.cache_data.clear()
         st.rerun()
 
-    if st.button("Se déconnecter", use_container_width=True):
+    if st.button("Se déconnecter", width="stretch"):
         logout()
         st.rerun()
 
@@ -1455,7 +1490,7 @@ with st.sidebar:
                     }
                     for u in users
                 ]),
-                use_container_width=True,
+                width="stretch",
                 hide_index=True
             )
 
@@ -1491,7 +1526,7 @@ with st.sidebar:
             )
 
             if st.button(
-                "Créer le compte", use_container_width=True,
+                "Créer le compte", width="stretch",
                 type="primary", key="new_user_create"
             ):
                 try:
@@ -1537,7 +1572,7 @@ with st.sidebar:
                 )
 
                 if st.button(
-                    "Enregistrer", use_container_width=True,
+                    "Enregistrer", width="stretch",
                     key=f"managed_save_{managed_name}"
                 ):
                     try:
@@ -1563,7 +1598,7 @@ with st.sidebar:
 
                 if st.button(
                     "Réinitialiser le mot de passe",
-                    use_container_width=True,
+                    width="stretch",
                     key=f"managed_reset_btn_{managed_name}",
                     help="L'utilisateur devra le changer à sa prochaine "
                          "connexion ; ses sessions ouvertes sont fermées."
@@ -1584,7 +1619,7 @@ with st.sidebar:
 
                 if st.button(
                     f"Supprimer « {managed_name} »",
-                    use_container_width=True,
+                    width="stretch",
                     key=f"managed_delete_{managed_name}"
                 ):
                     try:
@@ -1610,7 +1645,7 @@ with st.sidebar:
                     "compte connecté à Azure CLI (az login)."
                 )
 
-            with st.popover("Comment créer l'application ?", use_container_width=True):
+            with st.popover("Comment créer l'application ?", width="stretch"):
 
                 st.markdown(
                     "1. **Portail Entra ID** > Inscriptions d'applications > "
@@ -1678,13 +1713,13 @@ with st.sidebar:
             az1, az2, az3 = st.columns(3)
 
             with az1:
-                azure_save = st.button("Enregistrer", use_container_width=True, key="azure_save")
+                azure_save = st.button("Enregistrer", width="stretch", key="azure_save")
 
             with az2:
-                azure_test = st.button("Tester", use_container_width=True, key="azure_test")
+                azure_test = st.button("Tester", width="stretch", key="azure_test")
 
             with az3:
-                azure_clear = st.button("Supprimer", use_container_width=True, key="azure_clear")
+                azure_clear = st.button("Supprimer", width="stretch", key="azure_clear")
 
             if azure_save:
 
@@ -1792,7 +1827,7 @@ with st.sidebar:
 
     if st.button(
         "Synchroniser CISA",
-        use_container_width=True,
+        width="stretch",
         disabled=(is_job_running("sync")) or not IS_ADMIN
     ):
 
@@ -1832,7 +1867,7 @@ with st.sidebar:
 
     if st.button(
         "Enrichir NVD maintenant",
-        use_container_width=True,
+        width="stretch",
         disabled=(is_job_running("enrich")) or not IS_ADMIN
     ):
 
@@ -1862,7 +1897,7 @@ with st.sidebar:
 
     if st.button(
         "Analyser avec l'IA locale",
-        use_container_width=True,
+        width="stretch",
         disabled=(is_job_running("ai_enrich")) or not IS_ADMIN
     ):
 
@@ -2071,7 +2106,7 @@ with tab_dashboard:
 
         st.plotly_chart(
             devices_fig,
-            use_container_width=True
+            width="stretch"
         )
 
         top_devices_display = top_devices[[
@@ -2090,7 +2125,7 @@ with tab_dashboard:
 
         st.dataframe(
             top_devices_display,
-            use_container_width=True,
+            width="stretch",
             hide_index=True
         )
 
@@ -2124,7 +2159,7 @@ with tab_dashboard:
                 x_title="Priorité CISA",
                 y_title="Nombre de CVE"
             ),
-            use_container_width=True
+            width="stretch"
         )
 
 
@@ -2147,7 +2182,7 @@ with tab_dashboard:
                 x_title="Sévérité NVD",
                 y_title="Nombre de CVE"
             ),
-            use_container_width=True
+            width="stretch"
         )
 
 
@@ -2203,7 +2238,7 @@ with tab_dashboard:
 
         st.dataframe(
             display,
-            use_container_width=True,
+            width="stretch",
             hide_index=True
         )
 
@@ -2302,7 +2337,7 @@ with tab_servers:
 
         st.dataframe(
             server_display,
-            use_container_width=True,
+            width="stretch",
             hide_index=True
         )
 
@@ -2500,7 +2535,7 @@ with tab_servers:
 
         edited_servers = st.data_editor(
             servers_editable,
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
             disabled=([
                 "ID équipement",
@@ -2686,7 +2721,7 @@ with tab_servers:
 
             st.dataframe(
                 server_cve_df,
-                use_container_width=True,
+                width="stretch",
                 hide_index=True
             )
 
@@ -2846,7 +2881,7 @@ with tab_kev:
 
         st.dataframe(
             table,
-            use_container_width=True,
+            width="stretch",
             hide_index=True
         )
 
@@ -3078,7 +3113,7 @@ def render_nvd_cve_details(cve_id):
                 pd.DataFrame(load_inventory_devices_for_cve(cve_id)).rename(
                     columns=INVENTORY_DEVICE_COLUMNS
                 ),
-                use_container_width=True,
+                width="stretch",
                 hide_index=True
             )
 
@@ -3106,7 +3141,7 @@ def render_nvd_cve_details(cve_id):
                         "first_seen_timestamp": "Première détection",
                         "last_seen_timestamp": "Dernière détection"
                     }),
-                    use_container_width=True,
+                    width="stretch",
                     hide_index=True
                 )
 
@@ -3163,7 +3198,7 @@ def render_nvd_cve_details(cve_id):
                     "severity": "Sévérité",
                     "vector": "Vecteur"
                 }),
-                use_container_width=True,
+                width="stretch",
                 hide_index=True
             )
 
@@ -3177,7 +3212,7 @@ def render_nvd_cve_details(cve_id):
                     "version": "Version(s)",
                     "vulnerable": "Vulnérable"
                 }),
-                use_container_width=True,
+                width="stretch",
                 hide_index=True
             )
         else:
@@ -3192,7 +3227,7 @@ def render_nvd_cve_details(cve_id):
                     "tags": "Type"
                 }),
                 column_config={"Lien": st.column_config.LinkColumn("Lien")},
-                use_container_width=True,
+                width="stretch",
                 hide_index=True
             )
 
@@ -3359,7 +3394,7 @@ with tab_nvd:
                 "CVSS 3.1": st.column_config.NumberColumn(format="%.1f"),
                 "CVSS 4.0": st.column_config.NumberColumn(format="%.1f")
             },
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
             on_select="rerun",
             selection_mode="single-row",
@@ -3495,7 +3530,7 @@ def render_inventory_changes(search):
             "critical_introduced": "dont critiques",
             "cves_fixed": "CVE corrigées"
         }),
-        use_container_width=True,
+        width="stretch",
         hide_index=True
     )
 
@@ -3630,7 +3665,7 @@ def render_machine_details(machine):
                     "max_cvss": "CVSS max"
                 }),
                 column_config={"CVSS max": st.column_config.NumberColumn(format="%.1f")},
-                use_container_width=True,
+                width="stretch",
                 hide_index=True
             )
 
@@ -3644,7 +3679,7 @@ def render_machine_details(machine):
                     "CISA KEV", "Description"
                 ]],
                 column_config=CVSS_COLUMN,
-                use_container_width=True,
+                width="stretch",
                 hide_index=True
             )
         else:
@@ -3666,7 +3701,7 @@ def render_machine_details(machine):
                     "kev": "CISA KEV"
                 }),
                 column_config=CVSS_COLUMN,
-                use_container_width=True,
+                width="stretch",
                 hide_index=True
             )
         else:
@@ -3719,7 +3754,7 @@ def render_product_details(product):
                 "max_cvss": "CVSS max"
             }),
             column_config={"CVSS max": st.column_config.NumberColumn(format="%.1f")},
-            use_container_width=True,
+            width="stretch",
             hide_index=True
         )
 
@@ -3736,7 +3771,7 @@ def render_product_details(product):
                 "software_name": "Paquet / logiciel",
                 "distro_note": "À vérifier"
             }),
-            use_container_width=True,
+            width="stretch",
             hide_index=True
         )
 
@@ -3750,7 +3785,7 @@ def render_product_details(product):
                     "Description"
                 ]],
                 column_config=CVSS_COLUMN,
-                use_container_width=True,
+                width="stretch",
                 hide_index=True
             )
         else:
@@ -3842,7 +3877,7 @@ with tab_inventory:
                         "nvd_cves": "CVE (NVD)",
                         "nvd_critical": "dont critiques"
                     }),
-                    use_container_width=True,
+                    width="stretch",
                     hide_index=True,
                     on_select="rerun",
                     selection_mode="single-row",
@@ -3883,7 +3918,7 @@ with tab_inventory:
                         "nvd_cves": "CVE (NVD)",
                         "nvd_critical": "dont critiques"
                     }),
-                    use_container_width=True,
+                    width="stretch",
                     hide_index=True,
                     on_select="rerun",
                     selection_mode="single-row",
@@ -4075,7 +4110,7 @@ with tab_investigation:
 
             st.dataframe(
                 devices,
-                use_container_width=True,
+                width="stretch",
                 hide_index=True
             )
 
@@ -4347,7 +4382,7 @@ with tab_notifications:
         st.write("")
         st.write("")
 
-        if st.button("Envoyer un test", use_container_width=True, disabled=not IS_ADMIN):
+        if st.button("Envoyer un test", width="stretch", disabled=not IS_ADMIN):
 
             if not test_email_addr.strip():
 
@@ -4460,7 +4495,7 @@ with tab_notifications:
 
     if st.button(
         "Vérifier et envoyer les notifications maintenant",
-        use_container_width=True,
+        width="stretch",
         disabled=(is_job_running("notify")) or not IS_ADMIN
     ):
 
@@ -4533,7 +4568,7 @@ with tab_notifications:
 
         st.dataframe(
             history_df,
-            use_container_width=True,
+            width="stretch",
             hide_index=True
         )
 
@@ -4723,7 +4758,7 @@ with tab_attack_surface:
 
     if st.button(
         "Synchroniser les risques Hexiosec",
-        use_container_width=True,
+        width="stretch",
         disabled=(is_job_running("sync_hexiosec")) or not IS_ADMIN
     ):
 
@@ -4772,7 +4807,7 @@ with tab_attack_surface:
                 "Sévérité",
                 "Nombre de risques"
             ),
-            use_container_width=True
+            width="stretch"
         )
 
     hexiosec_findings = get_hexiosec_findings()
@@ -4862,7 +4897,7 @@ with tab_attack_surface:
                     "Statut", "Détecté le", "Vu le", "Importé le"
                 ]
             ],
-            use_container_width=True,
+            width="stretch",
             hide_index=True
         )
 
@@ -4979,7 +5014,7 @@ with tab_attack_surface:
                     "Vu le", "Importé le"
                 ]
             ],
-            use_container_width=True,
+            width="stretch",
             hide_index=True
         )
 
@@ -5065,7 +5100,7 @@ with tab_watch:
 
     if st.button(
         "Synchroniser NVD maintenant",
-        use_container_width=True,
+        width="stretch",
         key="watch_nvd_sync_button",
         disabled=(is_job_running("sync_nvd_feed")) or not IS_ADMIN
     ):
@@ -5169,7 +5204,7 @@ with tab_watch:
 
         audit_check = st.button(
             "Vérifier l'état",
-            use_container_width=True,
+            width="stretch",
             disabled=(audit_running) or not IS_ADMIN,
             key="nvd_audit_check_button"
         )
@@ -5178,7 +5213,7 @@ with tab_watch:
 
         audit_fix = st.button(
             "Rattraper les CVE manquantes",
-            use_container_width=True,
+            width="stretch",
             type="primary",
             disabled=(audit_running) or not IS_ADMIN,
             key="nvd_audit_fix_button"
@@ -5291,7 +5326,7 @@ with tab_watch:
                     "state": "État"
                 }
             ),
-            use_container_width=True,
+            width="stretch",
             hide_index=True
         )
 
@@ -5345,7 +5380,7 @@ with tab_watch:
 
         if st.button(
             "Vérifier les changements (delta)",
-            use_container_width=True,
+            width="stretch",
             type="primary",
             disabled=inventory_running or not IS_ADMIN,
             key="inventory_delta_button",
@@ -5363,7 +5398,7 @@ with tab_watch:
 
         if st.button(
             "Import complet depuis Defender",
-            use_container_width=True,
+            width="stretch",
             disabled=inventory_running or not IS_ADMIN,
             key="inventory_defender_button",
             help="Inventaire complet par l'API Advanced Hunting de Defender "
@@ -5380,7 +5415,7 @@ with tab_watch:
 
         if st.button(
             "Recalculer les équipements touchés",
-            use_container_width=True,
+            width="stretch",
             disabled=(is_job_running("nvd_match")) or not IS_ADMIN,
             key="inventory_match_button"
         ):
@@ -5480,7 +5515,7 @@ with tab_watch:
 
             if st.button(
                 "Télécharger les produits NVD",
-                use_container_width=True,
+                width="stretch",
                 disabled=(is_job_running("nvd_cpe_sync")) or not IS_ADMIN,
                 key="inventory_cpe_button"
             ):
@@ -5528,7 +5563,7 @@ with tab_watch:
 
         if inventory_csv and st.button(
             "Importer le CSV",
-            use_container_width=True,
+            width="stretch",
             disabled=(is_job_running("sync_software_inventory")) or not IS_ADMIN,
             key="inventory_csv_button"
         ):
@@ -5591,7 +5626,7 @@ with tab_watch:
             column_config={
                 "CVSS": st.column_config.NumberColumn(format="%.1f")
             },
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
             on_select="rerun",
             selection_mode="single-row",
@@ -5615,7 +5650,7 @@ with tab_watch:
                 pd.DataFrame(
                     load_inventory_devices_for_cve(selected_inventory_cve)
                 ).rename(columns=INVENTORY_DEVICE_COLUMNS),
-                use_container_width=True,
+                width="stretch",
                 hide_index=True
             )
 
@@ -5735,7 +5770,7 @@ with tab_watch:
 
         if st.button(
             "Relancer le téléchargement maintenant",
-            use_container_width=True,
+            width="stretch",
             key="watch_nvd_backfill_relaunch_button",
             help=(
                 "Reprend depuis le dernier point atteint. Utile si le "
@@ -5816,7 +5851,7 @@ with tab_watch:
 
         if uploaded_nvd_files and st.button(
             "Importer",
-            use_container_width=True,
+            width="stretch",
             key="nvd_manual_upload_button",
             disabled=(is_job_running("nvd_import_files")) or not IS_ADMIN
         ):
@@ -5915,7 +5950,7 @@ with tab_watch:
                     "Première détection", "Dernière détection"
                 ]
             ].rename(columns={"criticité": "Criticité"}),
-            use_container_width=True,
+            width="stretch",
             hide_index=True
         )
 
@@ -6004,7 +6039,7 @@ with tab_watch:
                         "Dernière détection"
                     ]
                 ],
-                use_container_width=True,
+                width="stretch",
                 hide_index=True
             )
 
@@ -6017,7 +6052,7 @@ with tab_watch:
         if st.button(
             f"📧 Envoyer une alerte à la liste de diffusion "
             f"({len(active_recipients)} destinataire(s))",
-            use_container_width=True,
+            width="stretch",
             disabled=(not active_recipients) or not IS_ADMIN
         ):
 
@@ -6121,7 +6156,7 @@ with tab_watch:
             st.write("")
             add_recipient_submitted = st.form_submit_button(
                 "Ajouter",
-                use_container_width=True,
+                width="stretch",
                 disabled=not IS_ADMIN
             )
 
@@ -6217,7 +6252,7 @@ with tab_watch:
                     "Envoyée le"
                 ]
             ],
-            use_container_width=True,
+            width="stretch",
             hide_index=True
         )
 
