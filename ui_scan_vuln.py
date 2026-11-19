@@ -103,8 +103,58 @@ def _tags(tags_json):
 
 
 def _day(value):
+    """Date ISO -> AAAA-MM-JJ ; vide pour None / NaN (pas « nan »)."""
+
+    try:
+        if value is None or pd.isna(value):
+            return ""
+    except (TypeError, ValueError):
+        pass
 
     return str(value)[:10] if value else ""
+
+
+# Couleur de fond de toute la case « Risque » (texte contrasté).
+RISK_COLORS = {
+    "low": ("#1E88E5", "#FFFFFF"),        # Faible : bleu
+    "faible": ("#1E88E5", "#FFFFFF"),
+    "medium": ("#FDD835", "#000000"),     # Moyen : jaune
+    "moyen": ("#FDD835", "#000000"),
+    "high": ("#FB8C00", "#000000"),       # Élevé : orange
+    "eleve": ("#FB8C00", "#000000"),
+    "élevé": ("#FB8C00", "#000000"),
+    "critical": ("#D50000", "#FFFFFF"),   # Critique : rouge vif
+    "critique": ("#D50000", "#FFFFFF")
+}
+
+
+def _risk_cell_style(value):
+
+    colors = RISK_COLORS.get(str(value or "").strip().lower())
+
+    if not colors:
+        return ""
+
+    background, text = colors
+
+    return f"background-color: {background}; color: {text}; font-weight: 600"
+
+
+def _style_risk(frame, column="Risque"):
+    """
+    Styler pandas : case « Risque » colorée selon le niveau. Accepté par
+    st.dataframe et st.data_editor (le tableau reste modifiable).
+    """
+
+    if column not in frame.columns:
+        return frame
+
+    styler = frame.style
+
+    # pandas >= 2.1 : Styler.map ; versions antérieures : applymap.
+    apply = getattr(styler, "map", None) or styler.applymap
+
+    return apply(_risk_cell_style, subset=[column])
 
 
 def _format_ts(iso_value):
@@ -519,7 +569,7 @@ def _render_nessus_import(is_admin, current_user):
             )
 
             st.dataframe(
-                pd.DataFrame([
+                _style_risk(pd.DataFrame([
                     {
                         "Action": ACTION_LABELS[a["action"]],
                         "Host (Nessus)": a["row"]["srv"],
@@ -536,7 +586,7 @@ def _render_nessus_import(is_admin, current_user):
                         if a["action"] in ("new", "reopen", "refresh") else ""
                     }
                     for a in detail_actions
-                ]),
+                ])),
                 width="stretch", hide_index=True
             )
 
@@ -1131,7 +1181,7 @@ def render_scan_vulnerabilites(is_admin=False, render_job=None,
         ))))
 
         edited = st.data_editor(
-            display,
+            _style_risk(display),
             key=editor_key,
             width="stretch",
             hide_index=True,
@@ -1177,7 +1227,7 @@ def render_scan_vulnerabilites(is_admin=False, render_job=None,
 
     else:
 
-        st.dataframe(display, width="stretch", hide_index=True)
+        st.dataframe(_style_risk(display), width="stretch", hide_index=True)
 
     export = display.copy()
     export.insert(

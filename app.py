@@ -1972,6 +1972,15 @@ nvd_critical = int(
 # TABS
 # =========================================================
 
+# Versions récentes de Streamlit (1.67 par exemple) : st.tabs accepte une clé, l'onglet actif est
+# alors conservé quand la page se réexécute (modification d'un tableau,
+# synchro qui se termine...) au lieu de revenir au premier onglet.
+_MAIN_TABS_KWARGS = (
+    {"key": "main_tabs"}
+    if "key" in inspect.signature(st.tabs).parameters
+    else {}
+)
+
 tab_dashboard, tab_servers, tab_kev, tab_nvd, tab_inventory, tab_investigation, tab_notifications, tab_attack_surface, tab_watch, tab_scan = st.tabs(
     [
         "Tableau de bord",
@@ -1984,7 +1993,8 @@ tab_dashboard, tab_servers, tab_kev, tab_nvd, tab_inventory, tab_investigation, 
         "Attack Surface",
         "Veille",
         "Scan vulnérabilité"
-    ]
+    ],
+    **_MAIN_TABS_KWARGS
 )
 
 
