@@ -542,6 +542,32 @@ LOCALLY_MODIFIED = "__local__"
 # LECTURE (rubrique "Scan vulnérabilité")
 # =========================================================
 
+# Hôte affiché et filtré, calculé à la lecture (une correction dans
+# « Correspondances machine → hôte » s'applique aussitôt à tous les
+# constats, migrés ou importés) :
+#   1. correspondance en base pour la machine du constat (titre = IP ou
+#      nom de machine, comme dans ClickUp) ;
+#   2. sinon, hôte enregistré (champ HOST ClickUp ou import Nessus) ;
+#   3. sinon, si le titre est un nom de machine (un seul mot, sans
+#      espace) : la partie avant le premier point
+#      (x.alliumfr.Corp.priv -> x, x -> x). Une IP sans correspondance
+#      ou un titre en texte libre ne donnent pas d'hôte.
+HOST_JOIN = "LEFT JOIN scan_host_map hm ON hm.machine = TRIM(f.title)"
+
+HOST_EXPR = """COALESCE(
+    hm.hote,
+    NULLIF(TRIM(f.host), ''),
+    CASE
+        WHEN f.title IS NULL OR TRIM(f.title) = '' THEN NULL
+        WHEN TRIM(f.title) GLOB '*[^A-Za-z0-9._-]*' THEN NULL
+        WHEN TRIM(f.title) NOT GLOB '*[^0-9.]*' THEN NULL
+        WHEN instr(TRIM(f.title), '.') > 0
+            THEN substr(TRIM(f.title), 1, instr(TRIM(f.title), '.') - 1)
+        ELSE TRIM(f.title)
+    END
+)"""
+
+
 def get_scan_summary():
 
     ensure_scan_tables()
@@ -572,8 +598,8 @@ def get_scan_summary():
     ).fetchall()
 
     hosts = conn.execute(
-        "SELECT COUNT(DISTINCT host) AS n FROM scan_findings "
-        "WHERE host IS NOT NULL AND host <> ''"
+        f"SELECT COUNT(DISTINCT {HOST_EXPR}) AS n "
+        f"FROM scan_findings f {HOST_JOIN}"
     ).fetchone()["n"]
 
     conn.close()
@@ -608,9 +634,19 @@ def get_scan_filter_options():
 
     hosts = [
         r["host"] for r in conn.execute(
-            "SELECT DISTINCT host FROM scan_findings "
-            "WHERE host IS NOT NULL AND host <> '' "
-            "ORDER BY host COLLATE NOCASE"
+            # Sous-requête : dans un WHERE, « host » désignerait la
+            # colonne enregistrée, pas l'hôte calculé.
+            f"SELECT DISTINCT h.host FROM (SELECT {HOST_EXPR} AS host "
+            f"FROM scan_findings f {HOST_JOIN}) h "
+            "WHERE h.host IS NOT NULL ORDER BY h.host COLLATE NOCASE"
+        ).fetchall()
+    ]
+
+    titles = [
+        r["title"] for r in conn.execute(
+            "SELECT DISTINCT TRIM(title) AS title FROM scan_findings "
+            "WHERE title IS NOT NULL AND TRIM(title) <> '' "
+            "ORDER BY title COLLATE NOCASE"
         ).fetchall()
     ]
 
@@ -638,6 +674,7 @@ def get_scan_filter_options():
     return {
         "lists": lists,
         "statuses": statuses,
+        "titles": titles,
         "hosts": hosts,
         "cves": cves,
         "assignees": assignees,
@@ -651,12 +688,12 @@ UNASSIGNED = "(non assigné)"
 
 def get_scan_findings(
     lists=None, statuses=None, search=None, only_untreated=False,
-    limit=5000, hosts=None, cves=None, assignees=None
+    limit=5000, hosts=None, cves=None, assignees=None, titles=None
 ):
     """
     Filtres cumulés (ET entre filtres, OU dans un même filtre) :
-    listes, statuts, hôtes, CVE et assignés (UNASSIGNED = sans
-    assignation).
+    listes, statuts, constats (titre), hôtes (hôte affiché, voir
+    HOST_EXPR), CVE et assignés (UNASSIGNED = sans assignation).
     """
 
     ensure_scan_tables()
@@ -664,7 +701,8 @@ def get_scan_findings(
     query = """
         SELECT
             f.task_id, f.custom_id, f.list_name, f.title, f.status,
-            f.status_type, f.treated, f.priority, f.risk, f.host, f.port,
+            f.status_type, f.treated, f.priority, f.risk,
+            {host_expr} AS host, f.host AS host_stored, f.port,
             f.assignee_names, f.date_created, f.date_updated,
             f.date_closed, f.due_date, f.url,
             f.plugin_id, f.cvss, f.last_scan, f.tags_json, f.source,
@@ -674,8 +712,9 @@ def get_scan_findings(
                FROM scan_finding_cves c WHERE c.task_id = f.task_id) AS cves
         FROM scan_findings f
         LEFT JOIN scan_users u ON u.id = f.assigned_user_id
+        {host_join}
         WHERE 1 = 1
-    """
+    """.replace("{host_expr}", HOST_EXPR).replace("{host_join}", HOST_JOIN)
 
     params = []
 
@@ -690,8 +729,12 @@ def get_scan_findings(
     if only_untreated:
         query += " AND f.treated = 0"
 
+    if titles:
+        query += f" AND TRIM(f.title) IN ({', '.join('?' for _ in titles)})"
+        params.extend(titles)
+
     if hosts:
-        query += f" AND f.host IN ({', '.join('?' for _ in hosts)})"
+        query += f" AND {HOST_EXPR} IN ({', '.join('?' for _ in hosts)})"
         params.extend(hosts)
 
     if cves:
@@ -722,7 +765,7 @@ def get_scan_findings(
         like = f"%{search}%"
 
         query += (
-            " AND (f.title LIKE ? OR f.host LIKE ? OR f.assignee_names LIKE ?"
+            f" AND (f.title LIKE ? OR {HOST_EXPR} LIKE ? OR f.assignee_names LIKE ?"
             " OR u.utilisateur LIKE ? OR u.mail LIKE ?"
             " OR f.description LIKE ? OR f.task_id IN ("
             "   SELECT task_id FROM scan_finding_cves WHERE cve_id LIKE ?))"
@@ -747,9 +790,14 @@ def get_scan_finding_detail(task_id):
     conn = get_connection()
 
     row = conn.execute(
-        "SELECT f.*, u.utilisateur AS assigned_user, u.mail AS assigned_mail "
+        # Alias distinct : avec « f.* », une seconde colonne « host »
+        # serait masquée par la première (hôte enregistré).
+        "SELECT f.*, f.host AS host_stored, "
+        f"{HOST_EXPR} AS host_effective, "
+        "u.utilisateur AS assigned_user, u.mail AS assigned_mail "
         "FROM scan_findings f "
         "LEFT JOIN scan_users u ON u.id = f.assigned_user_id "
+        f"{HOST_JOIN} "
         "WHERE f.task_id = ?",
         (task_id,)
     ).fetchone()
@@ -759,6 +807,7 @@ def get_scan_finding_detail(task_id):
         return None
 
     finding = dict(row)
+    finding["host"] = finding.pop("host_effective")
 
     finding["custom_fields"] = json.loads(
         finding.pop("custom_fields_json") or "{}"
