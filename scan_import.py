@@ -48,6 +48,7 @@ scan_store.apply_scan_import().
 """
 
 import io
+import re
 import ipaddress
 import unicodedata
 from datetime import timedelta
@@ -234,17 +235,34 @@ def build_description(row):
 
 
 def _key(value):
+    """
+    Clé de comparaison : casse et espaces ignorés ; un nombre lu comme
+    décimal (« 57582.0 », champ numérique ClickUp ou Excel) vaut
+    « 57582 ».
+    """
 
-    return str(value or "").strip().lower()
+    text = str(value or "").strip().lower()
+
+    if re.fullmatch(r"\d+\.0+", text):
+        text = text.split(".")[0]
+
+    return text
 
 
-def build_import_plan(frame, host_map, existing, now, skip_info=True):
+def build_import_plan(frame, host_map, existing, now, skip_info=True,
+                      list_name=None):
     """
     Calcule, sans rien écrire, l'action de chaque ligne du CSV.
 
-    `existing` : constats de la liste choisie (scan_store.
+    `existing` : constats existants, TOUTES listes (scan_store.
     get_import_candidates), dicts task_id / title / plugin_id / port /
-    cve / status. `now` : date d'import (datetime avec fuseau).
+    cve / status / list_name. `now` : date d'import (datetime avec
+    fuseau). `list_name` : liste choisie pour l'import.
+
+    Rapprochement : d'abord dans la liste choisie (comme le script) ;
+    sans résultat, dans les autres listes. Un constat déjà suivi ailleurs
+    (accepté, traité...) est ainsi mis à jour au lieu d'être recréé en
+    double quand le scan est importé dans une autre liste.
 
     `host_map` : correspondances machine -> hôte (scan_store.get_host_map).
 
@@ -313,6 +331,15 @@ def build_import_plan(frame, host_map, existing, now, skip_info=True):
         if cve:
             matches = [m for m in matches if _key(m["cve"]) == cve.lower()]
 
+        if list_name is not None and matches:
+
+            same_list = [
+                m for m in matches if m.get("list_name") == list_name
+            ]
+
+            if same_list:
+                matches = same_list
+
         if not matches:
 
             signature = (_key(srv), _key(plugin_id), _key(port), cve.lower())
@@ -342,7 +369,8 @@ def build_import_plan(frame, host_map, existing, now, skip_info=True):
 
             actions.append({
                 "action": action, "task_id": match["task_id"], "row": row,
-                "status_before": match["status"]
+                "status_before": match["status"],
+                "list_before": match.get("list_name")
             })
 
     counts = {key: 0 for key in ACTION_LABELS}

@@ -407,9 +407,12 @@ def _render_nessus_import(is_admin, current_user):
                 frame = read_nessus_csv(nessus_file)
                 now = datetime.now().astimezone()
 
+                # Toutes les listes : un constat déjà suivi dans une autre
+                # liste est mis à jour, pas recréé (priorité à la liste
+                # choisie).
                 plan = build_import_plan(
-                    frame, host_map, get_import_candidates(list_name),
-                    now, skip_info
+                    frame, host_map, get_import_candidates(),
+                    now, skip_info, list_name=list_name
                 )
 
             except ScanImportError as error:
@@ -438,6 +441,20 @@ def _render_nessus_import(is_admin, current_user):
             f"{pending['hosts']} correspondance(s) machine → hôte, liste "
             f"« {pending['params']['list']} »."
         )
+
+        elsewhere = sorted({
+            a["list_before"] for a in pending["plan"]["actions"]
+            if a.get("list_before")
+            and a["list_before"] != pending["params"]["list"]
+        })
+
+        if elsewhere:
+            st.info(
+                f"{sum(1 for a in pending['plan']['actions'] if a.get('list_before') and a['list_before'] != pending['params']['list'])} "
+                "ligne(s) correspondent à des constats déjà suivis dans une "
+                "autre liste (" + ", ".join(elsewhere) + ") : ils sont mis à "
+                "jour dans leur liste au lieu d'être recréés."
+            )
 
         unmapped = pending["plan"].get("unmapped_ips") or []
 
@@ -473,6 +490,8 @@ def _render_nessus_import(is_admin, current_user):
                         "CVE": a["row"]["cve"],
                         "Risque": a["row"]["risk"],
                         "Statut actuel": a["status_before"],
+                        "Liste du constat": a.get("list_before")
+                        or (pending["params"]["list"] if a["action"] == "new" else None),
                         "Échéance": _day(a["row"]["due_date"])
                         if a["action"] in ("new", "reopen", "refresh") else ""
                     }
