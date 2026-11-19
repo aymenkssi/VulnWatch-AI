@@ -103,8 +103,58 @@ def _tags(tags_json):
 
 
 def _day(value):
+    """Date ISO -> AAAA-MM-JJ ; vide pour None / NaN (pas « nan »)."""
+
+    try:
+        if value is None or pd.isna(value):
+            return ""
+    except (TypeError, ValueError):
+        pass
 
     return str(value)[:10] if value else ""
+
+
+# Couleur de fond de toute la case « Risque » (texte contrasté).
+RISK_COLORS = {
+    "low": ("#1E88E5", "#FFFFFF"),        # Faible : bleu
+    "faible": ("#1E88E5", "#FFFFFF"),
+    "medium": ("#FDD835", "#000000"),     # Moyen : jaune
+    "moyen": ("#FDD835", "#000000"),
+    "high": ("#FB8C00", "#000000"),       # Élevé : orange
+    "eleve": ("#FB8C00", "#000000"),
+    "élevé": ("#FB8C00", "#000000"),
+    "critical": ("#D50000", "#FFFFFF"),   # Critique : rouge vif
+    "critique": ("#D50000", "#FFFFFF")
+}
+
+
+def _risk_cell_style(value):
+
+    colors = RISK_COLORS.get(str(value or "").strip().lower())
+
+    if not colors:
+        return ""
+
+    background, text = colors
+
+    return f"background-color: {background}; color: {text}; font-weight: 600"
+
+
+def _style_risk(frame, column="Risque"):
+    """
+    Styler pandas : case « Risque » colorée selon le niveau. Accepté par
+    st.dataframe et st.data_editor (le tableau reste modifiable).
+    """
+
+    if column not in frame.columns:
+        return frame
+
+    styler = frame.style
+
+    # pandas >= 2.1 : Styler.map ; versions antérieures : applymap.
+    apply = getattr(styler, "map", None) or styler.applymap
+
+    return apply(_risk_cell_style, subset=[column])
 
 
 def _format_ts(iso_value):
@@ -202,7 +252,7 @@ def _render_users(is_admin):
                     "utilisateur": "Utilisateur", "mail": "Mail",
                     "constats": "Constats assignés"
                 }),
-                use_container_width=True, hide_index=True
+                width="stretch", hide_index=True
             )
 
             return
@@ -217,7 +267,7 @@ def _render_users(is_admin):
             table,
             key="scan_users_editor",
             num_rows="dynamic",
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
             column_order=["utilisateur", "mail", "constats"],
             disabled=["constats"],
@@ -242,7 +292,7 @@ def _render_users(is_admin):
             "Enregistrer les utilisateurs",
             key="scan_users_save",
             type="primary",
-            use_container_width=True
+            width="stretch"
         ):
 
             rows = [
@@ -276,7 +326,7 @@ def _render_users(is_admin):
         if c2.button(
             "Importer les assignés ClickUp",
             key="scan_users_seed",
-            use_container_width=True,
+            width="stretch",
             help=(
                 "Ajoute les assignés ClickUp absents de la liste et assigne "
                 "les constats sans assignation. Ne modifie ni les mails, ni "
@@ -481,7 +531,7 @@ def _render_nessus_import(is_admin, current_user):
                 {"Action": ACTION_LABELS[key], "Lignes": counts[key]}
                 for key in action_keys
             ]),
-            use_container_width=True, hide_index=True,
+            width="stretch", hide_index=True,
             on_select="rerun", selection_mode="single-row",
             key=summary_key
         )
@@ -519,7 +569,7 @@ def _render_nessus_import(is_admin, current_user):
             )
 
             st.dataframe(
-                pd.DataFrame([
+                _style_risk(pd.DataFrame([
                     {
                         "Action": ACTION_LABELS[a["action"]],
                         "Host (Nessus)": a["row"]["srv"],
@@ -536,8 +586,8 @@ def _render_nessus_import(is_admin, current_user):
                         if a["action"] in ("new", "reopen", "refresh") else ""
                     }
                     for a in detail_actions
-                ]),
-                use_container_width=True, hide_index=True
+                ])),
+                width="stretch", hide_index=True
             )
 
         to_write = sum(
@@ -557,7 +607,7 @@ def _render_nessus_import(is_admin, current_user):
             key="nessus_apply",
             type="primary",
             disabled=stale or to_write == 0,
-            use_container_width=True
+            width="stretch"
         ):
 
             applied = apply_scan_import(
@@ -579,7 +629,7 @@ def _render_nessus_import(is_admin, current_user):
             st.rerun()
 
         if b2.button(
-            "Annuler", key="nessus_cancel", use_container_width=True
+            "Annuler", key="nessus_cancel", width="stretch"
         ):
 
             st.session_state.pop("nessus_plan", None)
@@ -614,7 +664,7 @@ def _render_host_map(is_admin):
                 table.drop(columns=["id"]).rename(columns={
                     "machine": "Machine (IP ou nom)", "hote": "Hôte"
                 }),
-                use_container_width=True, hide_index=True
+                width="stretch", hide_index=True
             )
 
             return
@@ -629,7 +679,7 @@ def _render_host_map(is_admin):
             table,
             key="host_map_editor",
             num_rows="dynamic",
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
             column_order=["machine", "hote"],
             column_config={
@@ -692,7 +742,7 @@ def _render_host_map(is_admin):
 
         if f2.button(
             "Importer le fichier", key="host_map_import",
-            disabled=upload is None, use_container_width=True
+            disabled=upload is None, width="stretch"
         ):
 
             try:
@@ -868,7 +918,7 @@ def render_scan_vulnerabilites(is_admin=False, render_job=None,
                         "task_count": "Tâches (compteur ClickUp)",
                         "archived": "Archivée"
                     }),
-                    use_container_width=True, hide_index=True
+                    width="stretch", hide_index=True
                 )
 
             except Exception as error:
@@ -906,7 +956,7 @@ def render_scan_vulnerabilites(is_admin=False, render_job=None,
             key="clickup_launch_btn",
             disabled=(not is_admin) or (not token_present) or running,
             type="primary",
-            use_container_width=True
+            width="stretch"
         ):
 
             # Pas de st.rerun() : render_job() juste en dessous affiche
@@ -923,7 +973,7 @@ def render_scan_vulnerabilites(is_admin=False, render_job=None,
         if b2.button(
             "Reparcourir toutes les listes",
             key="clickup_reset_btn",
-            use_container_width=True,
+            width="stretch",
             disabled=(not is_admin) or running,
             help=(
                 "Oublie les listes terminées (aucun constat n'est "
@@ -991,7 +1041,7 @@ def render_scan_vulnerabilites(is_admin=False, render_job=None,
             by_status.assign(
                 Statut=by_status["status"].map(_status_label)
             )[["Statut", "n"]].rename(columns={"n": "Constats"}),
-            use_container_width=True, hide_index=True
+            width="stretch", hide_index=True
         )
 
     with right:
@@ -1002,7 +1052,7 @@ def render_scan_vulnerabilites(is_admin=False, render_job=None,
             pd.DataFrame(summary["by_list"]).rename(columns={
                 "list_name": "Liste", "n": "Constats", "open_n": "Ouverts"
             }),
-            use_container_width=True, hide_index=True
+            width="stretch", hide_index=True
         )
 
     st.divider()
@@ -1131,9 +1181,9 @@ def render_scan_vulnerabilites(is_admin=False, render_job=None,
         ))))
 
         edited = st.data_editor(
-            display,
+            _style_risk(display),
             key=editor_key,
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
             disabled=[c for c in display.columns if c != "Assigné"],
             column_config={
@@ -1177,7 +1227,7 @@ def render_scan_vulnerabilites(is_admin=False, render_job=None,
 
     else:
 
-        st.dataframe(display, use_container_width=True, hide_index=True)
+        st.dataframe(_style_risk(display), width="stretch", hide_index=True)
 
     export = display.copy()
     export.insert(
@@ -1269,7 +1319,7 @@ def render_scan_vulnerabilites(is_admin=False, render_job=None,
                 }
                 for cve in detail["cves"]
             ]),
-            use_container_width=True, hide_index=True
+            width="stretch", hide_index=True
         )
 
     if detail["comments"]:
