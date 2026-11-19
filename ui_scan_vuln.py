@@ -963,6 +963,7 @@ def render_scan_vulnerabilites(is_admin=False, render_job=None,
     for key, values in (
         ("scan_f_lists", options["lists"]),
         ("scan_f_status", options["statuses"]),
+        ("scan_f_titles", options["titles"]),
         ("scan_f_hosts", options["hosts"]),
         ("scan_f_cves", options["cves"]),
         ("scan_f_assignees", assignee_options)
@@ -975,7 +976,7 @@ def render_scan_vulnerabilites(is_admin=False, render_job=None,
                 v for v in st.session_state[key] if v in allowed
             ]
 
-    f1, f2, f3, f4, f5 = st.columns(5)
+    f1, f2, f6, f3, f4, f5 = st.columns(6)
 
     # Listes pré-chargées depuis la base ; on peut taper dans chaque
     # liste pour filtrer les valeurs proposées.
@@ -986,6 +987,11 @@ def render_scan_vulnerabilites(is_admin=False, render_job=None,
     sel_status = f2.multiselect(
         "Statut", options["statuses"], key="scan_f_status",
         placeholder="Tous"
+    )
+    sel_titles = f6.multiselect(
+        "Constat", options["titles"], key="scan_f_titles",
+        placeholder="Tous",
+        help="Machine du constat (adresse IP ou nom), telle que détectée."
     )
     sel_hosts = f3.multiselect(
         "Hôte", options["hosts"], key="scan_f_hosts",
@@ -1008,6 +1014,7 @@ def render_scan_vulnerabilites(is_admin=False, render_job=None,
     findings = get_scan_findings(
         lists=sel_lists or None,
         statuses=sel_status or None,
+        titles=sel_titles or None,
         hosts=sel_hosts or None,
         cves=sel_cves or None,
         assignees=sel_assignees or None,
@@ -1058,7 +1065,8 @@ def render_scan_vulnerabilites(is_admin=False, render_job=None,
         # affichées au lieu de réappliquer des modifications à d'autres
         # lignes.
         editor_key = "scan_assign_editor_" + str(abs(hash((
-            tuple(sel_lists), tuple(sel_status), tuple(sel_hosts),
+            tuple(sel_lists), tuple(sel_status), tuple(sel_titles),
+            tuple(sel_hosts),
             tuple(sel_cves), tuple(sel_assignees), only_open,
             tuple(df["task_id"])
         ))))
