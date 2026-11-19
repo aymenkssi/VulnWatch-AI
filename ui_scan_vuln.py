@@ -20,6 +20,7 @@ CVE avec NVD / CISA KEV / Defender), export CSV.
 
 import json
 import os
+import uuid
 from datetime import date, datetime, timezone
 from pathlib import Path
 
@@ -424,6 +425,7 @@ def _render_nessus_import(is_admin, current_user):
 
                 st.session_state["nessus_plan"] = {
                     "plan": plan, "params": params, "now": now,
+                    "analysis_id": uuid.uuid4().hex,
                     "rows": len(frame), "hosts": len(host_map)
                 }
 
@@ -467,16 +469,54 @@ def _render_nessus_import(is_admin, current_user):
                 "puis relancez l'analyse."
             )
 
-        st.dataframe(
+        action_keys = [key for key, n in counts.items() if n]
+
+        # Clic sur une ligne d'action -> ses lignes du CSV juste en
+        # dessous. La clé dépend de l'analyse : une nouvelle analyse
+        # repart sans sélection.
+        summary_key = f"nessus_summary_{pending.get('analysis_id', '')}"
+
+        event = st.dataframe(
             pd.DataFrame([
-                {"Action": ACTION_LABELS[key], "Lignes": n}
-                for key, n in counts.items() if n
+                {"Action": ACTION_LABELS[key], "Lignes": counts[key]}
+                for key in action_keys
             ]),
-            use_container_width=True, hide_index=True
+            use_container_width=True, hide_index=True,
+            on_select="rerun", selection_mode="single-row",
+            key=summary_key
+        )
+
+        selected_rows = event.selection.rows if event else []
+        selected_action = (
+            action_keys[selected_rows[0]]
+            if selected_rows and selected_rows[0] < len(action_keys)
+            else None
         )
 
         # Pas d'expander ici : Streamlit refuse les expanders imbriqués.
-        if st.checkbox("Afficher le détail ligne par ligne", key="nessus_detail"):
+        show_all = st.checkbox(
+            "Afficher le détail de toutes les lignes", key="nessus_detail"
+        )
+
+        if selected_action is None and not show_all:
+            st.caption(
+                "Cliquez sur une ligne du tableau ci-dessus pour voir les "
+                "lignes du CSV concernées par cette action."
+            )
+
+        if selected_action is not None or show_all:
+
+            detail_actions = [
+                a for a in pending["plan"]["actions"]
+                if show_all or a["action"] == selected_action
+            ]
+
+            st.markdown(
+                f"**{ACTION_LABELS[selected_action]}** — "
+                f"{len(detail_actions)} ligne(s)"
+                if selected_action is not None and not show_all
+                else f"**Toutes les lignes** — {len(detail_actions)}"
+            )
 
             st.dataframe(
                 pd.DataFrame([
@@ -495,7 +535,7 @@ def _render_nessus_import(is_admin, current_user):
                         "Échéance": _day(a["row"]["due_date"])
                         if a["action"] in ("new", "reopen", "refresh") else ""
                     }
-                    for a in pending["plan"]["actions"]
+                    for a in detail_actions
                 ]),
                 use_container_width=True, hide_index=True
             )
