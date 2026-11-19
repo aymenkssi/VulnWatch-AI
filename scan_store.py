@@ -1173,17 +1173,24 @@ def get_list_info(list_name):
     }
 
 
-def get_import_candidates(list_name):
-    """Constats de la liste, fermés compris (clé de rapprochement)."""
+def get_import_candidates(list_name=None):
+    """
+    Constats existants, fermés compris (clé de rapprochement de l'import).
+    Toutes les listes si list_name est None.
+    """
 
     ensure_scan_tables()
 
     conn = get_connection()
 
+    query = (
+        "SELECT task_id, title, plugin_id, port, cve, status, list_name "
+        "FROM scan_findings"
+    )
+
     rows = conn.execute(
-        "SELECT task_id, title, plugin_id, port, cve, status "
-        "FROM scan_findings WHERE list_name = ?",
-        (list_name,)
+        query + (" WHERE list_name = ?" if list_name is not None else ""),
+        (list_name,) if list_name is not None else ()
     ).fetchall()
 
     conn.close()
