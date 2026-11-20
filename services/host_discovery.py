@@ -37,6 +37,10 @@ from concurrent.futures import ThreadPoolExecutor, wait
 
 DEFENDER_LOOKBACK_DAYS = 14
 
+# Adresses demandées par requête (liste « in ») : reste loin des limites
+# de taille d'une requête Advanced Hunting.
+DEFENDER_ADDRESS_BATCH = 300
+
 # Adresses IPv4 vues par Defender sur chaque machine, dernière machine
 # vue par adresse. IPv6, boucle locale et APIPA exclues.
 DEFENDER_QUERY = """
@@ -46,7 +50,7 @@ DeviceNetworkInfo
 | extend Address = tostring(IP.IPAddress)
 | where Address matches regex @"^\\d{{1,3}}(\\.\\d{{1,3}}){{3}}$"
 | where not(Address startswith "127.") and not(Address startswith "169.254.")
-| summarize arg_max(Timestamp, DeviceName), Devices = dcount(DeviceName) by Address
+{address_filter}| summarize arg_max(Timestamp, DeviceName), Devices = dcount(DeviceName) by Address
 | project Address, DeviceName, Devices, LastSeen = Timestamp
 """
 
@@ -86,10 +90,29 @@ def _is_ipv4(value):
 # 1. MICROSOFT DEFENDER
 # =========================================================
 
+def defender_query(days, addresses=None):
+    """
+    Requête KQL. `addresses` : ne chercher que ces IP (sinon toutes les
+    adresses du parc).
+    """
+
+    days = max(1, min(int(days), 30))   # Advanced Hunting : 30 jours max
+
+    address_filter = ""
+
+    if addresses:
+        quoted = ", ".join(f'"{a}"' for a in addresses)
+        address_filter = f"| where Address in (dynamic([{quoted}]))\n"
+
+    return DEFENDER_QUERY.format(days=days, address_filter=address_filter)
+
+
 def discover_from_defender(days=DEFENDER_LOOKBACK_DAYS, upper=True,
-                           run_query=None):
+                           run_query=None, addresses=None):
     """
     Retourne une liste de propositions {machine, hote, source, detail}.
+    `addresses` : ne chercher que ces IP (par exemple celles sans
+    correspondance de la dernière analyse) ; None = tout le parc.
     `run_query` : pour les tests ; par défaut, l'Advanced Hunting de
     collectors.defender (application Entra ID, sinon Azure CLI).
     """
@@ -97,9 +120,25 @@ def discover_from_defender(days=DEFENDER_LOOKBACK_DAYS, upper=True,
     if run_query is None:
         from collectors.defender import run_hunting_query as run_query
 
-    days = max(1, min(int(days), 30))   # Advanced Hunting : 30 jours max
+    if addresses is not None:
 
-    rows = run_query(DEFENDER_QUERY.format(days=days))
+        # Seules des IPv4 valides entrent dans la requête (aucune autre
+        # saisie n'est injectée dans le KQL).
+        addresses = [a for a in dict.fromkeys(str(a).strip() for a in addresses) if _is_ipv4(a)]
+
+        if not addresses:
+            return []
+
+        rows = []
+
+        for start in range(0, len(addresses), DEFENDER_ADDRESS_BATCH):
+            rows.extend(run_query(defender_query(
+                days, addresses[start:start + DEFENDER_ADDRESS_BATCH]
+            )))
+
+    else:
+
+        rows = run_query(defender_query(days))
 
     proposals = []
 
@@ -140,12 +179,17 @@ _NETBIOS_RE = re.compile(r"^\s*([A-Za-z0-9._-]+)\s*=\s*Computer name", re.IGNORE
 _HOSTNAME_RE = re.compile(r"Hostname\s*:\s*([A-Za-z0-9._-]+)", re.IGNORECASE)
 
 
-def discover_from_nessus(frame, upper=True):
+def discover_from_nessus(frame, upper=True, addresses=None):
     """
     Noms de machine trouvés dans les résultats informatifs d'un export
     CSV Nessus (DataFrame de scan_import.read_nessus_csv). Un seul nom
     par adresse : FQDN, sinon NetBIOS, sinon « Device Hostname ».
+    `addresses` : ne garder que ces IP ; None = toutes.
     """
+
+    wanted = (
+        {str(a).strip() for a in addresses} if addresses is not None else None
+    )
 
     if frame is None or "Plugin Output" not in frame.columns:
         return []
@@ -172,7 +216,7 @@ def discover_from_nessus(frame, upper=True):
 
         address = str(line.get("Host") or "").strip()
 
-        if not _is_ipv4(address):
+        if not _is_ipv4(address) or (wanted is not None and address not in wanted):
             continue
 
         match = patterns[plugin].search(str(line.get("Plugin Output") or ""))
