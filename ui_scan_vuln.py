@@ -47,6 +47,9 @@ from scan_store import (
     set_scan_assignments,
     seed_scan_users_from_findings,
     get_import_candidates,
+    add_scan_comment,
+    delete_scan_comment,
+    COMMENT_MAX_LENGTH,
     get_status_catalog,
     default_new_status,
     apply_scan_import,
@@ -777,6 +780,103 @@ def _render_host_map(is_admin):
                 st.rerun()
 
 
+def _render_comments(detail, is_admin, current_user):
+    """
+    Commentaires d'un constat : historique ClickUp, commentaires
+    « Date d'import » et commentaires saisis ici. Ajout réservé aux
+    administrateurs ; chacun peut supprimer ses propres commentaires
+    saisis dans VulnWatch (jamais l'historique ClickUp).
+    """
+
+    task_id = detail["task_id"]
+    comments = detail["comments"]
+
+    st.markdown(f"##### Commentaires ({len(comments)})")
+
+    result = st.session_state.pop(f"comment_result_{task_id}", None)
+
+    if result:
+        st.success(result)
+
+    if not comments:
+        st.caption("Aucun commentaire pour ce constat.")
+
+    for comment in comments:
+
+        with st.container(border=True):
+
+            head, action = st.columns([12, 1])
+
+            origin = (
+                "" if str(comment["comment_id"]).startswith("VW-")
+                else " · ClickUp"
+            )
+
+            head.caption(
+                f"{_format_ts(comment['date'])} — "
+                f"**{comment['author_name'] or '?'}**"
+                f"{' (réponse)' if comment['parent_comment_id'] else ''}"
+                f"{origin}"
+            )
+
+            can_delete = (
+                is_admin
+                and current_user
+                and str(comment["comment_id"]).startswith("VW-")
+                and comment["author_name"] == current_user
+            )
+
+            if can_delete and action.button(
+                "🗑️",
+                key=f"comment_del_{comment['comment_id']}",
+                help="Supprimer ce commentaire"
+            ):
+
+                delete_scan_comment(comment["comment_id"], current_user)
+                st.session_state[f"comment_result_{task_id}"] = (
+                    "Commentaire supprimé."
+                )
+                st.rerun()
+
+            # st.text : le texte n'est jamais interprété (Markdown, HTML).
+            st.text(comment["text"] or "")
+
+    if not is_admin:
+        st.caption("🔒 Ajout de commentaires réservé aux administrateurs.")
+        return
+
+    with st.form(f"comment_form_{task_id}", clear_on_submit=True):
+
+        text = st.text_area(
+            "Ajouter un commentaire",
+            max_chars=COMMENT_MAX_LENGTH,
+            placeholder=(
+                "Action menée, échange avec le propriétaire, justification "
+                "d'une acceptation du risque..."
+            ),
+            key=f"comment_text_{task_id}"
+        )
+
+        submitted = st.form_submit_button("Publier le commentaire")
+
+    if submitted:
+
+        try:
+
+            add_scan_comment(task_id, current_user or "VulnWatch", text)
+
+        except ValueError as error:
+
+            st.error(str(error))
+
+        else:
+
+            st.session_state[f"comment_result_{task_id}"] = (
+                "Commentaire ajouté."
+            )
+            st.rerun()
+
+
 def render_scan_vulnerabilites(is_admin=False, render_job=None,
                                current_user=None):
     """
@@ -1322,18 +1422,7 @@ def render_scan_vulnerabilites(is_admin=False, render_job=None,
             width="stretch", hide_index=True
         )
 
-    if detail["comments"]:
-
-        st.markdown(f"##### Commentaires ({len(detail['comments'])})")
-
-        for comment in detail["comments"]:
-
-            st.text(
-                f"{_day(comment['date'])} — "
-                f"{comment['author_name'] or '?'}"
-                f"{' (réponse)' if comment['parent_comment_id'] else ''}\n"
-                f"{comment['text'] or ''}"
-            )
+    _render_comments(detail, is_admin, current_user)
 
     if detail["attachments"]:
 
