@@ -1547,3 +1547,82 @@ def import_host_map(pairs, overwrite=False):
     conn.close()
 
     return stats
+
+
+# =========================================================
+# COMMENTAIRES SAISIS DANS VULNWATCH
+# =========================================================
+
+COMMENT_MAX_LENGTH = 5000
+
+
+def add_scan_comment(task_id, author, text):
+    """
+    Ajoute un commentaire à un constat. Identifiant « VW-... » : jamais
+    écrasé par une migration ClickUp (qui n'écrit que ses propres ids).
+    Lève ValueError si le texte est vide ou trop long.
+    """
+
+    text = (text or "").strip()
+
+    if not text:
+        raise ValueError("Le commentaire est vide.")
+
+    if len(text) > COMMENT_MAX_LENGTH:
+        raise ValueError(
+            f"Commentaire trop long ({len(text)} caractères, "
+            f"{COMMENT_MAX_LENGTH} au maximum)."
+        )
+
+    ensure_scan_tables()
+
+    from datetime import datetime, timezone
+
+    comment_id = f"VW-{uuid.uuid4().hex}"
+
+    conn = get_connection()
+
+    if conn.execute(
+        "SELECT 1 FROM scan_findings WHERE task_id = ?", (task_id,)
+    ).fetchone() is None:
+        conn.close()
+        raise ValueError("Constat introuvable.")
+
+    conn.execute(
+        "INSERT INTO scan_finding_comments "
+        "(comment_id, task_id, author_name, text, date) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (
+            comment_id, task_id, author, text,
+            datetime.now(timezone.utc).isoformat()
+        )
+    )
+
+    conn.commit()
+    conn.close()
+
+    return comment_id
+
+
+def delete_scan_comment(comment_id, author):
+    """
+    Supprime un commentaire saisi dans VulnWatch par `author`. Les
+    commentaires repris de ClickUp (historique) ne sont jamais supprimés.
+    Retourne True si un commentaire a été supprimé.
+    """
+
+    if not str(comment_id or "").startswith("VW-"):
+        return False
+
+    conn = get_connection()
+
+    cursor = conn.execute(
+        "DELETE FROM scan_finding_comments "
+        "WHERE comment_id = ? AND author_name = ?",
+        (comment_id, author)
+    )
+
+    conn.commit()
+    conn.close()
+
+    return cursor.rowcount > 0
