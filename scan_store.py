@@ -1239,6 +1239,41 @@ def get_status_catalog(list_name=None):
     return catalog
 
 
+# Les cinq statuts du suivi (espace ClickUp « DSI Infra SecOps ») et leur
+# type : un statut de type done / closed compte comme traité.
+STANDARD_STATUSES = [
+    ("reduire", "open"),
+    ("traite", "closed"),
+    ("attenue", "custom"),
+    ("accepte", "custom"),
+    ("refuse", "custom")
+]
+
+
+def get_new_status_choices(catalog):
+    """
+    Statuts proposés pour les nouveaux constats d'un import : les cinq
+    statuts standard, toujours, même si aucun constat ne les porte encore
+    (orthographe déjà utilisée en base quand elle existe), puis les
+    autres statuts présents en base.
+    """
+
+    choices = []
+
+    for normalized, _ in STANDARD_STATUSES:
+        entry = catalog.get(normalized)
+        choices.append(entry["status"] if entry else normalized)
+
+    standard = {normalized for normalized, _ in STANDARD_STATUSES}
+
+    choices += sorted(
+        entry["status"] for normalized, entry in catalog.items()
+        if normalized not in standard
+    )
+
+    return choices
+
+
 def default_new_status(catalog):
     """
     Statut d'un nouveau constat : dans ClickUp, le premier statut
@@ -1282,8 +1317,11 @@ def apply_scan_import(plan, list_name, scan_date, now, author,
 
     reduire, reduire_type = status_of("reduire", "reduire")
     new_status_type = (
-        catalog.get(_normalize_status(new_status)) or {}
-    ).get("status_type", "open")
+        (catalog.get(_normalize_status(new_status)) or {}).get("status_type")
+        or dict(STANDARD_STATUSES).get(_normalize_status(new_status))
+        or "open"
+    )
+    new_treated = 1 if new_status_type in ("done", "closed") else 0
 
     now_iso = now.isoformat()
     scan_iso = scan_date.isoformat()
@@ -1333,14 +1371,15 @@ def apply_scan_import(plan, list_name, scan_date, now, author,
                     date_created, date_updated, due_date, details_synced,
                     imported_at, last_synced_at, local_modified_at
                 )
-                VALUES (?, 'Nessus CSV', ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?,
+                VALUES (?, 'Nessus CSV', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                         ?, ?, ?, ?, ?, '', '[]', ?, ?, ?, '[]', NULL, ?, ?,
                         ?, 0, ?, ?, ?)
                 """,
                 (
                     task_id, info["space_id"], info["list_id"], list_name,
                     info["folder_name"], row["srv"], row["description"],
-                    new_status, new_status_type, row["risk"], row["host"],
+                    new_status, new_status_type, new_treated,
+                    row["risk"], row["host"],
                     row["port"], row["plugin_id"], row["cve"], row["cvss"],
                     scan_iso,
                     json.dumps([row["name"]] if row["name"] else [],
