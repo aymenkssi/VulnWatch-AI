@@ -815,6 +815,34 @@ def _render_host_discovery():
     pending = st.session_state.get("nessus_plan") or {}
     unmapped = (pending.get("plan") or {}).get("unmapped_ips") or []
 
+    # Une seule liste pour les trois sources : par défaut, les adresses
+    # sans correspondance de la dernière analyse d'import.
+    ips_text = st.text_area(
+        "Adresses IP à rechercher (une par ligne)",
+        value="\n".join(unmapped),
+        height=110,
+        key=f"host_discovery_ips_{pending.get('analysis_id', '')}",
+        help=(
+            "Pré-rempli avec les adresses sans correspondance de la dernière "
+            "analyse d'import. Vous pouvez en ajouter ou en retirer."
+        )
+    )
+
+    ips = list(dict.fromkeys(
+        part for part in re.split(r"[\s,;]+", ips_text or "") if part
+    ))
+
+    if unmapped:
+        st.caption(
+            f"{len(unmapped)} adresse(s) sans correspondance dans la dernière "
+            "analyse. Seules les adresses de la liste sont recherchées."
+        )
+    else:
+        st.caption(
+            "Lancez « Analyser le fichier » dans l'import pour pré-remplir la "
+            "liste, ou collez des adresses."
+        )
+
     upper = st.checkbox(
         "Noms d'hôte en majuscules (LIEBKP01 plutôt que liebkp01)",
         value=True, key="host_discovery_upper"
@@ -835,19 +863,22 @@ def _render_host_discovery():
         )
 
         if st.button(
-            "Chercher dans Defender", key="host_discovery_defender",
-            width="stretch",
+            f"Chercher {len(ips)} adresse(s) dans Defender",
+            key="host_discovery_defender",
+            width="stretch", disabled=not ips,
             help=(
-                "Requête Advanced Hunting sur DeviceNetworkInfo : adresses "
-                "IP de chaque machine gérée par Defender (permission "
-                "AdvancedQuery.Read.All, déjà utilisée pour l'inventaire)."
+                "Requête Advanced Hunting sur DeviceNetworkInfo, limitée aux "
+                "adresses de la liste (permission AdvancedQuery.Read.All, "
+                "déjà utilisée pour l'inventaire)."
             )
         ):
 
             try:
 
                 with st.spinner("Requête Advanced Hunting en cours..."):
-                    proposals = discover_from_defender(days, upper=upper)
+                    proposals = discover_from_defender(
+                        days, upper=upper, addresses=ips
+                    )
 
             except Exception as error:
 
@@ -855,7 +886,10 @@ def _render_host_discovery():
 
             else:
 
-                _store_discovery("Microsoft Defender", proposals, [])
+                _store_discovery(
+                    "Microsoft Defender", proposals,
+                    _not_found(ips, proposals)
+                )
 
     # --- 2. CSV Nessus ----------------------------------------------
     with c2:
@@ -877,8 +911,9 @@ def _render_host_discovery():
         )
 
         if st.button(
-            "Chercher dans le CSV", key="host_discovery_nessus",
-            width="stretch", disabled=nessus_file is None,
+            f"Chercher {len(ips)} adresse(s) dans le CSV",
+            key="host_discovery_nessus",
+            width="stretch", disabled=nessus_file is None or not ips,
             help=(
                 "Lit les plugins 12053 (FQDN), 10150 (NetBIOS) et 55472 "
                 "(Device Hostname). Le scan doit être exporté AVEC les "
@@ -896,39 +931,31 @@ def _render_host_discovery():
 
             else:
 
-                proposals = discover_from_nessus(frame, upper=upper)
+                proposals = discover_from_nessus(
+                    frame, upper=upper, addresses=ips
+                )
 
                 if not proposals:
                     st.warning(
-                        "Aucun nom trouvé : le CSV ne contient pas les "
-                        "plugins 12053, 10150 ou 55472. Exportez le scan "
-                        "avec les résultats informatifs."
+                        "Aucun nom trouvé pour ces adresses : le CSV ne "
+                        "contient pas leurs plugins 12053, 10150 ou 55472. "
+                        "Exportez le scan avec les résultats informatifs."
                     )
                 else:
-                    _store_discovery("CSV Nessus", proposals, [])
+                    _store_discovery(
+                        "CSV Nessus", proposals, _not_found(ips, proposals)
+                    )
 
     # --- 3. DNS inverse ---------------------------------------------
     with c3:
 
         st.markdown("###### DNS inverse")
 
-        ips_text = st.text_area(
-            "Adresses IP (une par ligne)",
-            value="\n".join(unmapped),
-            height=100,
-            key=f"host_discovery_ips_{pending.get('analysis_id', '')}",
-            help=(
-                "Pré-rempli avec les adresses sans correspondance de la "
-                "dernière analyse d'import."
-            )
-        )
-
-        ips = [
-            part for part in re.split(r"[\s,;]+", ips_text or "") if part
-        ]
+        st.caption("Depuis le serveur VulnWatch (zone DNS inverse).")
 
         if st.button(
-            f"Résoudre {len(ips)} adresse(s)", key="host_discovery_dns",
+            f"Résoudre {len(ips)} adresse(s) par DNS",
+            key="host_discovery_dns",
             width="stretch", disabled=not ips
         ):
 
@@ -957,7 +984,7 @@ def _render_host_discovery():
 
     if discovery["unresolved"]:
         st.caption(
-            f"{len(discovery['unresolved'])} adresse(s) sans réponse : "
+            f"{len(discovery['unresolved'])} adresse(s) non trouvée(s) par cette source : "
             + ", ".join(discovery["unresolved"][:40])
             + (" ..." if len(discovery["unresolved"]) > 40 else "")
         )
@@ -1079,6 +1106,14 @@ def _show_defender_error(error):
         "configurez une application Entra ID : barre latérale > "
         "Application Azure."
     )
+
+
+def _not_found(addresses, proposals):
+    """Adresses demandées pour lesquelles la source n'a rien proposé."""
+
+    found = {p["machine"] for p in proposals}
+
+    return [a for a in addresses if a not in found]
 
 
 def _store_discovery(source, proposals, unresolved):
