@@ -43,8 +43,11 @@ from scan_store import (
     mark_list_done,
     get_synced_task_state,
     save_scan_batch,
-    set_attachment_download
+    set_attachment_download,
+    seed_scan_users_from_findings,
+    LOCALLY_MODIFIED
 )
+from services.jobs import report_progress
 from collectors.clickup import (
     ClickUpClient,
     ClickUpError,
@@ -145,6 +148,11 @@ def main():
                 f"(~{lst.get('task_count') or '?'} tâches)..."
             )
 
+            report_progress(
+                list_index - 1, len(lists),
+                f"Liste « {label} »", force=True
+            )
+
             batch = []
             list_tasks = 0
 
@@ -152,12 +160,22 @@ def main():
 
                 list_tasks += 1
 
+                # Limité à une écriture toutes les 0,5 s par jobs.py.
+                report_progress(
+                    list_index - 1, len(lists),
+                    f"Liste « {label} » : {list_tasks} tâches parcourues "
+                    f"({totals['tasks']} migrées, {totals['skipped']} déjà "
+                    f"à jour, {client.calls} appels API)"
+                )
+
                 task_id = str(raw["id"])
                 updated_iso = ms_to_iso(raw.get("date_updated"))
 
                 already = synced.get(task_id)
 
-                if already is not None and already == updated_iso:
+                if already is not None and already in (
+                    updated_iso, LOCALLY_MODIFIED
+                ):
 
                     # Détail + commentaires déjà récupérés et tâche
                     # inchangée : on ne refait pas ces appels.
@@ -259,6 +277,13 @@ def main():
 
         sys.exit(1)
 
+    # Liste déroulante « Assigné » : ajoute les nouveaux assignés ClickUp
+    # au référentiel et assigne les nouveaux constats (sans toucher aux
+    # assignations faites à la main).
+    users_added, findings_assigned = seed_scan_users_from_findings()
+
+    report_progress(len(lists), len(lists), "Migration terminée", force=True)
+
     print()
     print("Migration terminée.")
     print(f"  Tâches migrées      : {totals['tasks']}")
@@ -266,6 +291,8 @@ def main():
     print(f"  Commentaires        : {totals['comments']}")
     print(f"  Fichiers téléchargés: {totals['files']}")
     print(f"  Appels API ClickUp  : {client.calls}")
+    print(f"  Utilisateurs ajoutés: {users_added}")
+    print(f"  Constats assignés   : {findings_assigned}")
     print()
 
     set_sync_state(

@@ -14,6 +14,8 @@ pages figées sur ce projet.
 """
 
 import json
+import re
+import uuid
 
 from database import (
     get_connection,
@@ -32,6 +34,43 @@ DEFAULT_CLICKUP_SPACE_ID = "60866384"
 SYNC_KEY = "clickup_migration"
 
 _TABLES_READY = False
+
+
+def _backfill_nessus_fields(conn):
+    """
+    Constats déjà migrés avant l'ajout des colonnes Nessus : les valeurs
+    sont relues dans le JSON ClickUp brut conservé (raw_json).
+    """
+
+    from collectors.clickup import resolve_custom_field, extract_nessus_fields
+
+    rows = conn.execute(
+        "SELECT task_id, raw_json FROM scan_findings WHERE raw_json IS NOT NULL"
+    ).fetchall()
+
+    for row in rows:
+
+        try:
+            raw = json.loads(row["raw_json"] or "{}")
+        except (ValueError, TypeError):
+            continue
+
+        by_id, by_name = {}, {}
+
+        for field in raw.get("custom_fields") or []:
+
+            value = resolve_custom_field(field)
+            by_id[field.get("id")] = value
+            by_name[field.get("name")] = value
+
+        nessus = extract_nessus_fields(by_id, by_name)
+
+        conn.execute(
+            "UPDATE scan_findings SET plugin_id = ?, cve = ?, cvss = ?, "
+            "last_scan = ? WHERE task_id = ?",
+            (nessus["plugin_id"], nessus["cve"], nessus["cvss"],
+             nessus["last_scan"], row["task_id"])
+        )
 
 
 # =========================================================
@@ -152,6 +191,81 @@ def ensure_scan_tables():
     ):
         conn.execute(index_sql)
 
+    # Référentiel des personnes à qui l'on assigne un constat (liste
+    # déroulante « Assigné »). Rempli une première fois avec les assignés
+    # ClickUp migrés, puis complété à la main dans l'interface.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS scan_users (
+
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            utilisateur TEXT NOT NULL UNIQUE COLLATE NOCASE,
+            mail TEXT,
+
+            -- Nom de l'assigné dans ClickUp : garde le lien quand
+            -- l'utilisateur est renommé (« jdupont » -> « Jean DUPONT »).
+            clickup_name TEXT COLLATE NOCASE
+
+        )
+    """)
+
+    # Correspondances machine détectée par Nessus (IP ou nom) -> hôte,
+    # qui remplacent le fichier IP;HOST du script ImportVullns.ps1.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS scan_host_map (
+
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            machine TEXT NOT NULL UNIQUE COLLATE NOCASE,
+            hote TEXT NOT NULL
+
+        )
+    """)
+
+    # Assignation locale (VulnWatch), distincte de l'assignation ClickUp
+    # d'origine (assignee_names / assignees_json, que la migration
+    # réécrit). assigned_manual = 1 : modifiée dans l'interface, le
+    # remplissage automatique n'y touche plus.
+    existing = {
+        r["name"] for r in conn.execute("PRAGMA table_info(scan_findings)")
+    }
+
+    if "assigned_user_id" not in existing:
+        conn.execute(
+            "ALTER TABLE scan_findings ADD COLUMN assigned_user_id INTEGER"
+        )
+
+    # Champs Nessus dédiés (Plugin ID, CVE, CVSS, date du dernier scan) :
+    # clé de rapprochement de l'import de scan, comme dans le script
+    # ImportVullns.ps1. local_modified_at : constat créé ou modifié par
+    # un import local ; la migration ClickUp ne l'écrase plus.
+    added_nessus = False
+
+    for column in ("plugin_id", "cve", "cvss", "last_scan", "local_modified_at"):
+
+        if column not in existing:
+
+            conn.execute(f"ALTER TABLE scan_findings ADD COLUMN {column} TEXT")
+
+            added_nessus = True
+
+    if added_nessus:
+        _backfill_nessus_fields(conn)
+
+    if "assigned_manual" not in existing:
+        conn.execute(
+            "ALTER TABLE scan_findings "
+            "ADD COLUMN assigned_manual INTEGER DEFAULT 0"
+        )
+
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_scan_findings_assigned "
+        "ON scan_findings(assigned_user_id)"
+    )
+
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_scan_findings_match "
+        "ON scan_findings(list_name, plugin_id)"
+    )
+
     conn.commit()
     conn.close()
 
@@ -224,7 +338,8 @@ _FINDING_COLUMNS = (
     "assignees_json", "tags_json", "creator", "custom_fields_json",
     "checklists_json", "raw_json", "date_created", "date_updated",
     "date_closed", "date_done", "due_date", "url", "parent_task_id",
-    "details_synced", "imported_at", "last_synced_at"
+    "details_synced", "imported_at", "last_synced_at",
+    "plugin_id", "cve", "cvss", "last_scan"
 )
 
 
@@ -267,7 +382,11 @@ def _finding_row(finding, now_iso, details_synced):
         finding.get("parent_task_id"),
         1 if details_synced else 0,
         now_iso,
-        now_iso
+        now_iso,
+        finding.get("plugin_id"),
+        finding.get("cve"),
+        finding.get("cvss"),
+        finding.get("last_scan")
     )
 
 
@@ -295,7 +414,10 @@ def save_scan_batch(items, now_iso):
     sql = (
         f"INSERT INTO scan_findings ({', '.join(_FINDING_COLUMNS)}) "
         f"VALUES ({placeholders}) "
-        f"ON CONFLICT(task_id) DO UPDATE SET {updates}"
+        f"ON CONFLICT(task_id) DO UPDATE SET {updates} "
+        # Constat modifié par un import de scan local : la version
+        # VulnWatch fait foi, la migration ClickUp n'y touche plus.
+        f"WHERE scan_findings.local_modified_at IS NULL"
     )
 
     conn = get_connection()
@@ -397,18 +519,54 @@ def get_synced_task_state():
     conn = get_connection()
 
     rows = conn.execute(
-        "SELECT task_id, date_updated FROM scan_findings "
-        "WHERE details_synced = 1"
+        "SELECT task_id, date_updated, local_modified_at FROM scan_findings "
+        "WHERE details_synced = 1 OR local_modified_at IS NOT NULL"
     ).fetchall()
 
     conn.close()
 
-    return {r["task_id"]: r["date_updated"] for r in rows}
+    # Constat modifié localement : valeur spéciale, la migration le
+    # saute quoi que dise ClickUp (sa version locale fait foi).
+    return {
+        r["task_id"]: (
+            LOCALLY_MODIFIED if r["local_modified_at"] else r["date_updated"]
+        )
+        for r in rows
+    }
+
+
+LOCALLY_MODIFIED = "__local__"
 
 
 # =========================================================
 # LECTURE (rubrique "Scan vulnérabilité")
 # =========================================================
+
+# Hôte affiché et filtré, calculé à la lecture (une correction dans
+# « Correspondances machine → hôte » s'applique aussitôt à tous les
+# constats, migrés ou importés) :
+#   1. correspondance en base pour la machine du constat (titre = IP ou
+#      nom de machine, comme dans ClickUp) ;
+#   2. sinon, hôte enregistré (champ HOST ClickUp ou import Nessus) ;
+#   3. sinon, si le titre est un nom de machine (un seul mot, sans
+#      espace) : la partie avant le premier point
+#      (x.alliumfr.Corp.priv -> x, x -> x). Une IP sans correspondance
+#      ou un titre en texte libre ne donnent pas d'hôte.
+HOST_JOIN = "LEFT JOIN scan_host_map hm ON hm.machine = TRIM(f.title)"
+
+HOST_EXPR = """COALESCE(
+    hm.hote,
+    NULLIF(TRIM(f.host), ''),
+    CASE
+        WHEN f.title IS NULL OR TRIM(f.title) = '' THEN NULL
+        WHEN TRIM(f.title) GLOB '*[^A-Za-z0-9._-]*' THEN NULL
+        WHEN TRIM(f.title) NOT GLOB '*[^0-9.]*' THEN NULL
+        WHEN instr(TRIM(f.title), '.') > 0
+            THEN substr(TRIM(f.title), 1, instr(TRIM(f.title), '.') - 1)
+        ELSE TRIM(f.title)
+    END
+)"""
+
 
 def get_scan_summary():
 
@@ -440,8 +598,8 @@ def get_scan_summary():
     ).fetchall()
 
     hosts = conn.execute(
-        "SELECT COUNT(DISTINCT host) AS n FROM scan_findings "
-        "WHERE host IS NOT NULL AND host <> ''"
+        f"SELECT COUNT(DISTINCT {HOST_EXPR}) AS n "
+        f"FROM scan_findings f {HOST_JOIN}"
     ).fetchone()["n"]
 
     conn.close()
@@ -474,29 +632,89 @@ def get_scan_filter_options():
         ).fetchall()
     ]
 
+    hosts = [
+        r["host"] for r in conn.execute(
+            # Sous-requête : dans un WHERE, « host » désignerait la
+            # colonne enregistrée, pas l'hôte calculé.
+            f"SELECT DISTINCT h.host FROM (SELECT {HOST_EXPR} AS host "
+            f"FROM scan_findings f {HOST_JOIN}) h "
+            "WHERE h.host IS NOT NULL ORDER BY h.host COLLATE NOCASE"
+        ).fetchall()
+    ]
+
+    titles = [
+        r["title"] for r in conn.execute(
+            "SELECT DISTINCT TRIM(title) AS title FROM scan_findings "
+            "WHERE title IS NOT NULL AND TRIM(title) <> '' "
+            "ORDER BY title COLLATE NOCASE"
+        ).fetchall()
+    ]
+
+    cves = [
+        r["cve_id"] for r in conn.execute(
+            "SELECT DISTINCT cve_id FROM scan_finding_cves ORDER BY cve_id DESC"
+        ).fetchall()
+    ]
+
+    # Seulement les utilisateurs qui ont au moins un constat.
+    assignees = [
+        r["utilisateur"] for r in conn.execute(
+            "SELECT DISTINCT u.utilisateur FROM scan_users u "
+            "JOIN scan_findings f ON f.assigned_user_id = u.id "
+            "ORDER BY u.utilisateur COLLATE NOCASE"
+        ).fetchall()
+    ]
+
+    has_unassigned = conn.execute(
+        "SELECT 1 FROM scan_findings WHERE assigned_user_id IS NULL LIMIT 1"
+    ).fetchone() is not None
+
     conn.close()
 
-    return {"lists": lists, "statuses": statuses}
+    return {
+        "lists": lists,
+        "statuses": statuses,
+        "titles": titles,
+        "hosts": hosts,
+        "cves": cves,
+        "assignees": assignees,
+        "has_unassigned": has_unassigned
+    }
+
+
+# Valeur du filtre « Assigné » pour les constats sans assignation.
+UNASSIGNED = "(non assigné)"
 
 
 def get_scan_findings(
     lists=None, statuses=None, search=None, only_untreated=False,
-    limit=5000
+    limit=5000, hosts=None, cves=None, assignees=None, titles=None
 ):
+    """
+    Filtres cumulés (ET entre filtres, OU dans un même filtre) :
+    listes, statuts, constats (titre), hôtes (hôte affiché, voir
+    HOST_EXPR), CVE et assignés (UNASSIGNED = sans assignation).
+    """
 
     ensure_scan_tables()
 
     query = """
         SELECT
             f.task_id, f.custom_id, f.list_name, f.title, f.status,
-            f.status_type, f.treated, f.priority, f.risk, f.host, f.port,
+            f.status_type, f.treated, f.priority, f.risk,
+            {host_expr} AS host, f.host AS host_stored, f.port,
             f.assignee_names, f.date_created, f.date_updated,
             f.date_closed, f.due_date, f.url,
+            f.plugin_id, f.cvss, f.last_scan, f.tags_json, f.source,
+            f.assigned_user_id, u.utilisateur AS assigned_user,
+            u.mail AS assigned_mail,
             (SELECT GROUP_CONCAT(c.cve_id, ', ')
                FROM scan_finding_cves c WHERE c.task_id = f.task_id) AS cves
         FROM scan_findings f
+        LEFT JOIN scan_users u ON u.id = f.assigned_user_id
+        {host_join}
         WHERE 1 = 1
-    """
+    """.replace("{host_expr}", HOST_EXPR).replace("{host_join}", HOST_JOIN)
 
     params = []
 
@@ -511,17 +729,49 @@ def get_scan_findings(
     if only_untreated:
         query += " AND f.treated = 0"
 
+    if titles:
+        query += f" AND TRIM(f.title) IN ({', '.join('?' for _ in titles)})"
+        params.extend(titles)
+
+    if hosts:
+        query += f" AND {HOST_EXPR} IN ({', '.join('?' for _ in hosts)})"
+        params.extend(hosts)
+
+    if cves:
+        query += (
+            " AND f.task_id IN (SELECT task_id FROM scan_finding_cves "
+            f"WHERE cve_id IN ({', '.join('?' for _ in cves)}))"
+        )
+        params.extend(cves)
+
+    if assignees:
+
+        names = [a for a in assignees if a != UNASSIGNED]
+        clauses = []
+
+        if names:
+            clauses.append(
+                f"u.utilisateur IN ({', '.join('?' for _ in names)})"
+            )
+            params.extend(names)
+
+        if UNASSIGNED in assignees:
+            clauses.append("f.assigned_user_id IS NULL")
+
+        query += " AND (" + " OR ".join(clauses) + ")"
+
     if search:
 
         like = f"%{search}%"
 
         query += (
-            " AND (f.title LIKE ? OR f.host LIKE ? OR f.assignee_names LIKE ?"
+            f" AND (f.title LIKE ? OR {HOST_EXPR} LIKE ? OR f.assignee_names LIKE ?"
+            " OR u.utilisateur LIKE ? OR u.mail LIKE ?"
             " OR f.description LIKE ? OR f.task_id IN ("
             "   SELECT task_id FROM scan_finding_cves WHERE cve_id LIKE ?))"
         )
 
-        params.extend([like, like, like, like, like])
+        params.extend([like] * 7)
 
     query += " ORDER BY f.date_updated DESC LIMIT ?"
     params.append(int(limit))
@@ -540,7 +790,16 @@ def get_scan_finding_detail(task_id):
     conn = get_connection()
 
     row = conn.execute(
-        "SELECT * FROM scan_findings WHERE task_id = ?", (task_id,)
+        # Alias distinct : avec « f.* », une seconde colonne « host »
+        # serait masquée par la première (hôte enregistré).
+        "SELECT f.*, f.host AS host_stored, "
+        f"{HOST_EXPR} AS host_effective, "
+        "u.utilisateur AS assigned_user, u.mail AS assigned_mail "
+        "FROM scan_findings f "
+        "LEFT JOIN scan_users u ON u.id = f.assigned_user_id "
+        f"{HOST_JOIN} "
+        "WHERE f.task_id = ?",
+        (task_id,)
     ).fetchone()
 
     if row is None:
@@ -548,6 +807,7 @@ def get_scan_finding_detail(task_id):
         return None
 
     finding = dict(row)
+    finding["host"] = finding.pop("host_effective")
 
     finding["custom_fields"] = json.loads(
         finding.pop("custom_fields_json") or "{}"
@@ -637,3 +897,732 @@ def get_scan_cve_context(cve_ids):
     conn.close()
 
     return context
+
+
+# =========================================================
+# UTILISATEURS ET ASSIGNATION
+# =========================================================
+
+MAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
+def _clickup_assignee_names(assignees_json):
+    """Noms des assignés ClickUp d'un constat, dans l'ordre d'origine."""
+
+    try:
+        assignees = json.loads(assignees_json or "[]")
+    except (ValueError, TypeError):
+        return []
+
+    names = []
+
+    for assignee in assignees:
+
+        name = (assignee.get("username") or "").strip()
+
+        if name and name.lower() not in (n.lower() for n in names):
+            names.append(name)
+
+    return names
+
+
+def seed_scan_users_from_findings():
+    """
+    Remplissage à partir des données migrées, rejouable sans risque :
+      - ajoute chaque assigné ClickUp absent du référentiel (champ
+        « utilisateur » seul, le mail est complété à la main) ;
+      - assigne au premier assigné ClickUp les constats encore sans
+        assignation et jamais modifiés à la main.
+    Ne modifie ni les mails saisis, ni une assignation manuelle.
+    Retourne (utilisateurs ajoutés, constats assignés).
+    """
+
+    ensure_scan_tables()
+
+    conn = get_connection()
+
+    rows = conn.execute(
+        "SELECT task_id, assignees_json, assigned_user_id, assigned_manual "
+        "FROM scan_findings"
+    ).fetchall()
+
+    def clickup_map():
+
+        mapping = {}
+
+        for r in conn.execute(
+            "SELECT id, utilisateur, clickup_name FROM scan_users"
+        ):
+
+            mapping.setdefault(r["utilisateur"].lower(), r["id"])
+
+            if r["clickup_name"]:
+                # Le nom ClickUp d'origine prime sur un homonyme.
+                mapping[r["clickup_name"].lower()] = r["id"]
+
+        return mapping
+
+    ids = clickup_map()
+    added = 0
+
+    for row in rows:
+
+        for name in _clickup_assignee_names(row["assignees_json"]):
+
+            if name.lower() in ids:
+                continue
+
+            conn.execute(
+                "INSERT INTO scan_users (utilisateur, clickup_name) "
+                "VALUES (?, ?)",
+                (name, name)
+            )
+
+            ids = clickup_map()
+            added += 1
+
+    assigned = 0
+
+    for row in rows:
+
+        if row["assigned_user_id"] is not None or row["assigned_manual"]:
+            continue
+
+        names = _clickup_assignee_names(row["assignees_json"])
+
+        if not names:
+            continue
+
+        conn.execute(
+            "UPDATE scan_findings SET assigned_user_id = ? WHERE task_id = ?",
+            (ids[names[0].lower()], row["task_id"])
+        )
+
+        assigned += 1
+
+    conn.commit()
+    conn.close()
+
+    return added, assigned
+
+
+def get_scan_users():
+
+    ensure_scan_tables()
+
+    conn = get_connection()
+
+    rows = conn.execute(
+        """
+        SELECT u.id, u.utilisateur, u.mail,
+               (SELECT COUNT(*) FROM scan_findings f
+                 WHERE f.assigned_user_id = u.id) AS constats
+        FROM scan_users u
+        ORDER BY u.utilisateur COLLATE NOCASE
+        """
+    ).fetchall()
+
+    conn.close()
+
+    return [dict(r) for r in rows]
+
+
+def save_scan_users(rows):
+    """
+    Remplace le référentiel par `rows` (liste de dicts id / utilisateur /
+    mail, id None pour un nouvel utilisateur), en une transaction.
+    Un utilisateur retiré de la liste est supprimé et ses constats
+    deviennent non assignés. Lève ValueError si la saisie est invalide
+    (rien n'est alors écrit).
+    """
+
+    ensure_scan_tables()
+
+    cleaned = []
+    seen = set()
+
+    for row in rows:
+
+        name = (row.get("utilisateur") or "").strip()
+        mail = (row.get("mail") or "").strip() or None
+
+        if not name and not mail:
+            # Ligne vide ajoutée puis abandonnée dans l'éditeur.
+            continue
+
+        if not name:
+            raise ValueError(f"Utilisateur manquant pour le mail {mail}.")
+
+        if name.lower() in seen:
+            raise ValueError(f"Utilisateur en double : {name}.")
+
+        if mail and not MAIL_PATTERN.match(mail):
+            raise ValueError(f"Adresse mail invalide pour {name} : {mail}.")
+
+        seen.add(name.lower())
+
+        user_id = row.get("id")
+        user_id = int(user_id) if user_id not in (None, "") else None
+
+        cleaned.append((user_id, name, mail))
+
+    conn = get_connection()
+
+    kept = {user_id for user_id, _, _ in cleaned if user_id is not None}
+
+    existing = {
+        r["id"] for r in conn.execute("SELECT id FROM scan_users")
+    }
+
+    removed = existing - kept
+
+    for user_id in removed:
+
+        conn.execute(
+            "UPDATE scan_findings SET assigned_user_id = NULL, "
+            "assigned_manual = 1 WHERE assigned_user_id = ?",
+            (user_id,)
+        )
+
+        conn.execute("DELETE FROM scan_users WHERE id = ?", (user_id,))
+
+    # Renommages d'abord sous un nom temporaire : permet d'échanger deux
+    # noms sans heurter la contrainte UNIQUE.
+    for user_id, name, mail in cleaned:
+
+        if user_id is not None:
+            conn.execute(
+                "UPDATE scan_users SET utilisateur = ? WHERE id = ?",
+                (f"__tmp_{user_id}", user_id)
+            )
+
+    for user_id, name, mail in cleaned:
+
+        if user_id is None:
+            conn.execute(
+                "INSERT INTO scan_users (utilisateur, mail) VALUES (?, ?)",
+                (name, mail)
+            )
+        else:
+            conn.execute(
+                "UPDATE scan_users SET utilisateur = ?, mail = ? WHERE id = ?",
+                (name, mail, user_id)
+            )
+
+    conn.commit()
+    conn.close()
+
+    return len(removed)
+
+
+def set_scan_assignments(assignments):
+    """
+    `assignments` : {task_id: user_id ou None}. Enregistré en une
+    transaction ; marque l'assignation comme manuelle.
+    """
+
+    if not assignments:
+        return 0
+
+    ensure_scan_tables()
+
+    conn = get_connection()
+
+    for task_id, user_id in assignments.items():
+
+        conn.execute(
+            "UPDATE scan_findings SET assigned_user_id = ?, "
+            "assigned_manual = 1 WHERE task_id = ?",
+            (user_id, task_id)
+        )
+
+    conn.commit()
+    conn.close()
+
+    return len(assignments)
+
+
+# =========================================================
+# IMPORT DE SCAN NESSUS (voir scan_import.py)
+# =========================================================
+
+def _normalize_status(status):
+
+    from scan_import import normalize_status
+
+    return normalize_status(status)
+
+
+def get_list_info(list_name):
+    """list_id / folder_name d'une liste déjà connue (None sinon)."""
+
+    ensure_scan_tables()
+
+    conn = get_connection()
+
+    row = conn.execute(
+        "SELECT list_id, folder_name, space_id FROM scan_findings "
+        "WHERE list_name = ? AND list_id IS NOT NULL LIMIT 1",
+        (list_name,)
+    ).fetchone()
+
+    conn.close()
+
+    return dict(row) if row else {
+        "list_id": None, "folder_name": None, "space_id": None
+    }
+
+
+def get_import_candidates(list_name=None):
+    """
+    Constats existants, fermés compris (clé de rapprochement de l'import).
+    Toutes les listes si list_name est None.
+    """
+
+    ensure_scan_tables()
+
+    conn = get_connection()
+
+    query = (
+        "SELECT task_id, title, plugin_id, port, cve, status, list_name "
+        "FROM scan_findings"
+    )
+
+    rows = conn.execute(
+        query + (" WHERE list_name = ?" if list_name is not None else ""),
+        (list_name,) if list_name is not None else ()
+    ).fetchall()
+
+    conn.close()
+
+    return [dict(r) for r in rows]
+
+
+def get_status_catalog(list_name=None):
+    """
+    Statuts connus (orthographe stockée, type ClickUp, ordre) :
+    {statut normalisé: {"status", "status_type", "orderindex"}}.
+    Ceux de la liste choisie priment sur ceux des autres listes.
+    """
+
+    ensure_scan_tables()
+
+    conn = get_connection()
+
+    rows = conn.execute(
+        "SELECT status, status_type, raw_json, "
+        "       COALESCE(list_name = ?, 0) AS same_list "
+        "FROM scan_findings WHERE status IS NOT NULL "
+        "GROUP BY status, status_type, same_list",
+        (list_name,)
+    ).fetchall()
+
+    conn.close()
+
+    catalog = {}
+
+    for row in sorted(rows, key=lambda r: r["same_list"]):
+
+        try:
+            orderindex = (
+                json.loads(row["raw_json"] or "{}").get("status") or {}
+            ).get("orderindex")
+        except (ValueError, TypeError, AttributeError):
+            orderindex = None
+
+        catalog[_normalize_status(row["status"])] = {
+            "status": row["status"],
+            "status_type": row["status_type"] or "open",
+            "orderindex": orderindex
+        }
+
+    return catalog
+
+
+def default_new_status(catalog):
+    """
+    Statut d'un nouveau constat : dans ClickUp, le premier statut
+    (ouvert) de la liste. À défaut, RÉDUIRE.
+    """
+
+    opened = [
+        v for v in catalog.values()
+        if v["status_type"] == "open" and v["orderindex"] is not None
+    ]
+
+    if opened:
+        return min(opened, key=lambda v: int(v["orderindex"]))["status"]
+
+    return (catalog.get("reduire") or {}).get("status") or "reduire"
+
+
+def apply_scan_import(plan, list_name, scan_date, now, author,
+                      new_status):
+    """
+    Écrit le plan de scan_import.build_import_plan() en UNE transaction.
+    `scan_date` : date du scan (date), `now` : date d'import (datetime
+    avec fuseau), `author` : utilisateur VulnWatch (auteur du
+    commentaire), `new_status` : statut des nouveaux constats.
+    Retourne les compteurs effectivement appliqués.
+    """
+
+    ensure_scan_tables()
+
+    catalog = get_status_catalog(list_name)
+    info = get_list_info(list_name)
+
+    def status_of(normalized, fallback):
+
+        entry = catalog.get(normalized)
+
+        return (
+            (entry["status"], entry["status_type"]) if entry
+            else (fallback, "open")
+        )
+
+    reduire, reduire_type = status_of("reduire", "reduire")
+    new_status_type = (
+        catalog.get(_normalize_status(new_status)) or {}
+    ).get("status_type", "open")
+
+    now_iso = now.isoformat()
+    scan_iso = scan_date.isoformat()
+
+    # Même texte que le script : « Date d'import: <date et heure> ».
+    comment_text = f"Date d'import: {now.strftime('%d/%m/%Y %H:%M:%S')}"
+
+    applied = {}
+
+    conn = get_connection()
+
+    def add_comment(task_id):
+
+        conn.execute(
+            "INSERT INTO scan_finding_comments (comment_id, task_id, "
+            "author_name, text, date) VALUES (?, ?, ?, ?, ?)",
+            (f"VW-{uuid.uuid4().hex}", task_id, author, comment_text, now_iso)
+        )
+
+    for item in plan["actions"]:
+
+        action = item["action"]
+        row = item["row"]
+        task_id = item["task_id"]
+
+        if action in ("unchanged", "duplicate", "info"):
+            continue
+
+        if action == "new":
+
+            task_id = f"VW-{uuid.uuid4().hex[:16]}"
+
+            custom_fields = {
+                "Plugin ID": row["plugin_id"], "Risk": row["risk"],
+                "CVE": row["cve"], "CVSS": row["cvss"], "Port": row["port"],
+                "Last Scan": scan_iso, "HOST": row["host"]
+            }
+
+            conn.execute(
+                """
+                INSERT INTO scan_findings (
+                    task_id, source, space_id, list_id, list_name,
+                    folder_name, title, description, status, status_type,
+                    treated, risk, host, port, plugin_id, cve, cvss,
+                    last_scan, assignee_names, assignees_json, tags_json,
+                    creator, custom_fields_json, checklists_json, raw_json,
+                    date_created, date_updated, due_date, details_synced,
+                    imported_at, last_synced_at, local_modified_at
+                )
+                VALUES (?, 'Nessus CSV', ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?,
+                        ?, ?, ?, ?, ?, '', '[]', ?, ?, ?, '[]', NULL, ?, ?,
+                        ?, 0, ?, ?, ?)
+                """,
+                (
+                    task_id, info["space_id"], info["list_id"], list_name,
+                    info["folder_name"], row["srv"], row["description"],
+                    new_status, new_status_type, row["risk"], row["host"],
+                    row["port"], row["plugin_id"], row["cve"], row["cvss"],
+                    scan_iso,
+                    json.dumps([row["name"]] if row["name"] else [],
+                               ensure_ascii=False),
+                    author,
+                    json.dumps(custom_fields, ensure_ascii=False),
+                    now_iso, now_iso, row["due_date"], now_iso, now_iso,
+                    now_iso
+                )
+            )
+
+            if row["cve"]:
+                conn.execute(
+                    "INSERT OR IGNORE INTO scan_finding_cves (task_id, cve_id) "
+                    "VALUES (?, ?)",
+                    (task_id, row["cve"])
+                )
+
+        elif action == "reopen":
+
+            conn.execute(
+                "UPDATE scan_findings SET status = ?, status_type = ?, "
+                "treated = 0, date_closed = NULL, date_done = NULL, "
+                "due_date = ?, last_scan = ?, date_updated = ?, "
+                "local_modified_at = ? WHERE task_id = ?",
+                (reduire, reduire_type, row["due_date"], scan_iso, now_iso,
+                 now_iso, task_id)
+            )
+
+        elif action == "refresh":
+
+            conn.execute(
+                "UPDATE scan_findings SET due_date = ?, last_scan = ?, "
+                "date_updated = ?, local_modified_at = ? WHERE task_id = ?",
+                (row["due_date"], scan_iso, now_iso, now_iso, task_id)
+            )
+
+        elif action == "accepted":
+
+            conn.execute(
+                "UPDATE scan_findings SET due_date = NULL, last_scan = ?, "
+                "date_updated = ?, local_modified_at = ? WHERE task_id = ?",
+                (scan_iso, now_iso, now_iso, task_id)
+            )
+
+        add_comment(task_id)
+
+        applied[action] = applied.get(action, 0) + 1
+
+    conn.commit()
+    conn.close()
+
+    return applied
+
+
+# =========================================================
+# CORRESPONDANCES MACHINE -> HÔTE (import de scan)
+# =========================================================
+
+def get_host_map_rows():
+
+    ensure_scan_tables()
+
+    conn = get_connection()
+
+    rows = conn.execute(
+        "SELECT id, machine, hote FROM scan_host_map "
+        "ORDER BY hote COLLATE NOCASE, machine COLLATE NOCASE"
+    ).fetchall()
+
+    conn.close()
+
+    return [dict(r) for r in rows]
+
+
+def get_host_map():
+    """{machine en minuscules: hôte}, pour scan_import.resolve_hostname."""
+
+    return {r["machine"].lower(): r["hote"] for r in get_host_map_rows()}
+
+
+def save_host_map(rows):
+    """
+    Remplace les correspondances par `rows` (dicts id / machine / hote,
+    id None pour une nouvelle ligne), en une transaction. Lève
+    ValueError si la saisie est invalide (rien n'est alors écrit).
+    """
+
+    ensure_scan_tables()
+
+    cleaned = []
+    seen = set()
+
+    for row in rows:
+
+        machine = (row.get("machine") or "").strip()
+        hote = (row.get("hote") or "").strip()
+
+        if not machine and not hote:
+            continue
+
+        if not machine or not hote:
+            raise ValueError(
+                f"Machine et hôte obligatoires : « {machine or hote} »."
+            )
+
+        if machine.lower() in seen:
+            raise ValueError(f"Machine en double : {machine}.")
+
+        seen.add(machine.lower())
+
+        row_id = row.get("id")
+        row_id = int(row_id) if row_id not in (None, "") else None
+
+        cleaned.append((row_id, machine, hote))
+
+    conn = get_connection()
+
+    kept = {row_id for row_id, _, _ in cleaned if row_id is not None}
+
+    removed = [
+        r["id"] for r in conn.execute("SELECT id FROM scan_host_map")
+        if r["id"] not in kept
+    ]
+
+    for row_id in removed:
+        conn.execute("DELETE FROM scan_host_map WHERE id = ?", (row_id,))
+
+    # Nom temporaire d'abord : permet d'échanger deux machines sans
+    # heurter la contrainte UNIQUE.
+    for row_id, machine, hote in cleaned:
+
+        if row_id is not None:
+            conn.execute(
+                "UPDATE scan_host_map SET machine = ? WHERE id = ?",
+                (f"__tmp_{row_id}", row_id)
+            )
+
+    for row_id, machine, hote in cleaned:
+
+        if row_id is None:
+            conn.execute(
+                "INSERT INTO scan_host_map (machine, hote) VALUES (?, ?)",
+                (machine, hote)
+            )
+        else:
+            conn.execute(
+                "UPDATE scan_host_map SET machine = ?, hote = ? WHERE id = ?",
+                (machine, hote, row_id)
+            )
+
+    conn.commit()
+    conn.close()
+
+    return len(removed)
+
+
+def import_host_map(pairs, overwrite=False):
+    """
+    Ajoute les paires (machine, hôte) du fichier de correspondance.
+    overwrite=False : une machine déjà en base garde son hôte (les
+    corrections faites dans l'interface sont préservées).
+    Retourne {"added", "updated", "kept"}.
+    """
+
+    ensure_scan_tables()
+
+    conn = get_connection()
+
+    existing = {
+        r["machine"].lower(): r["hote"]
+        for r in conn.execute("SELECT machine, hote FROM scan_host_map")
+    }
+
+    stats = {"added": 0, "updated": 0, "kept": 0}
+
+    for machine, hote in pairs:
+
+        current = existing.get(machine.lower())
+
+        if current is None:
+
+            conn.execute(
+                "INSERT INTO scan_host_map (machine, hote) VALUES (?, ?)",
+                (machine, hote)
+            )
+            existing[machine.lower()] = hote
+            stats["added"] += 1
+
+        elif current != hote and overwrite:
+
+            conn.execute(
+                "UPDATE scan_host_map SET hote = ? WHERE machine = ?",
+                (hote, machine)
+            )
+            existing[machine.lower()] = hote
+            stats["updated"] += 1
+
+        else:
+
+            stats["kept"] += 1
+
+    conn.commit()
+    conn.close()
+
+    return stats
+
+
+# =========================================================
+# COMMENTAIRES SAISIS DANS VULNWATCH
+# =========================================================
+
+COMMENT_MAX_LENGTH = 5000
+
+
+def add_scan_comment(task_id, author, text):
+    """
+    Ajoute un commentaire à un constat. Identifiant « VW-... » : jamais
+    écrasé par une migration ClickUp (qui n'écrit que ses propres ids).
+    Lève ValueError si le texte est vide ou trop long.
+    """
+
+    text = (text or "").strip()
+
+    if not text:
+        raise ValueError("Le commentaire est vide.")
+
+    if len(text) > COMMENT_MAX_LENGTH:
+        raise ValueError(
+            f"Commentaire trop long ({len(text)} caractères, "
+            f"{COMMENT_MAX_LENGTH} au maximum)."
+        )
+
+    ensure_scan_tables()
+
+    from datetime import datetime, timezone
+
+    comment_id = f"VW-{uuid.uuid4().hex}"
+
+    conn = get_connection()
+
+    if conn.execute(
+        "SELECT 1 FROM scan_findings WHERE task_id = ?", (task_id,)
+    ).fetchone() is None:
+        conn.close()
+        raise ValueError("Constat introuvable.")
+
+    conn.execute(
+        "INSERT INTO scan_finding_comments "
+        "(comment_id, task_id, author_name, text, date) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (
+            comment_id, task_id, author, text,
+            datetime.now(timezone.utc).isoformat()
+        )
+    )
+
+    conn.commit()
+    conn.close()
+
+    return comment_id
+
+
+def delete_scan_comment(comment_id, author):
+    """
+    Supprime un commentaire saisi dans VulnWatch par `author`. Les
+    commentaires repris de ClickUp (historique) ne sont jamais supprimés.
+    Retourne True si un commentaire a été supprimé.
+    """
+
+    if not str(comment_id or "").startswith("VW-"):
+        return False
+
+    conn = get_connection()
+
+    cursor = conn.execute(
+        "DELETE FROM scan_finding_comments "
+        "WHERE comment_id = ? AND author_name = ?",
+        (comment_id, author)
+    )
+
+    conn.commit()
+    conn.close()
+
+    return cursor.rowcount > 0
