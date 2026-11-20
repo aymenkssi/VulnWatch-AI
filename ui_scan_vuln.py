@@ -20,6 +20,7 @@ CVE avec NVD / CISA KEV / Defender), export CSV.
 
 import json
 import os
+import re
 import uuid
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -57,6 +58,13 @@ from scan_store import (
     get_host_map_rows,
     save_host_map,
     import_host_map
+)
+from services.host_discovery import (
+    DEFENDER_LOOKBACK_DAYS,
+    discover_from_defender,
+    discover_from_nessus,
+    discover_from_dns,
+    compare_with_existing
 )
 from scan_import import (
     ACTION_LABELS,
@@ -519,7 +527,8 @@ def _render_nessus_import(is_admin, current_user):
                 "l'adresse IP) : " + ", ".join(unmapped[:30])
                 + (" ..." if len(unmapped) > 30 else "")
                 + ". Ajoutez-les dans « Correspondances machine → hôte » "
-                "puis relancez l'analyse."
+                "(à la main ou avec « Remplir automatiquement ») puis "
+                "relancez l'analyse."
             )
 
         action_keys = [key for key, n in counts.items() if n]
@@ -653,7 +662,11 @@ def _render_host_map(is_admin):
 
     with st.expander(
         f"Correspondances machine → hôte ({len(rows)})",
-        expanded=result is not None
+        expanded=(
+            result is not None
+            or "host_discovery" in st.session_state
+            or bool(st.session_state.get("host_discovery_open"))
+        )
     ):
 
         if result:
@@ -725,6 +738,8 @@ def _render_host_map(is_admin):
                 )
                 st.rerun()
 
+        _render_host_discovery()
+
         st.markdown("**Importer un fichier de correspondance**")
 
         f1, f2 = st.columns([3, 2])
@@ -778,6 +793,250 @@ def _render_host_map(is_admin):
                 st.session_state.pop("host_map_editor", None)
                 st.session_state["host_map_result"] = message
                 st.rerun()
+
+
+def _render_host_discovery():
+    """
+    Remplissage automatique de la table des correspondances : Defender
+    (Advanced Hunting), plugins d'information du CSV Nessus, DNS
+    inverse. Aperçu des propositions, puis ajout après confirmation
+    (sans remplacer les correspondances existantes, sauf choix contraire).
+    """
+
+    st.markdown("**Remplir automatiquement**")
+
+    st.caption(
+        "Propose des correspondances IP → hôte à partir de Microsoft "
+        "Defender, des résultats informatifs du CSV Nessus déposé dans "
+        "« Importer un scan Nessus », ou du DNS inverse. Rien n'est "
+        "enregistré avant votre confirmation."
+    )
+
+    pending = st.session_state.get("nessus_plan") or {}
+    unmapped = (pending.get("plan") or {}).get("unmapped_ips") or []
+
+    upper = st.checkbox(
+        "Noms d'hôte en majuscules (LIEBKP01 plutôt que liebkp01)",
+        value=True, key="host_discovery_upper"
+    )
+
+    c1, c2, c3 = st.columns(3)
+
+    # --- 1. Defender ------------------------------------------------
+    with c1:
+
+        st.markdown("###### Microsoft Defender")
+
+        days = st.selectbox(
+            "Adresses vues depuis", [7, 14, 30],
+            index=[7, 14, 30].index(DEFENDER_LOOKBACK_DAYS),
+            format_func=lambda d: f"{d} jours",
+            key="host_discovery_days"
+        )
+
+        if st.button(
+            "Chercher dans Defender", key="host_discovery_defender",
+            width="stretch",
+            help=(
+                "Requête Advanced Hunting sur DeviceNetworkInfo : adresses "
+                "IP de chaque machine gérée par Defender (permission "
+                "AdvancedQuery.Read.All, déjà utilisée pour l'inventaire)."
+            )
+        ):
+
+            try:
+
+                with st.spinner("Requête Advanced Hunting en cours..."):
+                    proposals = discover_from_defender(days, upper=upper)
+
+            except Exception as error:
+
+                st.error(f"Defender n'a pas répondu : {error}")
+
+            else:
+
+                _store_discovery("Microsoft Defender", proposals, [])
+
+    # --- 2. CSV Nessus ----------------------------------------------
+    with c2:
+
+        st.markdown("###### CSV Nessus")
+
+        nessus_file = st.session_state.get("nessus_file")
+
+        st.caption(
+            f"Fichier : {nessus_file.name}" if nessus_file
+            else "Déposez d'abord le CSV dans « Importer un scan Nessus »."
+        )
+
+        if st.button(
+            "Chercher dans le CSV", key="host_discovery_nessus",
+            width="stretch", disabled=nessus_file is None,
+            help=(
+                "Lit les plugins 12053 (FQDN), 10150 (NetBIOS) et 55472 "
+                "(Device Hostname). Le scan doit être exporté AVEC les "
+                "résultats informatifs (Risk = None)."
+            )
+        ):
+
+            try:
+
+                frame = read_nessus_csv(nessus_file)
+
+            except ScanImportError as error:
+
+                st.error(str(error))
+
+            else:
+
+                proposals = discover_from_nessus(frame, upper=upper)
+
+                if not proposals:
+                    st.warning(
+                        "Aucun nom trouvé : le CSV ne contient pas les "
+                        "plugins 12053, 10150 ou 55472. Exportez le scan "
+                        "avec les résultats informatifs."
+                    )
+                else:
+                    _store_discovery("CSV Nessus", proposals, [])
+
+    # --- 3. DNS inverse ---------------------------------------------
+    with c3:
+
+        st.markdown("###### DNS inverse")
+
+        ips_text = st.text_area(
+            "Adresses IP (une par ligne)",
+            value="\n".join(unmapped),
+            height=100,
+            key=f"host_discovery_ips_{pending.get('analysis_id', '')}",
+            help=(
+                "Pré-rempli avec les adresses sans correspondance de la "
+                "dernière analyse d'import."
+            )
+        )
+
+        ips = [
+            part for part in re.split(r"[\s,;]+", ips_text or "") if part
+        ]
+
+        if st.button(
+            f"Résoudre {len(ips)} adresse(s)", key="host_discovery_dns",
+            width="stretch", disabled=not ips
+        ):
+
+            with st.spinner("Résolution DNS inverse..."):
+                proposals, unresolved = discover_from_dns(ips, upper=upper)
+
+            _store_discovery("DNS inverse", proposals, unresolved)
+
+    discovery = st.session_state.get("host_discovery")
+
+    if not discovery:
+        return
+
+    rows = compare_with_existing(discovery["proposals"], get_host_map())
+
+    counts = {
+        state: sum(1 for r in rows if r["etat"] == state)
+        for state in ("nouvelle", "différente", "identique")
+    }
+
+    st.markdown(
+        f"**{discovery['source']}** : {len(rows)} proposition(s) — "
+        f"{counts['nouvelle']} nouvelle(s), {counts['différente']} "
+        f"différente(s) de la table, {counts['identique']} déjà connue(s)."
+    )
+
+    if discovery["unresolved"]:
+        st.caption(
+            f"{len(discovery['unresolved'])} adresse(s) sans réponse : "
+            + ", ".join(discovery["unresolved"][:40])
+            + (" ..." if len(discovery["unresolved"]) > 40 else "")
+        )
+
+    if rows:
+
+        table = pd.DataFrame([
+            {
+                "Ajouter": r["etat"] == "nouvelle",
+                "Machine": r["machine"],
+                "Hôte proposé": r["hote"],
+                "Hôte actuel": r["actuel"],
+                "État": r["etat"],
+                "Détail": r["detail"]
+            }
+            for r in rows
+        ])
+
+        edited = st.data_editor(
+            table,
+            key=f"host_discovery_editor_{discovery['id']}",
+            hide_index=True,
+            width="stretch",
+            disabled=[c for c in table.columns if c not in ("Ajouter", "Hôte proposé")],
+            column_config={
+                "Ajouter": st.column_config.CheckboxColumn(
+                    "Ajouter",
+                    help=(
+                        "Cochée par défaut pour les machines absentes de la "
+                        "table. Cocher une ligne « différente » remplace "
+                        "l'hôte actuel."
+                    )
+                ),
+                "Hôte proposé": st.column_config.TextColumn(
+                    "Hôte proposé", help="Modifiable avant l'ajout."
+                )
+            }
+        )
+
+        selected = [
+            (row["Machine"], str(row["Hôte proposé"]).strip())
+            for row in edited.to_dict("records")
+            if row["Ajouter"] and str(row["Hôte proposé"] or "").strip()
+        ]
+
+    else:
+
+        selected = []
+
+    b1, b2 = st.columns(2)
+
+    if b1.button(
+        f"Ajouter {len(selected)} correspondance(s)",
+        key="host_discovery_apply", type="primary",
+        disabled=not selected, width="stretch"
+    ):
+
+        # overwrite=True : seules les lignes cochées sont envoyées ; une
+        # ligne « différente » n'est cochée que par choix explicite.
+        stats = import_host_map(selected, overwrite=True)
+
+        st.session_state.pop("host_discovery", None)
+        st.session_state.pop("host_map_editor", None)
+        st.session_state["host_map_result"] = (
+            f"{discovery['source']} : {stats['added']} correspondance(s) "
+            f"ajoutée(s), {stats['updated']} remplacée(s). Relancez "
+            "« Analyser le fichier » dans l'import pour en tenir compte."
+        )
+        st.rerun()
+
+    if b2.button("Ignorer", key="host_discovery_cancel", width="stretch"):
+
+        st.session_state.pop("host_discovery", None)
+        st.rerun()
+
+
+def _store_discovery(source, proposals, unresolved):
+
+    st.session_state["host_discovery"] = {
+        "id": uuid.uuid4().hex,
+        "source": source,
+        "proposals": proposals,
+        "unresolved": unresolved
+    }
+
+    st.rerun()
 
 
 def _render_comments(detail, is_admin, current_user):
