@@ -53,6 +53,7 @@ from scan_store import (
     COMMENT_MAX_LENGTH,
     get_status_catalog,
     default_new_status,
+    get_new_status_choices,
     apply_scan_import,
     get_host_map,
     get_host_map_rows,
@@ -433,7 +434,9 @@ def _render_nessus_import(is_admin, current_user):
         )
 
         catalog = get_status_catalog(list_name) if list_name else {}
-        statuses = sorted({v["status"] for v in catalog.values()})
+        # Les cinq statuts (dont REFUSÉ) sont toujours proposés, même si la
+        # base n'en contient encore aucun.
+        statuses = get_new_status_choices(catalog)
         default_status = default_new_status(catalog)
 
         if default_status not in statuses:
@@ -443,7 +446,12 @@ def _render_nessus_import(is_admin, current_user):
             "Statut des nouveaux constats", statuses,
             index=statuses.index(default_status),
             key=f"nessus_new_status_{list_name}",
-            help="Par défaut : premier statut ouvert de la liste (comme ClickUp)."
+            format_func=_status_label,
+            help=(
+                "Par défaut : premier statut ouvert de la liste (comme "
+                "ClickUp). RÉDUIRE, TRAITÉ, ATTÉNUÉ, ACCEPTÉ et REFUSÉ sont "
+                "toujours proposés."
+            )
         )
 
         params = {
