@@ -851,7 +851,7 @@ def _render_host_discovery():
 
             except Exception as error:
 
-                st.error(f"Defender n'a pas répondu : {error}")
+                _show_defender_error(error)
 
             else:
 
@@ -862,7 +862,14 @@ def _render_host_discovery():
 
         st.markdown("###### CSV Nessus")
 
+        # Après un rafraîchissement, Streamlit peut laisser à la place du
+        # fichier un objet « DeletedFile » sans nom ni contenu.
         nessus_file = st.session_state.get("nessus_file")
+
+        if not (
+            hasattr(nessus_file, "name") and hasattr(nessus_file, "getvalue")
+        ):
+            nessus_file = None
 
         st.caption(
             f"Fichier : {nessus_file.name}" if nessus_file
@@ -1025,6 +1032,53 @@ def _render_host_discovery():
 
         st.session_state.pop("host_discovery", None)
         st.rerun()
+
+
+def _show_defender_error(error):
+    """
+    Erreur Defender lisible. Cas fréquent en mode Azure CLI : session
+    expirée ou MFA à renouveler (AADSTS50078 / 50076 / 700082,
+    InteractionRequired) -> commande prête à copier.
+    """
+
+    message = str(error)
+
+    cli_expired = any(
+        marker in message
+        for marker in (
+            "AADSTS50078", "AADSTS50076", "AADSTS700082",
+            "InteractionRequired", "invalid_grant"
+        )
+    )
+
+    if not cli_expired:
+        st.error(f"Defender n'a pas répondu : {message}")
+        return
+
+    account = re.search(r"compte Windows : ([^)]+)\)", message)
+    tenant = re.search(r"--tenant\s+\"?([0-9a-fA-F-]{36})", message)
+
+    st.error(
+        "La session Azure CLI "
+        + (f"du compte Windows {account.group(1)} " if account else "")
+        + "a expiré : l'authentification multifacteur doit être "
+        "renouvelée. Ouvrez une console PowerShell avec ce compte, lancez "
+        "les commandes ci-dessous, puis recommencez."
+    )
+
+    st.code(
+        "az logout\n"
+        "az login"
+        + (f" --tenant {tenant.group(1)}" if tenant else "")
+        + " --scope https://api.securitycenter.microsoft.com/.default",
+        language="powershell"
+    )
+
+    st.caption(
+        "Pour ne plus dépendre d'une session personnelle (qui expire), "
+        "configurez une application Entra ID : barre latérale > "
+        "Application Azure."
+    )
 
 
 def _store_discovery(source, proposals, unresolved):
